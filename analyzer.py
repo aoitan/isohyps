@@ -2,9 +2,15 @@ import os
 import argparse
 from pathlib import Path
 from abc import ABC, abstractmethod
-from google import genai
-import ollama
-from dotenv import load_dotenv
+
+from analysis_helpers import detect_language, extract_symbols, is_probably_binary
+from rlm_runtime import BudgetLimits, RLMController, RunContext, write_analysis_docs
+
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:
+    def load_dotenv():
+        return False
 
 load_dotenv()
 
@@ -15,6 +21,10 @@ class BaseLLMClient(ABC):
 
 class GeminiClient(BaseLLMClient):
     def __init__(self, model_name="gemini-1.5-flash"):
+        try:
+            from google import genai
+        except ModuleNotFoundError as exc:
+            raise ValueError("google-genai package is required for the Gemini backend.") from exc
         api_key = os.getenv("GOOGLE_API_KEY")
         if not api_key:
             raise ValueError("GOOGLE_API_KEY environment variable is not set.")
@@ -33,6 +43,10 @@ class GeminiClient(BaseLLMClient):
 
 class OllamaClient(BaseLLMClient):
     def __init__(self, model_name="llama3", base_url=None, num_ctx=4096):
+        try:
+            import ollama
+        except ModuleNotFoundError as exc:
+            raise ValueError("ollama package is required for the Ollama backend.") from exc
         self.model_name = model_name
         self.client = ollama.Client(host=base_url) if base_url else ollama
         self.options = {
@@ -50,101 +64,6 @@ class OllamaClient(BaseLLMClient):
             return response['message']['content'].strip()
         except Exception as e:
             return f"[Ollama Error: {e}]"
-
-
-# --- 多言語対応: 拡張子 → tree-sitter 言語名 ---
-SUPPORTED_LANGUAGES: dict[str, str] = {
-    ".py":    "python",
-    ".js":    "javascript",
-    ".jsx":   "javascript",
-    ".ts":    "typescript",
-    ".tsx":   "tsx",
-    ".go":    "go",
-    ".rs":    "rust",
-    ".java":  "java",
-    ".rb":    "ruby",
-    ".c":     "c",
-    ".h":     "c",
-    ".cpp":   "cpp",
-    ".cc":    "cpp",
-    ".hpp":   "cpp",
-    ".cs":    "c_sharp",
-    ".kt":    "kotlin",
-    ".swift": "swift",
-}
-
-# tree-sitter クエリ: トップレベルのシンボル定義を @symbol でキャプチャ
-SYMBOL_QUERIES: dict[str, str] = {
-    "python": """
-        [(function_definition) @symbol
-         (class_definition) @symbol]
-    """,
-    "javascript": """
-        [(function_declaration) @symbol
-         (class_declaration) @symbol
-         (lexical_declaration
-           (variable_declarator value: [(arrow_function) (function_expression)])) @symbol]
-    """,
-    "typescript": """
-        [(function_declaration) @symbol
-         (class_declaration) @symbol
-         (interface_declaration) @symbol
-         (type_alias_declaration) @symbol]
-    """,
-    "tsx": """
-        [(function_declaration) @symbol
-         (class_declaration) @symbol
-         (interface_declaration) @symbol]
-    """,
-    "go": """
-        [(function_declaration) @symbol
-         (method_declaration) @symbol
-         (type_declaration) @symbol]
-    """,
-    "rust": """
-        [(function_item) @symbol
-         (struct_item) @symbol
-         (enum_item) @symbol
-         (impl_item) @symbol
-         (trait_item) @symbol]
-    """,
-    "java": """
-        [(class_declaration) @symbol
-         (interface_declaration) @symbol
-         (method_declaration) @symbol
-         (constructor_declaration) @symbol]
-    """,
-    "ruby": """
-        [(method) @symbol
-         (class) @symbol
-         (module) @symbol]
-    """,
-    "c": """
-        [(function_definition) @symbol
-         (struct_specifier) @symbol]
-    """,
-    "cpp": """
-        [(function_definition) @symbol
-         (class_specifier) @symbol
-         (struct_specifier) @symbol]
-    """,
-    "c_sharp": """
-        [(class_declaration) @symbol
-         (interface_declaration) @symbol
-         (method_declaration) @symbol]
-    """,
-    "kotlin": """
-        [(function_declaration) @symbol
-         (class_declaration) @symbol
-         (object_declaration) @symbol]
-    """,
-    "swift": """
-        [(function_declaration) @symbol
-         (class_declaration) @symbol
-         (struct_declaration) @symbol
-         (protocol_declaration) @symbol]
-    """,
-}
 
 
 class RLMAnalyzer:
@@ -189,60 +108,25 @@ class RLMAnalyzer:
         return result
 
     def _detect_language(self, path: Path) -> str | None:
-        return SUPPORTED_LANGUAGES.get(path.suffix.lower())
+        return detect_language(path)
 
     def _analyze_code_file(self, path: Path, depth: int, lang: str) -> str:
         """tree-sitter でシンボルを抽出し、LLM に要約させる（多言語対応）"""
-        try:
-            from tree_sitter_languages import get_language, get_parser
+        symbol_info = extract_symbols(path, lang=lang)
+        if symbol_info["error"]:
+            print(f"Warning: tree-sitter analysis failed for {path} ({lang}): {symbol_info['error']}")
+        if not symbol_info["symbols"]:
+            return self._analyze_file(path, depth, lang)
 
-            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-                code = f.read()
-
-            parser = get_parser(lang)
-            tree = parser.parse(bytes(code, 'utf-8'))
-
-            query_str = SYMBOL_QUERIES.get(lang, '')
-            if not query_str:
-                return self._analyze_file(path, depth)
-
-            language = get_language(lang)
-            query = language.query(query_str)
-            raw = query.captures(tree.root_node)
-
-            # tree-sitter <0.22: list of (node, name); 0.22+: dict {name: [nodes]}
-            if isinstance(raw, dict):
-                symbol_nodes = raw.get('symbol', [])
-            else:
-                symbol_nodes = [node for node, name in raw if name == 'symbol']
-
-            if not symbol_nodes:
-                return self._analyze_file(path, depth)
-
-            snippets = []
-            seen: set[int] = set()
-            lines = code.splitlines()
-            for node in symbol_nodes[:10]:
-                if node.start_byte in seen:
-                    continue
-                seen.add(node.start_byte)
-                start = node.start_point[0]
-                end = min(node.end_point[0], start + 15)
-                snippet = '\n'.join(lines[start:end + 1])
-                snippets.append(f"```{lang}\n{snippet}\n```")
-
-            symbols_str = '\n\n'.join(snippets)
-            prompt = (
-                f"ファイル '{path.name}' ({lang}) には以下のシンボル定義があります：\n\n"
-                f"{symbols_str}\n\n"
-                "これらの定義から、このファイルが提供している主要な機能と設計意図を技術的に詳しく要約してください。"
-                "日本語で回答してください。"
-            )
-            return self.client.query(prompt)
-
-        except Exception as e:
-            print(f"Warning: tree-sitter analysis failed for {path} ({lang}): {e}")
-            return self._analyze_file(path, depth)
+        snippets = [f"```{lang}\n{snippet}\n```" for snippet in symbol_info["symbols"]]
+        symbols_str = '\n\n'.join(snippets)
+        prompt = (
+            f"ファイル '{path.name}' ({lang}) には以下のシンボル定義があります：\n\n"
+            f"{symbols_str}\n\n"
+            "これらの定義から、このファイルが提供している主要な機能と設計意図を技術的に詳しく要約してください。"
+            "日本語で回答してください。"
+        )
+        return self.client.query(prompt)
 
     def _analyze_directory(self, path: Path, depth: int, rel_path: Path) -> str:
         ignore_list = {".git", "__pycache__", "venv", ".env", "node_modules", ".vscode", ".idea"}
@@ -286,9 +170,9 @@ class RLMAnalyzer:
         )
         return self.client.query(summary_prompt)
 
-    def _analyze_file(self, path: Path, depth: int) -> str:
+    def _analyze_file(self, path: Path, depth: int, lang: str | None = None) -> str:
         try:
-            if path.suffix.lower() in {'.png', '.jpg', '.jpeg', '.gif', '.pdf', '.exe', '.pyc', '.o', '.a', '.so'}:
+            if is_probably_binary(path):
                 return "（バイナリファイルのため解析をスキップしました）"
 
             with open(path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -296,18 +180,86 @@ class RLMAnalyzer:
         except Exception as e:
             return f"[Error reading file: {e}]"
 
+        language_hint = f"言語は {lang} です。\n" if lang else ""
         prompt = (
             f"ファイル '{path.name}' の内容（冒頭部分）を解析してください：\n"
+            f"{language_hint}"
             f"```\n{content}\n```\n\n"
             "このファイルが提供している主要な機能、主要なクラス、エクスポートされている関数、"
             "およびその責務を技術的に要約してください。日本語で回答してください。"
         )
         return self.client.query(prompt)
 
+
+class RLMRuntimeAnalyzer:
+    def __init__(
+        self,
+        client: BaseLLMClient,
+        max_depth: int = 2,
+        max_steps: int = 8,
+        output_dir: Path | None = None,
+        step_timeout_seconds: float = 3.0,
+        max_total_tokens: int = 12000,
+        backend_name: str = "unknown",
+        model_name: str = "unknown",
+    ):
+        self.client = client
+        self.max_depth = max_depth
+        self.max_steps = max_steps
+        self.output_dir = output_dir
+        self.step_timeout_seconds = step_timeout_seconds
+        self.max_total_tokens = max_total_tokens
+        self.backend_name = backend_name
+        self.model_name = model_name
+        self.last_result = None
+        if self.output_dir:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def analyze(self, path: Path) -> str:
+        root = path.resolve()
+        limits = BudgetLimits(
+            max_steps=self.max_steps,
+            max_depth=self.max_depth,
+            max_total_tokens=self.max_total_tokens,
+            step_timeout_seconds=self.step_timeout_seconds,
+        )
+        controller = RLMController(
+            client=self.client,
+            root=root,
+            run_context=RunContext(limits=limits),
+        )
+        goal = (
+            f"Analyze the project rooted at '{root.name}'. "
+            "Inspect the repository using helpers, use llm_query only for focused subproblems, "
+            "and finish with a dict containing a project summary plus optional analysis_docs documents."
+        )
+        result = controller.run(goal=goal)
+        self.last_result = result
+
+        summary = result.error or str(result.result)
+        if result.status == "finished" and isinstance(result.result, dict):
+            summary = str(result.result.get("summary") or summary)
+        elif result.status != "finished":
+            summary = f"[{result.status}] {summary}"
+
+        if self.output_dir:
+            write_analysis_docs(
+                output_dir=self.output_dir,
+                root_path=root,
+                controller_result=result,
+                backend=self.backend_name,
+                model=self.model_name,
+            )
+        return summary
+
 def main():
     parser = argparse.ArgumentParser(description="Recursive Project Analyzer (RLM style)")
     parser.add_argument("root", help="Analysis root directory", default=".", nargs="?")
     parser.add_argument("--depth", type=int, default=3, help="Max recursion depth")
+    parser.add_argument("--runtime", choices=["legacy", "controller"], default="legacy", help="Runtime to use")
+    parser.add_argument("--max-steps", type=int, default=8, help="Max controller steps for the controller runtime")
+    parser.add_argument("--step-timeout", type=float, default=3.0, help="Per-step timeout for the controller runtime")
+    parser.add_argument("--max-total-tokens", type=int, default=12000, help="Approximate shared token budget for the controller runtime")
     parser.add_argument("--backend", choices=["gemini", "ollama"], default="gemini", help="LLM backend to use")
     parser.add_argument("--model", help="LLM model name (defaults: gemini-1.5-flash or llama3)")
     parser.add_argument("--out", default="analysis_docs", help="Output directory for structured documentation")
@@ -330,9 +282,22 @@ def main():
         client = OllamaClient(model_name=model, base_url=args.ollama_url, num_ctx=args.num_ctx)
 
     # 出力先ディレクトリを指定して初期化
-    analyzer = RLMAnalyzer(client, max_depth=args.depth, output_dir=output_path)
+    if args.runtime == "controller":
+        analyzer = RLMRuntimeAnalyzer(
+            client,
+            max_depth=args.depth,
+            max_steps=args.max_steps,
+            output_dir=output_path,
+            step_timeout_seconds=args.step_timeout,
+            max_total_tokens=args.max_total_tokens,
+            backend_name=args.backend,
+            model_name=model,
+        )
+    else:
+        analyzer = RLMAnalyzer(client, max_depth=args.depth, output_dir=output_path)
 
     print(f"Starting RLM analysis from: {root_path}")
+    print(f"Runtime: {args.runtime}")
     print(f"Backend: {args.backend}, Model: {model}")
     if args.backend == "ollama":
         print(f"Ollama URL: {args.ollama_url if args.ollama_url else 'local'}")
@@ -342,15 +307,18 @@ def main():
 
     final_summary = analyzer.analyze(root_path)
 
-    # 全体レポートも出力ディレクトリ内に保存
-    report_path = output_path / "analysis_report.md"
-    with open(report_path, "w", encoding="utf-8") as f:
-        f.write(f"# Project Analysis Report: {root_path.name}\n\n")
-        f.write(f"**Root Directory:** `{root_path}`  \n")
-        f.write(f"**Backend:** {args.backend} ({model})  \n")
-        f.write(f"**Max Depth:** {args.depth}  \n\n")
-        f.write("## Executive Summary\n\n")
-        f.write(final_summary)
+    if args.runtime == "legacy":
+        report_path = output_path / "analysis_report.md"
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(f"# Project Analysis Report: {root_path.name}\n\n")
+            f.write(f"**Root Directory:** `{root_path}`  \n")
+            f.write(f"**Backend:** {args.backend} ({model})  \n")
+            f.write(f"**Runtime:** legacy  \n")
+            f.write(f"**Max Depth:** {args.depth}  \n\n")
+            f.write("## Executive Summary\n\n")
+            f.write(final_summary)
+    else:
+        report_path = output_path / "analysis_report.md"
 
     print(f"\nAnalysis complete.")
     print(f"Structured docs: {output_path}")

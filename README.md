@@ -67,9 +67,22 @@ python analyzer.py . \
   --model llama3
 ```
 
+#### 4. Controller runtime を使用する場合
+```bash
+python analyzer.py . \
+  --runtime controller \
+  --depth 2 \
+  --max-steps 8 \
+  --step-timeout 3
+```
+
 ### 主なオプション
 - `root`: 解析を開始するルートディレクトリ（デフォルト: `.`）
 - `--depth`: 再帰解析の最大深さ（デフォルト: `3`）
+- `--runtime`: `legacy` の静的 DFS か、`controller` の stepwise RLM runtime
+- `--max-steps`: controller runtime の最大 step 数
+- `--step-timeout`: controller runtime の 1 step あたりタイムアウト秒数
+- `--max-total-tokens`: controller runtime の共有トークン予算（概算）
 - `--backend`: 使用するLLMバックエンド (`gemini` または `ollama`)
 - `--model`: 使用するモデル名
 - `--out`: 構造化ドキュメントの出力先ディレクトリ（デフォルト: `analysis_docs`）
@@ -92,3 +105,5 @@ analysis_docs/
 ```
 
 各ファイルには、LLMによって生成された機能説明、クラス・関数の責務、およびモジュールの役割が記述されます。
+
+`controller` runtime では、LLM は helper (`list_dir`, `read_text`, `extract_symbols`, `llm_query`, `finish`) を介して探索し、最終結果から `analysis_docs` を再構築します。

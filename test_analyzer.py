@@ -3,7 +3,7 @@ from unittest.mock import MagicMock
 from pathlib import Path
 import tempfile
 import shutil
-from analyzer import RLMAnalyzer, BaseLLMClient
+from analyzer import RLMAnalyzer, BaseLLMClient, RLMRuntimeAnalyzer
 
 
 class TestRLMAnalyzer(unittest.TestCase):
@@ -135,6 +135,43 @@ class TestTreeSitterAnalysis(unittest.TestCase):
 
         self.assertEqual(result, "Summary")
         self.mock_client.query.assert_called_once()
+
+
+class TestRLMRuntimeAnalyzer(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.output_dir = Path(self.test_dir) / "docs"
+        self.root = Path(self.test_dir) / "repo"
+        self.root.mkdir()
+        (self.root / "README.md").write_text("# demo\n", encoding="utf-8")
+        self.client = MagicMock(spec=BaseLLMClient)
+        self.client.query.return_value = (
+            "finish({'summary': 'runtime summary', "
+            "'documents': [{'path': 'index.md', 'title': 'Root', 'content': 'runtime summary'}, "
+            "{'path': 'README.md', 'title': 'README', 'content': 'readme details'}]})"
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    def test_runtime_analyzer_writes_structured_docs(self):
+        analyzer = RLMRuntimeAnalyzer(
+            self.client,
+            max_depth=2,
+            max_steps=2,
+            output_dir=self.output_dir,
+            backend_name="test",
+            model_name="fake-model",
+        )
+
+        summary = analyzer.analyze(self.root)
+
+        self.assertEqual(summary, "runtime summary")
+        self.assertTrue((self.output_dir / "index.md").exists())
+        self.assertTrue((self.output_dir / "README.md").exists())
+        report = (self.output_dir / "analysis_report.md").read_text(encoding="utf-8")
+        self.assertIn("runtime summary", report)
+        self.assertIn("Runtime:** controller", report)
 
 
 if __name__ == "__main__":
