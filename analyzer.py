@@ -51,6 +51,102 @@ class OllamaClient(BaseLLMClient):
         except Exception as e:
             return f"[Ollama Error: {e}]"
 
+
+# --- 多言語対応: 拡張子 → tree-sitter 言語名 ---
+SUPPORTED_LANGUAGES: dict[str, str] = {
+    ".py":    "python",
+    ".js":    "javascript",
+    ".jsx":   "javascript",
+    ".ts":    "typescript",
+    ".tsx":   "tsx",
+    ".go":    "go",
+    ".rs":    "rust",
+    ".java":  "java",
+    ".rb":    "ruby",
+    ".c":     "c",
+    ".h":     "c",
+    ".cpp":   "cpp",
+    ".cc":    "cpp",
+    ".hpp":   "cpp",
+    ".cs":    "c_sharp",
+    ".kt":    "kotlin",
+    ".swift": "swift",
+}
+
+# tree-sitter クエリ: トップレベルのシンボル定義を @symbol でキャプチャ
+SYMBOL_QUERIES: dict[str, str] = {
+    "python": """
+        [(function_definition) @symbol
+         (class_definition) @symbol]
+    """,
+    "javascript": """
+        [(function_declaration) @symbol
+         (class_declaration) @symbol
+         (lexical_declaration
+           (variable_declarator value: [(arrow_function) (function_expression)])) @symbol]
+    """,
+    "typescript": """
+        [(function_declaration) @symbol
+         (class_declaration) @symbol
+         (interface_declaration) @symbol
+         (type_alias_declaration) @symbol]
+    """,
+    "tsx": """
+        [(function_declaration) @symbol
+         (class_declaration) @symbol
+         (interface_declaration) @symbol]
+    """,
+    "go": """
+        [(function_declaration) @symbol
+         (method_declaration) @symbol
+         (type_declaration) @symbol]
+    """,
+    "rust": """
+        [(function_item) @symbol
+         (struct_item) @symbol
+         (enum_item) @symbol
+         (impl_item) @symbol
+         (trait_item) @symbol]
+    """,
+    "java": """
+        [(class_declaration) @symbol
+         (interface_declaration) @symbol
+         (method_declaration) @symbol
+         (constructor_declaration) @symbol]
+    """,
+    "ruby": """
+        [(method) @symbol
+         (class) @symbol
+         (module) @symbol]
+    """,
+    "c": """
+        [(function_definition) @symbol
+         (struct_specifier) @symbol]
+    """,
+    "cpp": """
+        [(function_definition) @symbol
+         (class_specifier) @symbol
+         (struct_specifier) @symbol]
+    """,
+    "c_sharp": """
+        [(class_declaration) @symbol
+         (interface_declaration) @symbol
+         (method_declaration) @symbol]
+    """,
+    "kotlin": """
+        [(function_declaration) @symbol
+         (class_declaration) @symbol
+         (object_declaration) @symbol]
+    """,
+    "swift": """
+        [(function_declaration) @symbol
+         (class_declaration) @symbol
+         (struct_declaration) @symbol
+         (protocol_declaration) @symbol]
+    """,
+}
+
+
 class RLMAnalyzer:
     def __init__(self, client: BaseLLMClient, max_depth: int = 3, output_dir: Path = None):
         self.client = client
@@ -77,7 +173,12 @@ class RLMAnalyzer:
                 with open(out_file, "w", encoding="utf-8") as f:
                     f.write(f"# Directory: {path.name}\n\n{result}")
         else:
-            result = self._analyze_file(path, depth)
+            lang = self._detect_language(path)
+            if lang:
+                result = self._analyze_code_file(path, depth, lang)
+            else:
+                result = self._analyze_file(path, depth)
+            
             if self.output_dir:
                 out_file = self.output_dir / rel_path.with_suffix(".md")
                 out_file.parent.mkdir(parents=True, exist_ok=True)
@@ -86,6 +187,62 @@ class RLMAnalyzer:
 
         self.cache[path] = result
         return result
+
+    def _detect_language(self, path: Path) -> str | None:
+        return SUPPORTED_LANGUAGES.get(path.suffix.lower())
+
+    def _analyze_code_file(self, path: Path, depth: int, lang: str) -> str:
+        """tree-sitter でシンボルを抽出し、LLM に要約させる（多言語対応）"""
+        try:
+            from tree_sitter_languages import get_language, get_parser
+
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                code = f.read()
+
+            parser = get_parser(lang)
+            tree = parser.parse(bytes(code, 'utf-8'))
+
+            query_str = SYMBOL_QUERIES.get(lang, '')
+            if not query_str:
+                return self._analyze_file(path, depth)
+
+            language = get_language(lang)
+            query = language.query(query_str)
+            raw = query.captures(tree.root_node)
+
+            # tree-sitter <0.22: list of (node, name); 0.22+: dict {name: [nodes]}
+            if isinstance(raw, dict):
+                symbol_nodes = raw.get('symbol', [])
+            else:
+                symbol_nodes = [node for node, name in raw if name == 'symbol']
+
+            if not symbol_nodes:
+                return self._analyze_file(path, depth)
+
+            snippets = []
+            seen: set[int] = set()
+            lines = code.splitlines()
+            for node in symbol_nodes[:10]:
+                if node.start_byte in seen:
+                    continue
+                seen.add(node.start_byte)
+                start = node.start_point[0]
+                end = min(node.end_point[0], start + 15)
+                snippet = '\n'.join(lines[start:end + 1])
+                snippets.append(f"```{lang}\n{snippet}\n```")
+
+            symbols_str = '\n\n'.join(snippets)
+            prompt = (
+                f"ファイル '{path.name}' ({lang}) には以下のシンボル定義があります：\n\n"
+                f"{symbols_str}\n\n"
+                "これらの定義から、このファイルが提供している主要な機能と設計意図を技術的に詳しく要約してください。"
+                "日本語で回答してください。"
+            )
+            return self.client.query(prompt)
+
+        except Exception as e:
+            print(f"Warning: tree-sitter analysis failed for {path} ({lang}): {e}")
+            return self._analyze_file(path, depth)
 
     def _analyze_directory(self, path: Path, depth: int, rel_path: Path) -> str:
         ignore_list = {".git", "__pycache__", "venv", ".env", "node_modules", ".vscode", ".idea"}

@@ -1,4 +1,6 @@
 __pycache__/
 .env
-analysis_report.md
+analysis_docs/
 venv/
+.venv/
+*.pyc

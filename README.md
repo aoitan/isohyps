@@ -1,4 +1,6 @@
-# RLM Project Analyzer
+# Isohyps
+
+> *等高線（Isohyps）* — コードの抽象度という「高さ」を地図のように行き来しながら、プロジェクト全体の地形を把握するツール。
 
 Recursive Language Models (RLM) の概念に基づき、大規模なプロジェクトを「抽象から具体へと段階的に」再帰下降解析するスクリプトです。
 
