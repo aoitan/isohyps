@@ -1,9 +1,10 @@
 import unittest
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 from pathlib import Path
 import tempfile
 import shutil
-from analyzer import RLMAnalyzer, BaseLLMClient, RLMRuntimeAnalyzer
+from analyzer import RLMAnalyzer, BaseLLMClient, RLMRuntimeAnalyzer, build_parser
 
 
 class TestRLMAnalyzer(unittest.TestCase):
@@ -21,7 +22,7 @@ class TestRLMAnalyzer(unittest.TestCase):
         (self.root / "file2.txt").write_text("some text", encoding='utf-8')
 
         self.mock_client = MagicMock(spec=BaseLLMClient)
-        self.analyzer = RLMAnalyzer(self.mock_client, max_depth=2)
+        self.analyzer = RLMAnalyzer(self.mock_client, max_depth=2, warn=False)
 
     def tearDown(self):
         shutil.rmtree(self.test_dir)
@@ -90,7 +91,7 @@ class TestTreeSitterAnalysis(unittest.TestCase):
         self.test_dir = tempfile.mkdtemp()
         self.mock_client = MagicMock(spec=BaseLLMClient)
         self.mock_client.query.return_value = "Summary"
-        self.analyzer = RLMAnalyzer(self.mock_client, max_depth=2)
+        self.analyzer = RLMAnalyzer(self.mock_client, max_depth=2, warn=False)
 
     def tearDown(self):
         shutil.rmtree(self.test_dir)
@@ -172,6 +173,40 @@ class TestRLMRuntimeAnalyzer(unittest.TestCase):
         report = (self.output_dir / "analysis_report.md").read_text(encoding="utf-8")
         self.assertIn("runtime summary", report)
         self.assertIn("Runtime:** controller", report)
+
+    def test_runtime_analyzer_defaults_to_30000_tokens(self):
+        analyzer = RLMRuntimeAnalyzer(self.client)
+        self.assertEqual(analyzer.max_depth, 2)
+        self.assertEqual(analyzer.max_total_tokens, 30000)
+        self.assertEqual(analyzer.step_timeout_seconds, 15.0)
+
+    def test_runtime_analyzer_adds_recovery_guidance(self):
+        fake_result = SimpleNamespace(
+            status="budget_exceeded",
+            error="max_total_tokens=10 reached",
+            result=None,
+            budget=SimpleNamespace(steps_used=1, llm_calls=1, total_tokens=10),
+        )
+        fake_controller = MagicMock()
+        fake_controller.run.return_value = fake_result
+
+        with patch("analyzer.RLMController", return_value=fake_controller):
+            analyzer = RLMRuntimeAnalyzer(self.client)
+            summary = analyzer.analyze(self.root)
+
+        self.assertIn("Try increasing --max-total-tokens or --max-steps.", summary)
+        self.assertIn("--runtime legacy", summary)
+
+
+class TestCLIParser(unittest.TestCase):
+    def test_parser_defaults_to_controller_runtime(self):
+        args = build_parser().parse_args([])
+
+        self.assertEqual(args.root, ".")
+        self.assertEqual(args.runtime, "controller")
+        self.assertEqual(args.depth, 2)
+        self.assertEqual(args.max_total_tokens, 30000)
+        self.assertEqual(args.step_timeout, 15.0)
 
 
 if __name__ == "__main__":

@@ -67,27 +67,32 @@ python analyzer.py . \
   --model llama3
 ```
 
-#### 4. Controller runtime を使用する場合
+#### 4. Controller runtime を使用する場合 (デフォルト)
 ```bash
 python analyzer.py . \
-  --runtime controller \
   --depth 2 \
   --max-steps 8 \
-  --step-timeout 3
+  --max-total-tokens 30000 \
+  --step-timeout 15
 ```
 
 ### 主なオプション
 - `root`: 解析を開始するルートディレクトリ（デフォルト: `.`）
-- `--depth`: 再帰解析の最大深さ（デフォルト: `3`）
-- `--runtime`: `legacy` の静的 DFS か、`controller` の stepwise RLM runtime
-- `--max-steps`: controller runtime の最大 step 数
-- `--step-timeout`: controller runtime の 1 step あたりタイムアウト秒数
-- `--max-total-tokens`: controller runtime の共有トークン予算（概算）
+- `--depth`: 再帰解析の最大深さ（デフォルト: `2`）
+- `--runtime`: `controller` (推奨) または `legacy` (非推奨 / 将来削除予定)
+- `--max-steps`: controller runtime の最大 step 数 (デフォルト: `8`)
+- `--step-timeout`: controller runtime の 1 step あたりタイムアウト秒数 (デフォルト: `15.0`)
+- `--max-total-tokens`: controller runtime の共有トークン予算 (デフォルト: `30000`)
 - `--backend`: 使用するLLMバックエンド (`gemini` または `ollama`)
 - `--model`: 使用するモデル名
 - `--out`: 構造化ドキュメントの出力先ディレクトリ（デフォルト: `analysis_docs`）
 - `--ollama-url`: Ollama APIのエンドポイントURL
 - `--num-ctx`: Ollamaのコンテキストサイズ
+
+`controller` runtime はトップレベルの解析完了時に `finish({'summary': str})` を最低契約として要求し、必要に応じて
+`documents` list を受け取って `analysis_docs` を再構築します。`documents` の各要素では `path` / `title` / `content`
+を指定できますが、省略時はホスト側が補完します。`legacy` runtime は互換用途として残っていますが、新規利用は推奨しません。
+`legacy` を使う場合は、controller と実行時間やトークン消費の特性が異なる点に注意してください。
 
 ## 出力結果
 

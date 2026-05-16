@@ -1,10 +1,12 @@
 import os
+import sys
 import argparse
+import warnings
 from pathlib import Path
 from abc import ABC, abstractmethod
 
 from analysis_helpers import detect_language, extract_symbols, is_probably_binary
-from rlm_runtime import BudgetLimits, RLMController, RunContext, write_analysis_docs
+from rlm_runtime import BudgetLimits, RLMController, RunContext, write_analysis_docs, DEFAULT_GOAL_TEMPLATE
 
 try:
     from dotenv import load_dotenv
@@ -13,6 +15,14 @@ except ModuleNotFoundError:
         return False
 
 load_dotenv()
+
+_DEBUG = bool(os.getenv("DEBUG"))
+
+
+def _dbg(tag: str, msg: str) -> None:
+    if _DEBUG:
+        print(f"[DBG {tag}] {msg}", file=sys.stderr, flush=True)
+
 
 class BaseLLMClient(ABC):
     @abstractmethod
@@ -32,13 +42,17 @@ class GeminiClient(BaseLLMClient):
         self.model_name = model_name
 
     def query(self, prompt: str) -> str:
+        _dbg("llm", f"gemini query model={self.model_name} prompt={len(prompt)} chars")
         try:
             response = self.client.models.generate_content(
                 model=self.model_name,
                 contents=prompt
             )
-            return response.text.strip()
+            result = response.text.strip()
+            _dbg("llm", f"gemini response={len(result)} chars: {result[:80]!r}...")
+            return result
         except Exception as e:
+            _dbg("llm", f"gemini error: {e}")
             return f"[Gemini Error: {e}]"
 
 class OllamaClient(BaseLLMClient):
@@ -55,19 +69,31 @@ class OllamaClient(BaseLLMClient):
         }
 
     def query(self, prompt: str) -> str:
+        _dbg("llm", f"ollama query model={self.model_name} prompt={len(prompt)} chars")
         try:
             response = self.client.chat(
                 model=self.model_name,
                 messages=[{'role': 'user', 'content': prompt}],
                 options=self.options
             )
-            return response['message']['content'].strip()
+            result = response['message']['content'].strip()
+            _dbg("llm", f"ollama response={len(result)} chars: {result[:80]!r}...")
+            return result
         except Exception as e:
+            _dbg("llm", f"ollama error: {e}")
             return f"[Ollama Error: {e}]"
 
 
 class RLMAnalyzer:
-    def __init__(self, client: BaseLLMClient, max_depth: int = 3, output_dir: Path = None):
+    def __init__(self, client: BaseLLMClient, max_depth: int = 3, output_dir: Path = None, warn: bool = True):
+        if warn:
+            warnings.warn(
+                "RLMAnalyzer (legacy) is deprecated and will be removed in a future version. "
+                "Use RLMRuntimeAnalyzer (controller) instead; controller may use different token "
+                "budgets and execution times.",
+                FutureWarning,
+                stacklevel=2,
+            )
         self.client = client
         self.max_depth = max_depth
         self.cache = {}
@@ -198,8 +224,8 @@ class RLMRuntimeAnalyzer:
         max_depth: int = 2,
         max_steps: int = 8,
         output_dir: Path | None = None,
-        step_timeout_seconds: float = 3.0,
-        max_total_tokens: int = 12000,
+        step_timeout_seconds: float = 15.0,
+        max_total_tokens: int = 30000,
         backend_name: str = "unknown",
         model_name: str = "unknown",
     ):
@@ -217,6 +243,11 @@ class RLMRuntimeAnalyzer:
 
     def analyze(self, path: Path) -> str:
         root = path.resolve()
+        _dbg("analyzer", (
+            f"controller runtime: root={root}"
+            f" max_steps={self.max_steps} max_depth={self.max_depth}"
+            f" max_total_tokens={self.max_total_tokens} step_timeout={self.step_timeout_seconds}s"
+        ))
         limits = BudgetLimits(
             max_steps=self.max_steps,
             max_depth=self.max_depth,
@@ -228,19 +259,26 @@ class RLMRuntimeAnalyzer:
             root=root,
             run_context=RunContext(limits=limits),
         )
-        goal = (
-            f"Analyze the project rooted at '{root.name}'. "
-            "Inspect the repository using helpers, use llm_query only for focused subproblems, "
-            "and finish with a dict containing a project summary plus optional analysis_docs documents."
-        )
-        result = controller.run(goal=goal)
+        goal = DEFAULT_GOAL_TEMPLATE.format(root_name=root.name)
+        _dbg("analyzer", f"goal: {goal!r}")
+        result = controller.run(goal=goal, require_structured_finish=True)
+        _dbg("analyzer", (
+            f"controller.run() done: status={result.status}"
+            f" steps_used={result.budget.steps_used}"
+            f" llm_calls={result.budget.llm_calls}"
+            f" total_tokens={result.budget.total_tokens}"
+        ))
         self.last_result = result
 
         summary = result.error or str(result.result)
         if result.status == "finished" and isinstance(result.result, dict):
             summary = str(result.result.get("summary") or summary)
         elif result.status != "finished":
-            summary = f"[{result.status}] {summary}"
+            guidance = []
+            if result.status == "budget_exceeded":
+                guidance.append("Try increasing --max-total-tokens or --max-steps.")
+            guidance.append("If the controller keeps failing, retry with --runtime legacy.")
+            summary = f"[{result.status}] {summary} {' '.join(guidance)}".strip()
 
         if self.output_dir:
             write_analysis_docs(
@@ -252,20 +290,33 @@ class RLMRuntimeAnalyzer:
             )
         return summary
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Recursive Project Analyzer (RLM style)")
     parser.add_argument("root", help="Analysis root directory", default=".", nargs="?")
-    parser.add_argument("--depth", type=int, default=3, help="Max recursion depth")
-    parser.add_argument("--runtime", choices=["legacy", "controller"], default="legacy", help="Runtime to use")
+    parser.add_argument("--depth", type=int, default=2, help="Max recursion depth")
+    parser.add_argument("--runtime", choices=["legacy", "controller"], default="controller", help="Runtime to use (default: controller)")
     parser.add_argument("--max-steps", type=int, default=8, help="Max controller steps for the controller runtime")
-    parser.add_argument("--step-timeout", type=float, default=3.0, help="Per-step timeout for the controller runtime")
-    parser.add_argument("--max-total-tokens", type=int, default=12000, help="Approximate shared token budget for the controller runtime")
+    parser.add_argument("--step-timeout", type=float, default=15.0, help="Per-step timeout for the controller runtime")
+    parser.add_argument("--max-total-tokens", type=int, default=30000, help="Approximate shared token budget for the controller runtime")
     parser.add_argument("--backend", choices=["gemini", "ollama"], default="gemini", help="LLM backend to use")
     parser.add_argument("--model", help="LLM model name (defaults: gemini-1.5-flash or llama3)")
     parser.add_argument("--out", default="analysis_docs", help="Output directory for structured documentation")
     parser.add_argument("--ollama-url", help="Base URL for Ollama API (e.g. http://192.168.1.10:11434)")
     parser.add_argument("--num-ctx", type=int, default=8192, help="Context size (num_ctx) for Ollama")
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
+
+    if args.runtime == "legacy":
+        warnings.warn(
+            "'legacy' runtime is deprecated. Using 'controller' is recommended; "
+            "controller may use different token budgets and execution times.",
+            FutureWarning,
+            stacklevel=1,
+        )
 
     root_path = Path(args.root).resolve()
     output_path = Path(args.out).resolve()
@@ -294,11 +345,16 @@ def main():
             model_name=model,
         )
     else:
-        analyzer = RLMAnalyzer(client, max_depth=args.depth, output_dir=output_path)
+        analyzer = RLMAnalyzer(client, max_depth=args.depth, output_dir=output_path, warn=False)
 
     print(f"Starting RLM analysis from: {root_path}")
     print(f"Runtime: {args.runtime}")
     print(f"Backend: {args.backend}, Model: {model}")
+    if args.runtime == "controller":
+        print(
+            "Agentic controller runtime is active "
+            f"(depth={args.depth}, max_steps={args.max_steps}, token_budget={args.max_total_tokens})."
+        )
     if args.backend == "ollama":
         print(f"Ollama URL: {args.ollama_url if args.ollama_url else 'local'}")
         print(f"Context Size: {args.num_ctx}")

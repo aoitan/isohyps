@@ -6,9 +6,12 @@ from pathlib import Path
 from rlm_runtime import (
     BudgetLimits,
     CodeResponseValidator,
+    ControllerResult,
+    BudgetSnapshot,
     IsolatedREPL,
     RLMController,
     RunContext,
+    validate_analysis_result,
     write_analysis_docs,
 )
 
@@ -101,6 +104,39 @@ class TestRLMRuntime(unittest.TestCase):
         self.assertEqual(result.status, "budget_exceeded")
         self.assertIn("max_steps=1", result.error)
 
+    def test_budget_limits_defaults_match_controller_runtime_defaults(self):
+        limits = BudgetLimits()
+
+        self.assertEqual(limits.max_total_tokens, 30000)
+        self.assertEqual(limits.step_timeout_seconds, 15.0)
+
+    def test_validate_analysis_result_rejects_invalid_payloads(self):
+        self.assertEqual(
+            validate_analysis_result("done"),
+            ["Expected finish(value) to receive a dict, got str."],
+        )
+        self.assertEqual(validate_analysis_result({"summary": "ok"}), [])
+        self.assertEqual(validate_analysis_result({"summary": "ok", "documents": [{}]}), [])
+        self.assertEqual(
+            validate_analysis_result({"summary": "ok", "documents": "README.md"}),
+            ["Expected 'documents' to be list, got str."],
+        )
+
+    def test_controller_retries_after_invalid_structured_finish(self):
+        controller, client = self._controller(
+            [
+                "finish('not-structured')",
+                "finish({'summary': 'fixed', 'documents': []})",
+            ],
+            max_steps=2,
+        )
+
+        result = controller.run("Analyze the repository.", require_structured_finish=True)
+
+        self.assertEqual(result.status, "finished")
+        self.assertEqual(result.result["summary"], "fixed")
+        self.assertIn("Invalid analysis result format", client.prompts[1])
+
     def test_finish_stops_following_side_effects(self):
         with IsolatedREPL(self.root, BudgetLimits()) as repl:
             observation = repl.execute("finish('done')\nvalue = 1\nprint('after')", lambda prompt, context: None)
@@ -155,6 +191,41 @@ class TestRLMRuntime(unittest.TestCase):
 
         self.assertFalse(outside.exists())
         self.assertTrue((output_dir / "escape.md").exists())
+
+    def test_write_analysis_docs_marks_nonfinished_runs(self):
+        result = ControllerResult(
+            status="budget_exceeded",
+            result=None,
+            steps=[],
+            error="max_total_tokens=10 reached",
+            budget=BudgetSnapshot(
+                steps_used=1,
+                llm_calls=1,
+                prompt_tokens=8,
+                response_tokens=4,
+                total_tokens=12,
+            ),
+            final_state={},
+        )
+
+        output_dir = self.root / "docs"
+        structured = write_analysis_docs(output_dir, self.root, result, backend="test", model="fake")
+        index = (output_dir / "index.md").read_text(encoding="utf-8")
+        report = (output_dir / "analysis_report.md").read_text(encoding="utf-8")
+
+        self.assertIn("[budget_exceeded]", structured.summary)
+        self.assertIn("Try increasing --max-total-tokens or --max-steps.", index)
+        self.assertIn("--runtime legacy", index)
+        self.assertIn("**Status:** budget_exceeded", report)
+
+    def test_system_prompt_contains_strict_schema(self):
+        from rlm_runtime import PromptBuilder
+        prompt = PromptBuilder.SYSTEM_PROMPT
+        self.assertIn("'summary': str", prompt)
+        self.assertIn("'documents': [", prompt)
+        self.assertIn("'path': str", prompt)
+        self.assertIn("'title': str", prompt)
+        self.assertIn("'content': str", prompt)
 
 
 if __name__ == "__main__":
