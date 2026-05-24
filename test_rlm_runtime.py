@@ -414,6 +414,20 @@ class TestRLMRuntime(unittest.TestCase):
         result = _summarize_value(large_dict, 160)
         self.assertIn("dict(len=100)", result)
 
+    def test_summarize_value_nested_large_collection(self):
+        from rlm_runtime import _summarize_value
+        value = {"items": list(range(200))}
+        result = _summarize_value(value, 160)
+        self.assertIn("dict {'items': list(len=200)", result)
+        self.assertNotIn(repr(value), result)
+
+    def test_summarize_value_self_reference(self):
+        from rlm_runtime import _summarize_value
+        value = []
+        value.append(value)
+        result = _summarize_value(value, 160)
+        self.assertIn("list [...]", result)
+
     def test_summarize_value_large_str(self):
         from rlm_runtime import _summarize_value
         long_str = "a" * 500
@@ -425,6 +439,7 @@ class TestRLMRuntime(unittest.TestCase):
         self.assertEqual(_sanitize_md_table_cell("hello | world"), "hello &#124; world")
         self.assertEqual(_sanitize_md_table_cell("line1\nline2"), "line1 line2")
         self.assertEqual(_sanitize_md_table_cell("ok"), "ok")
+        self.assertEqual(_sanitize_md_table_cell("ends\\"), "ends\\\\")
 
     def test_write_analysis_docs_step_history_sanitizes_pipe_chars(self):
         result = ControllerResult(

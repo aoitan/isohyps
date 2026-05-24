@@ -75,16 +75,59 @@ def _cap_text(value: str, limit: int) -> str:
 _READ_SIZE_LIMIT = 2 * 1024 * 1024  # 2 MB
 
 
+def _safe_repr(value: Any, limit: int, depth: int = 0, seen: set[int] | None = None) -> str:
+    if seen is None:
+        seen = set()
+
+    value_id = id(value)
+    if isinstance(value, (list, tuple, dict, set)):
+        if value_id in seen:
+            return "..."
+        seen.add(value_id)
+
+    if isinstance(value, str) and len(value) > limit:
+        return f"str(len={len(value)}) {value[:limit - 3]}..."
+    if depth >= 2:
+        if isinstance(value, (list, tuple, set, dict)):
+            return f"{type(value).__name__}(len={len(value)})"
+        rendered = repr(value)
+        return _cap_text(rendered, limit)
+    if isinstance(value, list):
+        if len(value) > 100:
+            first = _safe_repr(value[0], 20, depth + 1, seen) if value else ""
+            return f"list(len={len(value)}) [{first}, ...]"
+        return "[" + ", ".join(_safe_repr(item, limit, depth + 1, seen) for item in value) + "]"
+    if isinstance(value, tuple):
+        rendered_items = ", ".join(_safe_repr(item, limit, depth + 1, seen) for item in value)
+        if len(value) == 1:
+            rendered_items += ","
+        return f"({rendered_items})"
+    if isinstance(value, set):
+        if len(value) > 100:
+            return f"set(len={len(value)}) {{...}}"
+        return "{" + ", ".join(_safe_repr(item, limit, depth + 1, seen) for item in value) + "}"
+    if isinstance(value, dict):
+        if len(value) > 50:
+            return f"dict(len={len(value)}) {{...}}"
+        items = [
+            f"{_safe_repr(key, limit, depth + 1, seen)}: {_safe_repr(item, limit, depth + 1, seen)}"
+            for key, item in value.items()
+        ]
+        return "{" + ", ".join(items) + "}"
+
+    return repr(value)
+
+
 def _summarize_value(value: Any, limit: int) -> str:
     # Early-exit for large collections to avoid expensive repr() calls (OOM guard)
     if isinstance(value, list) and len(value) > 100:
-        first = _summarize_value(value[0], 20) if value else ""
+        first = _safe_repr(value[0], 20) if value else ""
         return f"list(len={len(value)}) [{first}, ...]"
     if isinstance(value, dict) and len(value) > 50:
         return f"dict(len={len(value)}) {{...}}"
     if isinstance(value, str) and len(value) > limit:
         return f"str(len={len(value)}) {value[:limit - 3]}..."
-    rendered = repr(value)
+    rendered = _safe_repr(value, limit)
     if len(rendered) > limit:
         rendered = rendered[: limit - 3] + "..."
     return f"{type(value).__name__} {rendered}"
@@ -94,6 +137,8 @@ def _sanitize_md_table_cell(text: str) -> str:
     """Sanitize a string for safe insertion into a Markdown table cell."""
     text = text.replace("|", "&#124;")
     text = text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    if text.endswith("\\"):
+        text += "\\"
     return text
 
 
