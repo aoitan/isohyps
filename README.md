@@ -2,26 +2,42 @@
 
 > *等高線（Isohyps）* — コードの抽象度という「高さ」を地図のように行き来しながら、プロジェクト全体の地形を把握するツール。
 
-Recursive Language Models (RLM) の概念に基づき、大規模なプロジェクトを「抽象から具体へと段階的に」再帰下降解析するスクリプトです。
+LLM がファイルシステムを自律的に探索し、各ディレクトリ・ファイルの解析結果を段階的に集約することで、プロジェクト全体の設計と機能をMarkdownドキュメントとして出力するツールです。
+
+## 目次
+
+1. [概要](#概要)
+2. [セットアップ](#セットアップ)
+3. [アーキテクチャと実行モデル](#アーキテクチャと実行モデル)
+4. [基本的な使い方](#基本的な使い方)
+5. [運用上の制約とパラメータ仕様](#運用上の制約とパラメータ仕様)
+6. [依存関係とフォールバック](#依存関係とフォールバック)
+7. [出力結果](#出力結果)
+8. [制限事項と非推奨機能](#制限事項と非推奨機能)
+
+---
 
 ## 概要
 
-このツールは、LLMがファイルシステムを自律的に探索し、各階層で情報を要約・集約することで、トークン制限を回避しながらプロジェクト全体の設計と機能を把握することを目的としています。
+Isohyps は、LLM を使ったコードベース解析ツールです。Controller ランタイムが LLM エージェントとしてディレクトリを探索・解析し、構造化された Markdown ドキュメントを生成します。
 
-### 特徴
-- **再帰的要約:** 下位ディレクトリやファイルの解析結果を上位に積み上げ、プロジェクト全体の「エグゼクティブ・サマリー」を構築します。
-- **動的探索:** LLMがディレクトリ内の重要度を判断し、解析すべきパスを自ら選択します。
-- **構造化ドキュメンテーション:** 解析結果をプロジェクトのディレクトリ構造を模したMarkdownファイル群として出力します。
-- **マルチバックエンド:** Google Gemini API および Ollama (ローカル/リモート) に対応しています。
+主な用途:
+- 大規模リポジトリの全体像の把握
+- コードベースのドキュメント自動生成
+- 外部レビュアーやオンボーディング向けの設計ドキュメント作成
+
+対応バックエンド: Google Gemini API および Ollama（ローカル/リモート）
+
+---
 
 ## セットアップ
 
 ### 1. 環境構築
-Python 3.10以降を推奨します。
+Python 3.10以降が必要です。
 
 ```bash
 # リポジトリのクローン（またはディレクトリへ移動）
-cd project-analyzer-rlm/poc
+cd isohyps
 
 # 仮想環境の作成
 python3 -m venv venv
@@ -32,14 +48,45 @@ source venv/bin/activate  # macOS/Linux
 pip install -r requirements.txt
 ```
 
-### 2. 環境変数の設定 (Geminiを使用する場合のみ)
-`.env` ファイルを作成し、Google Gemini APIキーを設定します。
+### 2. 環境変数の設定 (Gemini を使用する場合)
+`.env` ファイルを作成し、Google Gemini API キーを設定します。
 
 ```env
 GOOGLE_API_KEY=your_api_key_here
 ```
 
-## 使い方
+### 3. Ollama を使用する場合の注意事項
+
+Ollama バックエンドを使う場合、`--num-ctx` でコンテキストサイズを設定できます（デフォルト: `8192`）。大規模プロジェクトを解析する際にコンテキストが溢れてエラーになる場合は、この値を増やしてください。
+
+```bash
+python analyzer.py . --backend ollama --model llama3 --num-ctx 32768
+```
+
+---
+
+## アーキテクチャと実行モデル
+
+### Controller
+デフォルトのランタイムです。LLM エージェントが以下のヘルパーツールを使ってディレクトリを自律的に探索します。
+
+- `list_dir`: ディレクトリ一覧の取得
+- `read_text`: ファイルのテキスト読み込み
+- `extract_symbols`: 構造化シンボル（クラス・関数など）の抽出
+- `llm_query`: 下位ディレクトリへの再帰的サブクエリ（Child Query）
+- `finish`: 探索完了・結果の確定
+
+探索が完了すると、LLM は `finish({'summary': str, 'documents': [...]})` を呼び出します。`documents` の各要素には `path` / `title` / `content` を指定できます（省略時はホスト側が補完）。
+
+### Sandbox
+Controller の各ステップはサンドボックスプロセス内で実行されます。タイムアウトやリソース超過が発生した場合、プロセスはリセットされ、次のステップで再試行が可能です。
+
+### Child Query
+`llm_query` ヘルパーを使って、サブディレクトリやファイル群を別の Controller インスタンスに委任する再帰的サブクエリです。`--depth` パラメータで再帰の深さを制限できます。
+
+---
+
+## 基本的な使い方
 
 ### 基本コマンド
 ```bash
@@ -48,17 +95,17 @@ python analyzer.py [解析対象ディレクトリ] [オプション]
 
 ### 実行例
 
-#### 1. Gemini API を使用する場合 (デフォルト)
+#### Gemini API を使用する場合（デフォルト）
 ```bash
-python analyzer.py . --depth 3
+python analyzer.py . --depth 2
 ```
 
-#### 2. ローカルの Ollama を使用する場合
+#### ローカルの Ollama を使用する場合
 ```bash
 python analyzer.py . --backend ollama --model llama3
 ```
 
-#### 3. ネットワーク上の Ollama サーバーを使用する場合
+#### Ollama（ネットワーク上のサーバー）を使用する場合
 ```bash
 python analyzer.py . \
   --backend ollama \
@@ -67,48 +114,101 @@ python analyzer.py . \
   --model llama3
 ```
 
-#### 4. Controller runtime を使用する場合 (デフォルト)
+### 主なオプション
+
+| オプション | デフォルト値 | 説明 |
+|---|---|---|
+| `root` | `.` | 解析を開始するルートディレクトリ |
+| `--depth` | `2` | Child Query による再帰探索の最大深さ |
+| `--max-steps` | `8` | Controller の最大ステップ数 |
+| `--step-timeout` | `15.0` | 1ステップあたりのタイムアウト秒数 |
+| `--max-total-tokens` | `30000` | Controller 全体の共有トークン予算 |
+| `--backend` | `gemini` | LLM バックエンド（`gemini` または `ollama`） |
+| `--model` | — | 使用するモデル名 |
+| `--out` | `analysis_docs` | 出力先ディレクトリ |
+| `--ollama-url` | — | Ollama API のエンドポイント URL |
+| `--num-ctx` | `8192` | Ollama のコンテキストサイズ |
+| `--runtime` | `controller` | `controller`（推奨）または `legacy`（非推奨） |
+
+---
+
+## 運用上の制約とパラメータ仕様
+
+Controller ランタイムは、無限ループや過剰な API 課金を防ぐために以下の実行時制約を持ちます。各制約に達した場合の**システムの振る舞い**を理解しておくことが重要です。
+
+### `--max-steps`（デフォルト: `8`）
+Controller が LLM ツールコールを実行できる最大ループ回数です。
+
+**上限到達時の挙動:** 上限に達すると `BudgetExceededError` が発生し、探索は即座に打ち切られます。ツール全体はクラッシュせず、**そこまでに収集できた情報を使って出力ドキュメントを生成**し、ステータス `budget_exceeded` で正常終了します。
+
+### `--max-total-tokens`（デフォルト: `30000`）
+Controller 全体（すべての LLM 呼び出しの合計）で消費可能なトークン数の上限です。
+
+**上限到達時の挙動:** `--max-steps` と同様に `BudgetExceededError` として扱われます。**そこまでの結果で出力を生成**し、`budget_exceeded` ステータスで終了します。出力ドキュメントの `analysis_report.md` にステータスと使用済みトークン数が記録されます。
+
+### `--step-timeout`（デフォルト: `15.0` 秒）
+Sandbox での 1 ステップの実行に許容する最大時間です。
+
+**タイムアウト時の挙動:** タイムアウトに達すると **Sandbox プロセスがリセット**されます。そのステップは失敗として扱われますが、残りのステップ数に余裕がある場合は Controller が次のステップで別の手段を試行できます。
+
+### `--depth`（デフォルト: `2`）
+Child Query（`llm_query` ヘルパー）による再帰的サブクエリの最大深度です。
+
+**上限到達時の挙動:** 深度制限を超えた Controller は `budget_exceeded` として終了します。Child Query 内で発生した場合、呼び出し元の `llm_query` はエラーとして観測され、そのステップは失敗扱いになります。残りのステップ数に余裕があれば、Controller は次のステップで別の手段を試行できます。
+
+> **注意:** `budget_exceeded` ステータスで終了した場合、出力されるドキュメントは**不完全**です。完全な解析が必要な場合は `--max-total-tokens` または `--max-steps` を増やして再実行してください。
+
+---
+
+## 依存関係とフォールバック
+
+### tree-sitter
+
+`extract_symbols` ヘルパーはコードの構造化解析（クラス・関数などのシンボル抽出）に `tree-sitter-languages` パッケージを使用します。標準の `requirements.txt` には含まれていますが、最小構成やカスタム環境では利用できない場合があります。
+
+**`tree-sitter` が利用できない場合（未インストール、またはパース失敗時）:**
+シンボル抽出は行われず、ファイル先頭部分の単純なテキスト抽出（`read_text_excerpt`、デフォルト最大 1000 文字）にデグレードします。このデグレードは自動的に行われ、ツールの実行は継続されますが、**解析精度が大きく低下する**可能性があります。
+
+精度を重視する場合は `tree-sitter-languages` のインストールを強く推奨します。
+
 ```bash
-python analyzer.py . \
-  --depth 2 \
-  --max-steps 8 \
-  --max-total-tokens 30000 \
-  --step-timeout 15
+pip install tree-sitter-languages
 ```
 
-### 主なオプション
-- `root`: 解析を開始するルートディレクトリ（デフォルト: `.`）
-- `--depth`: 再帰解析の最大深さ（デフォルト: `2`）
-- `--runtime`: `controller` (推奨) または `legacy` (非推奨 / 将来削除予定)
-- `--max-steps`: controller runtime の最大 step 数 (デフォルト: `8`)
-- `--step-timeout`: controller runtime の 1 step あたりタイムアウト秒数 (デフォルト: `15.0`)
-- `--max-total-tokens`: controller runtime の共有トークン予算 (デフォルト: `30000`)
-- `--backend`: 使用するLLMバックエンド (`gemini` または `ollama`)
-- `--model`: 使用するモデル名
-- `--out`: 構造化ドキュメントの出力先ディレクトリ（デフォルト: `analysis_docs`）
-- `--ollama-url`: Ollama APIのエンドポイントURL
-- `--num-ctx`: Ollamaのコンテキストサイズ
-
-`controller` runtime はトップレベルの解析完了時に `finish({'summary': str})` を最低契約として要求し、必要に応じて
-`documents` list を受け取って `analysis_docs` を再構築します。`documents` の各要素では `path` / `title` / `content`
-を指定できますが、省略時はホスト側が補完します。`legacy` runtime は互換用途として残っていますが、新規利用は推奨しません。
-`legacy` を使う場合は、controller と実行時間やトークン消費の特性が異なる点に注意してください。
+---
 
 ## 出力結果
 
-`--out` で指定したディレクトリ（デフォルト: `analysis_docs`）に、以下の構造でMarkdownファイルが生成されます。
+`--out` で指定したディレクトリ（デフォルト: `analysis_docs`）に、以下の構造で Markdown ファイルが生成されます。
 
 ```text
 analysis_docs/
-├── index.md             # プロジェクト全体の要約 (Root)
-├── analysis_report.md   # 全解析結果を集約したレポート
+├── analysis_report.md   # 実行サマリー（ステータス・トークン使用量等）
+├── index.md             # プロジェクト全体の要約
 ├── src/
-│   ├── index.md         # srcディレクトリの要約
-│   ├── main.md          # main.pyの解析結果
-│   └── utils.md         # utils.pyの解析結果
+│   ├── index.md         # src ディレクトリの要約
+│   ├── main.md          # main.py の解析結果
+│   └── utils.md         # utils.py の解析結果
 └── ...
 ```
 
-各ファイルには、LLMによって生成された機能説明、クラス・関数の責務、およびモジュールの役割が記述されます。
+`analysis_report.md` には以下の情報が含まれます:
+- 実行バックエンドとモデル名
+- ランタイムステータス（`finished` / `budget_exceeded` / `error` 等）
+- 使用済みステップ数・トークン数
+- エグゼクティブサマリー
 
-`controller` runtime では、LLM は helper (`list_dir`, `read_text`, `extract_symbols`, `llm_query`, `finish`) を介して探索し、最終結果から `analysis_docs` を再構築します。
+---
+
+## 制限事項と非推奨機能
+
+### `--runtime legacy`（非推奨）
+
+`--runtime legacy` は旧来の `RLMAnalyzer` クラスを使った実行モードです。互換性のために残されていますが、**現在は非推奨であり将来のバージョンで削除予定**です。
+
+Legacy モードは Controller ランタイムと以下の点で異なります:
+- トークン予算管理（`--max-total-tokens`）が機能しません。
+- ステップタイムアウト（`--step-timeout`）が適用されません。
+- `budget_exceeded` によるフェイルセーフな部分出力の仕組みがありません。
+
+新規の利用は推奨しません。Controller ランタイムを使用してください。
