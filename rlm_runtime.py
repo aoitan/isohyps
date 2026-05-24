@@ -9,7 +9,7 @@ import sys
 import time
 import traceback
 from contextlib import redirect_stdout
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any, Protocol, TypedDict
@@ -78,6 +78,14 @@ def _summarize_value(value: Any, limit: int) -> str:
     return f"{type(value).__name__} {rendered}"
 
 
+def _summarize_child_error(error: str | None, limit: int = 200) -> str:
+    if not error:
+        return "no detail provided"
+    lines = [line.strip() for line in error.splitlines() if line.strip()]
+    detail = lines[-1] if lines else error.strip()
+    return _cap_text(detail, limit)
+
+
 @dataclass
 class BudgetLimits:
     max_steps: int = 8
@@ -87,6 +95,18 @@ class BudgetLimits:
     max_stdout_chars: int = 2000
     max_state_items: int = 20
     max_state_value_chars: int = 160
+
+
+@dataclass
+class PartialBudgetLimits:
+    max_steps: int | None = None
+    max_total_tokens: int | None = None
+
+
+@dataclass
+class ChildQueryConfig:
+    prompt_builder: PromptBuilder | None = None
+    limits: PartialBudgetLimits | None = None
 
 
 @dataclass
@@ -140,6 +160,13 @@ class RunContext:
             response_tokens=self.response_tokens,
             total_tokens=self.total_tokens,
         )
+
+    def accumulate(self, other: BudgetSnapshot) -> None:
+        self.llm_calls += other.llm_calls
+        self.prompt_tokens += other.prompt_tokens
+        self.response_tokens += other.response_tokens
+        if self.total_tokens > self.limits.max_total_tokens:
+            raise BudgetExceededError(f"max_total_tokens={self.limits.max_total_tokens} reached")
 
 
 @dataclass
@@ -680,12 +707,14 @@ class RLMController:
         run_context: RunContext,
         prompt_builder: PromptBuilder | None = None,
         validator: CodeResponseValidator | None = None,
+        child_config: ChildQueryConfig | None = None,
     ):
         self.client = client
         self.root = root.resolve()
         self.run_context = run_context
         self.prompt_builder = prompt_builder or PromptBuilder()
         self.validator = validator or CodeResponseValidator()
+        self.child_config = child_config or ChildQueryConfig()
 
     def run(
         self,
@@ -777,10 +806,42 @@ class RLMController:
                     )
                 previous = observation.to_prompt()
 
+    def _child_limits(self) -> BudgetLimits:
+        child_limits = replace(self.run_context.limits)
+        overrides = self.child_config.limits
+        if overrides is None:
+            return child_limits
+        if overrides.max_steps is not None:
+            child_limits.max_steps = overrides.max_steps
+        if overrides.max_total_tokens is not None:
+            child_limits.max_total_tokens = overrides.max_total_tokens
+        return child_limits
+
     def _run_subquery(self, goal: str, child_context: Any, depth: int) -> Any:
         _dbg("ctrl", f"subquery depth={depth} goal={goal[:80]!r}")
-        child_result = self.run(goal=goal, depth=depth, parent_context=child_context)
-        _dbg("ctrl", f"subquery done status={child_result.status} steps_used={child_result.budget.steps_used} tokens={child_result.budget.total_tokens}")
+        child_run_context = RunContext(limits=self._child_limits())
+        child_controller = type(self)(
+            client=self.client,
+            root=self.root,
+            run_context=child_run_context,
+            prompt_builder=self.child_config.prompt_builder or self.prompt_builder,
+            validator=self.validator,
+            child_config=self.child_config,
+        )
+        try:
+            child_result = child_controller.run(goal=goal, depth=depth, parent_context=child_context)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Child query failed (execution_error): {_summarize_child_error(f'{type(exc).__name__}: {exc}')}"
+            ) from exc
+        finally:
+            self.run_context.accumulate(child_run_context.snapshot())
+        _dbg(
+            "ctrl",
+            f"subquery done status={child_result.status} steps_used={child_result.budget.steps_used} tokens={child_result.budget.total_tokens}",
+        )
         if child_result.status != "finished":
-            raise RuntimeError(child_result.error or f"Child query stopped with status={child_result.status}")
+            raise RuntimeError(
+                f"Child query failed ({child_result.status}): {_summarize_child_error(child_result.error)}"
+            )
         return child_result.result

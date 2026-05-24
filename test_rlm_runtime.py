@@ -2,13 +2,18 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from rlm_runtime import (
+    BudgetExceededError,
     BudgetLimits,
     CodeResponseValidator,
     ControllerResult,
     BudgetSnapshot,
+    ChildQueryConfig,
     IsolatedREPL,
+    PartialBudgetLimits,
+    PromptBuilder,
     RLMController,
     RunContext,
     validate_analysis_result,
@@ -29,6 +34,14 @@ class ScriptedClient:
         if isinstance(response, Exception):
             raise response
         return response
+
+
+class TaggedPromptBuilder(PromptBuilder):
+    def __init__(self, tag: str):
+        self.tag = tag
+
+    def build(self, goal: str, step: int, max_steps: int, previous: str, parent_context):
+        return f"{self.tag}\n" + super().build(goal, step, max_steps, previous, parent_context)
 
 
 class TestCodeResponseValidator(unittest.TestCase):
@@ -62,8 +75,18 @@ class TestRLMRuntime(unittest.TestCase):
 
     def _controller(self, responses, **limits_kwargs):
         client = ScriptedClient(responses)
+        prompt_builder = limits_kwargs.pop("prompt_builder", None)
+        validator = limits_kwargs.pop("validator", None)
+        child_config = limits_kwargs.pop("child_config", None)
         limits = BudgetLimits(max_steps=limits_kwargs.pop("max_steps", 4), max_depth=limits_kwargs.pop("max_depth", 2), **limits_kwargs)
-        controller = RLMController(client=client, root=self.root, run_context=RunContext(limits=limits))
+        controller = RLMController(
+            client=client,
+            root=self.root,
+            run_context=RunContext(limits=limits),
+            prompt_builder=prompt_builder,
+            validator=validator,
+            child_config=child_config,
+        )
         return controller, client
 
     def test_controller_keeps_state_across_steps(self):
@@ -176,6 +199,99 @@ class TestRLMRuntime(unittest.TestCase):
         self.assertEqual(result.result["summary"], "child-summary")
         self.assertEqual(len(client.prompts), 2)
         self.assertIn("Parent context: dict {'path': 'src/app.py'}", client.prompts[1])
+
+    def test_llm_query_uses_independent_child_step_limit(self):
+        controller, _ = self._controller(
+            [
+                "try:\n    llm_query('Need another step')\nexcept RuntimeError as exc:\n    child_error = str(exc)",
+                "x = 1",
+                "finish({'summary': child_error, 'documents': []})",
+            ],
+            max_steps=2,
+            child_config=ChildQueryConfig(limits=PartialBudgetLimits(max_steps=1)),
+        )
+
+        result = controller.run("Handle a child budget failure.")
+
+        self.assertEqual(result.status, "finished")
+        self.assertEqual(result.budget.steps_used, 2)
+        self.assertIn("Child query failed (budget_exceeded): max_steps=1 reached", result.result["summary"])
+
+    def test_run_context_accumulates_child_token_usage(self):
+        controller, _ = self._controller(
+            ["finish('child-summary')"],
+            child_config=ChildQueryConfig(limits=PartialBudgetLimits(max_total_tokens=2000)),
+        )
+
+        child_value = controller._run_subquery("Summarize src/app.py", {"path": "src/app.py"}, depth=1)
+
+        self.assertEqual(child_value, "child-summary")
+        self.assertEqual(controller.run_context.llm_calls, 1)
+        self.assertGreater(controller.run_context.total_tokens, 0)
+
+    def test_llm_query_child_tokens_can_trip_parent_budget(self):
+        controller, _ = self._controller(
+            ["finish('child-summary')"],
+            max_total_tokens=1,
+            child_config=ChildQueryConfig(limits=PartialBudgetLimits(max_total_tokens=2000)),
+        )
+
+        with self.assertRaises(BudgetExceededError):
+            controller._run_subquery("Summarize src/app.py", None, depth=1)
+
+        self.assertEqual(controller.run_context.llm_calls, 1)
+        self.assertGreater(controller.run_context.total_tokens, controller.run_context.limits.max_total_tokens)
+
+    def test_llm_query_can_override_child_prompt_builder(self):
+        child_prompt_builder = TaggedPromptBuilder("CHILD-PROMPT")
+        controller, client = self._controller(
+            [
+                "child = llm_query('Summarize src/app.py')\nfinish({'summary': child, 'documents': []})",
+                "finish('child-summary')",
+            ],
+            child_config=ChildQueryConfig(prompt_builder=child_prompt_builder),
+        )
+
+        result = controller.run("Use a child query with a custom prompt.")
+
+        self.assertEqual(result.status, "finished")
+        self.assertNotIn("CHILD-PROMPT", client.prompts[0])
+        self.assertIn("CHILD-PROMPT", client.prompts[1])
+
+    def test_llm_query_sanitizes_child_failure_details(self):
+        controller, _ = self._controller([])
+        child_result = ControllerResult(
+            status="execution_error",
+            result=None,
+            steps=[],
+            error="Traceback (most recent call last):\n  File '<stdin>', line 1, in <module>\nValueError: boom",
+            budget=BudgetSnapshot(
+                steps_used=1,
+                llm_calls=0,
+                prompt_tokens=0,
+                response_tokens=0,
+                total_tokens=0,
+            ),
+            final_state={},
+        )
+
+        with patch.object(RLMController, "run", return_value=child_result):
+            with self.assertRaises(RuntimeError) as exc_info:
+                controller._run_subquery("Summarize src/app.py", None, depth=1)
+
+        self.assertEqual(str(exc_info.exception), "Child query failed (execution_error): ValueError: boom")
+
+    def test_llm_query_sanitizes_unexpected_child_exception(self):
+        controller, _ = self._controller([])
+
+        with patch.object(RLMController, "run", side_effect=RuntimeError("Traceback\nValueError: noisy detail")):
+            with self.assertRaises(RuntimeError) as exc_info:
+                controller._run_subquery("Summarize src/app.py", None, depth=1)
+
+        self.assertEqual(
+            str(exc_info.exception),
+            "Child query failed (execution_error): ValueError: noisy detail",
+        )
 
     def test_write_analysis_docs_sanitizes_parent_traversal_paths(self):
         controller, _ = self._controller(["finish({'summary': 'done', 'documents': []})"])
