@@ -20,21 +20,7 @@ from rlm_runtime import (
     validate_analysis_result,
     write_analysis_docs,
 )
-
-
-class ScriptedClient:
-    def __init__(self, responses):
-        self.responses = list(responses)
-        self.prompts = []
-
-    def query(self, prompt: str) -> str:
-        self.prompts.append(prompt)
-        if not self.responses:
-            raise AssertionError("No more scripted responses left.")
-        response = self.responses.pop(0)
-        if isinstance(response, Exception):
-            raise response
-        return response
+from test_utils import ScriptedClient
 
 
 class TaggedPromptBuilder(PromptBuilder):
