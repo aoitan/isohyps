@@ -343,6 +343,115 @@ class TestRLMRuntime(unittest.TestCase):
         self.assertIn("'title': str", prompt)
         self.assertIn("'content': str", prompt)
 
+    def test_system_prompt_contains_new_helpers(self):
+        prompt = PromptBuilder.SYSTEM_PROMPT
+        self.assertIn("path_exists", prompt)
+        self.assertIn("is_dir", prompt)
+        self.assertIn("read_json", prompt)
+
+    def test_repl_path_exists_and_is_dir(self):
+        with IsolatedREPL(self.root, BudgetLimits()) as repl:
+            obs = repl.execute(
+                "result = {'exists_src': path_exists('src'), 'is_dir_src': is_dir('src'), 'exists_missing': path_exists('missing.txt')}\nfinish(result)",
+                lambda prompt, context: None,
+            )
+        self.assertTrue(obs.finished)
+        self.assertTrue(obs.result["exists_src"])
+        self.assertTrue(obs.result["is_dir_src"])
+        self.assertFalse(obs.result["exists_missing"])
+
+    def test_repl_path_exists_blocks_root_escape(self):
+        with IsolatedREPL(self.root, BudgetLimits()) as repl:
+            obs = repl.execute("path_exists('../outside')", lambda prompt, context: None)
+        self.assertEqual(obs.kind, "execution_error")
+        self.assertIn("escapes root", obs.error)
+
+    def test_repl_is_dir_blocks_root_escape(self):
+        with IsolatedREPL(self.root, BudgetLimits()) as repl:
+            obs = repl.execute("is_dir('../outside')", lambda prompt, context: None)
+        self.assertEqual(obs.kind, "execution_error")
+        self.assertIn("escapes root", obs.error)
+
+    def test_repl_read_json(self):
+        (self.root / "config.json").write_text('{"key": "value", "num": 42}', encoding="utf-8")
+        with IsolatedREPL(self.root, BudgetLimits()) as repl:
+            obs = repl.execute("data = read_json('config.json')\nfinish(data['key'])", lambda prompt, context: None)
+        self.assertTrue(obs.finished)
+        self.assertEqual(obs.result, "value")
+
+    def test_repl_read_json_blocks_root_escape(self):
+        with IsolatedREPL(self.root, BudgetLimits()) as repl:
+            obs = repl.execute("read_json('../outside.json')", lambda prompt, context: None)
+        self.assertEqual(obs.kind, "execution_error")
+        self.assertIn("escapes root", obs.error)
+
+    def test_repl_read_json_rejects_oversized_file(self):
+        large_path = self.root / "big.json"
+        large_path.write_bytes(b'{"x": "' + b"a" * (2 * 1024 * 1024 + 1) + b'"}')
+        with IsolatedREPL(self.root, BudgetLimits()) as repl:
+            obs = repl.execute("read_json('big.json')", lambda prompt, context: None)
+        self.assertEqual(obs.kind, "execution_error")
+        self.assertIn("too large", obs.error)
+
+    def test_repl_read_text_rejects_oversized_file(self):
+        large_path = self.root / "big.txt"
+        large_path.write_bytes(b"x" * (2 * 1024 * 1024 + 1))
+        with IsolatedREPL(self.root, BudgetLimits()) as repl:
+            obs = repl.execute("read_text('big.txt')", lambda prompt, context: None)
+        self.assertEqual(obs.kind, "execution_error")
+        self.assertIn("too large", obs.error)
+
+    def test_summarize_value_large_list(self):
+        from rlm_runtime import _summarize_value
+        large_list = list(range(200))
+        result = _summarize_value(large_list, 160)
+        self.assertIn("list(len=200)", result)
+        self.assertNotIn(repr(large_list), result)
+
+    def test_summarize_value_large_dict(self):
+        from rlm_runtime import _summarize_value
+        large_dict = {str(i): i for i in range(100)}
+        result = _summarize_value(large_dict, 160)
+        self.assertIn("dict(len=100)", result)
+
+    def test_summarize_value_large_str(self):
+        from rlm_runtime import _summarize_value
+        long_str = "a" * 500
+        result = _summarize_value(long_str, 160)
+        self.assertIn("str(len=500)", result)
+
+    def test_sanitize_md_table_cell(self):
+        from rlm_runtime import _sanitize_md_table_cell
+        self.assertEqual(_sanitize_md_table_cell("hello | world"), "hello &#124; world")
+        self.assertEqual(_sanitize_md_table_cell("line1\nline2"), "line1 line2")
+        self.assertEqual(_sanitize_md_table_cell("ok"), "ok")
+
+    def test_write_analysis_docs_step_history_sanitizes_pipe_chars(self):
+        result = ControllerResult(
+            status="finished",
+            result={"summary": "done"},
+            steps=[
+                __import__("rlm_runtime").ExecutionObservation(
+                    kind="ok",
+                    stdout="col1 | col2",
+                    error=None,
+                    state={},
+                    finished=False,
+                    result=None,
+                )
+            ],
+            error=None,
+            budget=BudgetSnapshot(
+                steps_used=1, llm_calls=1, prompt_tokens=10, response_tokens=5, total_tokens=15
+            ),
+            final_state={},
+        )
+        output_dir = self.root / "docs_sanitize"
+        write_analysis_docs(output_dir, self.root, result, backend="test", model="fake")
+        report = (output_dir / "analysis_report.md").read_text(encoding="utf-8")
+        self.assertNotIn("col1 | col2", report)
+        self.assertIn("&#124;", report)
+
 
 if __name__ == "__main__":
     unittest.main()

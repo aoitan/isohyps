@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import io
+import json
 import math
 import multiprocessing
 import os
@@ -71,11 +72,29 @@ def _cap_text(value: str, limit: int) -> str:
     return value[: limit - 3] + "..."
 
 
+_READ_SIZE_LIMIT = 2 * 1024 * 1024  # 2 MB
+
+
 def _summarize_value(value: Any, limit: int) -> str:
+    # Early-exit for large collections to avoid expensive repr() calls (OOM guard)
+    if isinstance(value, list) and len(value) > 100:
+        first = _summarize_value(value[0], 20) if value else ""
+        return f"list(len={len(value)}) [{first}, ...]"
+    if isinstance(value, dict) and len(value) > 50:
+        return f"dict(len={len(value)}) {{...}}"
+    if isinstance(value, str) and len(value) > limit:
+        return f"str(len={len(value)}) {value[:limit - 3]}..."
     rendered = repr(value)
     if len(rendered) > limit:
         rendered = rendered[: limit - 3] + "..."
     return f"{type(value).__name__} {rendered}"
+
+
+def _sanitize_md_table_cell(text: str) -> str:
+    """Sanitize a string for safe insertion into a Markdown table cell."""
+    text = text.replace("|", "&#124;")
+    text = text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    return text
 
 
 def _summarize_child_error(error: str | None, limit: int = 200) -> str:
@@ -324,6 +343,9 @@ class PromptBuilder:
         "Available helpers:\n"
         "- list_dir(path='.') -> list[str]\n"
         "- read_text(path, limit=2000) -> str\n"
+        "- read_json(path) -> parsed json value\n"
+        "- path_exists(path) -> bool\n"
+        "- is_dir(path) -> bool\n"
         "- extract_symbols(path) -> dict(language, symbols, fallback_excerpt, error)\n"
         "- llm_query(prompt, context=None) -> child result value\n"
         "- finish(value) -> immediately end the run. For top-level project analysis, the value MUST be a dict matching:\n"
@@ -379,7 +401,16 @@ class _CappedWriter(io.StringIO):
 
 def _sandbox_worker(connection: Connection, root: str, limits: BudgetLimits) -> None:
     root_path = Path(root).resolve()
-    helper_names = {"list_dir", "read_text", "extract_symbols", "llm_query", "finish"}
+    helper_names = {
+        "list_dir",
+        "read_text",
+        "extract_symbols",
+        "llm_query",
+        "finish",
+        "path_exists",
+        "is_dir",
+        "read_json",
+    }
     globals_dict: dict[str, Any] = {"__builtins__": SAFE_BUILTINS}
 
     def resolve_path(path: str | Path) -> Path:
@@ -396,6 +427,11 @@ def _sandbox_worker(connection: Connection, root: str, limits: BudgetLimits) -> 
     def read_text(path: str, limit: int = 2000) -> str:
         _dbg("sandbox", f"read_text({path!r}, limit={limit})")
         target = resolve_path(path)
+        file_size = target.stat().st_size
+        if file_size > _READ_SIZE_LIMIT:
+            raise ValueError(
+                f"read_text: file too large ({file_size} bytes > {_READ_SIZE_LIMIT} bytes limit)"
+            )
         return read_text_excerpt(target, limit=min(limit, 2000))
 
     def extract_symbols_helper(path: str) -> dict[str, Any]:
@@ -420,6 +456,26 @@ def _sandbox_worker(connection: Connection, root: str, limits: BudgetLimits) -> 
         _dbg("sandbox", f"finish({type(value).__name__}): {repr(value)[:80]!r}")
         raise _FinishSignal(value)
 
+    def path_exists(path: str) -> bool:
+        _dbg("sandbox", f"path_exists({path!r})")
+        target = resolve_path(path)
+        return target.exists()
+
+    def is_dir(path: str) -> bool:
+        _dbg("sandbox", f"is_dir({path!r})")
+        target = resolve_path(path)
+        return target.is_dir()
+
+    def read_json(path: str) -> Any:
+        _dbg("sandbox", f"read_json({path!r})")
+        target = resolve_path(path)
+        file_size = target.stat().st_size
+        if file_size > _READ_SIZE_LIMIT:
+            raise ValueError(
+                f"read_json: file too large ({file_size} bytes > {_READ_SIZE_LIMIT} bytes limit)"
+            )
+        return json.loads(target.read_text(encoding="utf-8"))
+
     globals_dict.update(
         {
             "list_dir": list_dir,
@@ -427,6 +483,9 @@ def _sandbox_worker(connection: Connection, root: str, limits: BudgetLimits) -> 
             "extract_symbols": extract_symbols_helper,
             "llm_query": llm_query,
             "finish": finish,
+            "path_exists": path_exists,
+            "is_dir": is_dir,
+            "read_json": read_json,
         }
     )
 
@@ -627,6 +686,14 @@ def _normalize_structured_analysis(root_name: str, result: Any) -> StructuredAna
     return StructuredAnalysis(summary=summary, documents=documents)
 
 
+def _summarize_observation(obs: ExecutionObservation) -> str:
+    if obs.error:
+        return obs.error.splitlines()[0]
+    if obs.stdout:
+        return obs.stdout.strip().splitlines()[0]
+    return f"Result: {_summarize_value(obs.result, 100)}"
+
+
 def write_analysis_docs(
     output_dir: Path,
     root_path: Path,
@@ -691,6 +758,15 @@ def write_analysis_docs(
                 "## Final State",
                 "",
                 "\n".join(f"- {name}: {value}" for name, value in sorted(controller_result.final_state.items())) or "- (empty)",
+                "",
+                "## Step History",
+                "",
+                "| Step | Kind | Status | Summary |",
+                "| :--- | :--- | :--- | :--- |",
+                *[
+                    f"| {i+1} | {step.kind} | {'✅' if not step.error else '❌'} | {_sanitize_md_table_cell(_summarize_observation(step)[:100])} |"
+                    for i, step in enumerate(controller_result.steps)
+                ],
                 "",
             ]
         ),
