@@ -12,7 +12,7 @@ import traceback
 from contextlib import redirect_stdout
 from dataclasses import dataclass, replace
 from multiprocessing.connection import Connection
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, TypedDict
 
 from analysis_helpers import detect_language, extract_symbols, read_text_excerpt
@@ -739,6 +739,163 @@ def _summarize_observation(obs: ExecutionObservation) -> str:
     return f"Result: {_summarize_value(obs.result, 100)}"
 
 
+class AnalysisDocBuilder:
+    """Encapsulates document generation with path sanitization, collision avoidance, and minimal output guarantees."""
+
+    RESERVED_NAMES: frozenset[str] = frozenset({"analysis_report.md"})
+    MAX_FILENAME_LENGTH = 255
+
+    def __init__(self, output_dir: Path) -> None:
+        self.output_dir = output_dir.resolve()
+        # Tracks paths that are reserved or already written; used for collision detection.
+        self._written_paths: set[Path] = set()
+
+    def build(
+        self,
+        root_path: Path,
+        controller_result: ControllerResult,
+        backend: str,
+        model: str,
+    ) -> StructuredAnalysis:
+        """Generate documents and report from a controller result.
+
+        Always produces at least index.md content and analysis_report.md even on
+        abnormal termination.  Returns a StructuredAnalysis whose document paths
+        reflect the actual files written.
+        """
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Reserve the system report path so LLM documents cannot claim it.
+        report_path = self.output_dir / "analysis_report.md"
+        self._written_paths.add(report_path)
+
+        structured = _normalize_structured_analysis(root_path.name, controller_result.result)
+
+        if controller_result.status != "finished":
+            detail = controller_result.error or structured.summary or str(controller_result.result)
+            guidance = []
+            if controller_result.status == "budget_exceeded":
+                guidance.append("Try increasing --max-total-tokens or --max-steps.")
+            guidance.append("If the controller keeps failing, retry with --runtime legacy.")
+            failure_summary = f"[{controller_result.status}] {detail} {' '.join(guidance)}".strip()
+            structured = StructuredAnalysis(
+                summary=failure_summary,
+                documents=[
+                    AnalysisDocument(
+                        path="index.md",
+                        title=f"Analysis stopped: {controller_result.status}",
+                        content=failure_summary,
+                    )
+                ],
+            )
+
+        for document in structured.documents:
+            sanitized = self._sanitize_path(document.path)
+            target = self._avoid_collision(sanitized)
+            self._written_paths.add(target)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            body = document.content
+            if body and not body.lstrip().startswith("#"):
+                body = f"# {document.title}\n\n{body}"
+            target.write_text(body or f"# {document.title}\n", encoding="utf-8")
+            # Update path to the actual written location relative to output_dir.
+            document.path = str(target.relative_to(self.output_dir))
+
+        report_path.write_text(
+            "\n".join(
+                [
+                    f"# Project Analysis Report: {root_path.name}",
+                    "",
+                    f"**Root Directory:** `{root_path}`  ",
+                    f"**Backend:** {backend} ({model})  ",
+                    f"**Runtime:** controller  ",
+                    f"**Status:** {controller_result.status}  ",
+                    f"**Steps Used:** {controller_result.budget.steps_used}  ",
+                    f"**Approx Tokens:** {controller_result.budget.total_tokens}  ",
+                    "",
+                    "## Executive Summary",
+                    "",
+                    structured.summary or str(controller_result.result),
+                    "",
+                    "## Final State",
+                    "",
+                    "\n".join(f"- {name}: {value}" for name, value in sorted(controller_result.final_state.items())) or "- (empty)",
+                    "",
+                    "## Step History",
+                    "",
+                    "| Step | Kind | Status | Summary |",
+                    "| :--- | :--- | :--- | :--- |",
+                    *[
+                        f"| {i+1} | {step.kind} | {'✅' if not step.error else '❌'} | {_sanitize_md_table_cell(_summarize_observation(step)[:100])} |"
+                        for i, step in enumerate(controller_result.steps)
+                    ],
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return structured
+
+    def _sanitize_path(self, raw_path: str) -> Path:
+        """Return a path guaranteed to be inside output_dir.
+
+        Uses pure string-level normalization (no filesystem access) to strip
+        ``..`` components and absolute-path markers so symlink tricks cannot
+        bypass the sandbox boundary.
+        """
+        normalized = str(raw_path).replace("\\", "/")
+        parts = PurePosixPath(normalized).parts
+        safe_parts: list[str] = []
+        for part in parts:
+            if part.startswith("/") or part == "..":
+                continue
+            if part == ".":
+                continue
+            if part.endswith(":"):
+                continue
+            if len(part) >= 2 and part[1] == ":":
+                part = part[2:]
+                if not part:
+                    continue
+            if len(part) > self.MAX_FILENAME_LENGTH:
+                part = part[: self.MAX_FILENAME_LENGTH]
+            safe_parts.append(part)
+
+        if not safe_parts:
+            return self.output_dir / "index.md"
+
+        return self.output_dir / Path(*safe_parts)
+
+    def _avoid_collision(self, target_path: Path) -> Path:
+        """Return a path not in ``_written_paths``.
+
+        If ``target_path`` is already taken, appends ``_1``, ``_2``, …
+        immediately before the extension.  Truncates the stem when necessary to
+        respect ``MAX_FILENAME_LENGTH``.
+        """
+        stem = target_path.stem
+        ext = target_path.suffix
+        parent = target_path.parent
+
+        if len(target_path.name) > self.MAX_FILENAME_LENGTH:
+            max_stem_len = self.MAX_FILENAME_LENGTH - len(ext)
+            target_path = parent / f"{stem[: max(1, max_stem_len)]}{ext}"
+
+        if target_path not in self._written_paths:
+            return target_path
+
+        i = 1
+        while True:
+            suffix_str = f"_{i}"
+            max_stem_len = self.MAX_FILENAME_LENGTH - len(ext) - len(suffix_str)
+            truncated_stem = stem[: max(1, max_stem_len)]
+            new_name = f"{truncated_stem}{suffix_str}{ext}"
+            candidate = parent / new_name
+            if candidate not in self._written_paths:
+                return candidate
+            i += 1
+
+
 def write_analysis_docs(
     output_dir: Path,
     root_path: Path,
@@ -746,78 +903,7 @@ def write_analysis_docs(
     backend: str,
     model: str,
 ) -> StructuredAnalysis:
-    output_dir = output_dir.resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    structured = _normalize_structured_analysis(root_path.name, controller_result.result)
-
-    if controller_result.status != "finished":
-        detail = controller_result.error or structured.summary or str(controller_result.result)
-        guidance = []
-        if controller_result.status == "budget_exceeded":
-            guidance.append("Try increasing --max-total-tokens or --max-steps.")
-        guidance.append("If the controller keeps failing, retry with --runtime legacy.")
-        failure_summary = f"[{controller_result.status}] {detail} {' '.join(guidance)}".strip()
-        structured = StructuredAnalysis(
-            summary=failure_summary,
-            documents=[
-                AnalysisDocument(
-                    path="index.md",
-                    title=f"Analysis stopped: {controller_result.status}",
-                    content=failure_summary,
-                )
-            ],
-        )
-
-    def resolve_document_target(document_path: str) -> Path:
-        candidate = (output_dir / Path(document_path)).resolve()
-        if candidate == output_dir or output_dir not in candidate.parents:
-            fallback_name = Path(document_path).name or "index.md"
-            candidate = (output_dir / fallback_name).resolve()
-        return candidate
-
-    for document in structured.documents:
-        target = resolve_document_target(document.path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        body = document.content
-        if body and not body.lstrip().startswith("#"):
-            body = f"# {document.title}\n\n{body}"
-        target.write_text(body or f"# {document.title}\n", encoding="utf-8")
-
-    report_path = output_dir / "analysis_report.md"
-    report_path.write_text(
-        "\n".join(
-            [
-                f"# Project Analysis Report: {root_path.name}",
-                "",
-                f"**Root Directory:** `{root_path}`  ",
-                f"**Backend:** {backend} ({model})  ",
-                f"**Runtime:** controller  ",
-                f"**Status:** {controller_result.status}  ",
-                f"**Steps Used:** {controller_result.budget.steps_used}  ",
-                f"**Approx Tokens:** {controller_result.budget.total_tokens}  ",
-                "",
-                "## Executive Summary",
-                "",
-                structured.summary or str(controller_result.result),
-                "",
-                "## Final State",
-                "",
-                "\n".join(f"- {name}: {value}" for name, value in sorted(controller_result.final_state.items())) or "- (empty)",
-                "",
-                "## Step History",
-                "",
-                "| Step | Kind | Status | Summary |",
-                "| :--- | :--- | :--- | :--- |",
-                *[
-                    f"| {i+1} | {step.kind} | {'✅' if not step.error else '❌'} | {_sanitize_md_table_cell(_summarize_observation(step)[:100])} |"
-                    for i, step in enumerate(controller_result.steps)
-                ],
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    return structured
+    return AnalysisDocBuilder(output_dir).build(root_path, controller_result, backend, model)
 
 
 class RLMController:
