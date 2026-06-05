@@ -1,11 +1,11 @@
 import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from rlm_runtime import (
-    AnalysisDocBuilder,
+from isohyps.rlm_runtime import (
     BudgetExceededError,
     BudgetLimits,
     CodeResponseValidator,
@@ -17,10 +17,8 @@ from rlm_runtime import (
     PromptBuilder,
     RLMController,
     RunContext,
-    validate_analysis_result,
-    write_analysis_docs,
 )
-from test_utils import ScriptedClient
+from tests.test_utils import ScriptedClient
 
 
 class TaggedPromptBuilder(PromptBuilder):
@@ -47,6 +45,30 @@ class TestCodeResponseValidator(unittest.TestCase):
         validated = validator.normalize("```python\nx = 1\n```")
         self.assertEqual(validated.kind, "code")
         self.assertEqual(validated.code, "x = 1")
+
+    def test_accepts_blockquoted_fenced_python(self):
+        validator = CodeResponseValidator()
+        validated = validator.normalize("> ```python\n> x = 1\n> ```")
+        self.assertEqual(validated.kind, "code")
+        self.assertEqual(validated.code, "x = 1")
+
+    def test_accepts_fenced_python_with_surrounding_prose(self):
+        validator = CodeResponseValidator()
+        validated = validator.normalize("Here is the code:\n```python\nx = 1\n```\nDone.")
+        self.assertEqual(validated.kind, "code")
+        self.assertEqual(validated.code, "x = 1")
+
+    def test_unwraps_python_code_returned_as_string_literal(self):
+        validator = CodeResponseValidator()
+        validated = validator.normalize("\"finish('ok')\"")
+        self.assertEqual(validated.kind, "code")
+        self.assertEqual(validated.code, "finish('ok')")
+
+    def test_unwraps_fenced_python_code_returned_as_string_literal(self):
+        validator = CodeResponseValidator()
+        validated = validator.normalize("```python\n\"finish('ok')\"\n```")
+        self.assertEqual(validated.kind, "code")
+        self.assertEqual(validated.code, "finish('ok')")
 
 
 class TestRLMRuntime(unittest.TestCase):
@@ -114,38 +136,60 @@ class TestRLMRuntime(unittest.TestCase):
         self.assertEqual(result.status, "budget_exceeded")
         self.assertIn("max_steps=1", result.error)
 
+    def test_budget_exceeded_before_oversized_prompt_is_sent(self):
+        controller, client = self._controller(
+            ["finish('should not be used')"],
+            max_steps=8,
+            max_total_tokens=100,
+        )
+
+        result = controller.run("A" * 2000)
+
+        self.assertEqual(result.status, "budget_exceeded")
+        self.assertEqual(len(client.prompts), 0)
+        self.assertEqual(result.budget.llm_calls, 0)
+        self.assertIn("would be exceeded by prompt", result.error)
+        self.assertEqual(len(result.steps), 1)
+        self.assertEqual(result.steps[0].kind, "model_error")
+
+    def test_budget_exceeded_after_query_stops_without_retrying_same_prompt(self):
+        controller, client = self._controller(
+            ["x = '" + ("A" * 2000) + "'"],
+            max_steps=8,
+            max_total_tokens=500,
+        )
+
+        result = controller.run("Return a small result.")
+
+        self.assertEqual(result.status, "budget_exceeded")
+        self.assertEqual(len(client.prompts), 1)
+        self.assertEqual(result.budget.llm_calls, 1)
+        self.assertIn("max_total_tokens=500 reached", result.error)
+        self.assertEqual(len(result.steps), 1)
+
     def test_budget_limits_defaults_match_controller_runtime_defaults(self):
         limits = BudgetLimits()
 
         self.assertEqual(limits.max_total_tokens, 30000)
         self.assertEqual(limits.step_timeout_seconds, 15.0)
 
-    def test_validate_analysis_result_rejects_invalid_payloads(self):
-        self.assertEqual(
-            validate_analysis_result("done"),
-            ["Expected finish(value) to receive a dict, got str."],
-        )
-        self.assertEqual(validate_analysis_result({"summary": "ok"}), [])
-        self.assertEqual(validate_analysis_result({"summary": "ok", "documents": [{}]}), [])
-        self.assertEqual(
-            validate_analysis_result({"summary": "ok", "documents": "README.md"}),
-            ["Expected 'documents' to be list, got str."],
-        )
+    def test_controller_retries_after_invalid_finish_callback(self):
+        def validate_string(value):
+            return [] if isinstance(value, str) else ["Expected string result."]
 
-    def test_controller_retries_after_invalid_structured_finish(self):
         controller, client = self._controller(
             [
-                "finish('not-structured')",
-                "finish({'summary': 'fixed', 'documents': []})",
+                "finish({'not': 'string'})",
+                "finish('fixed')",
             ],
             max_steps=2,
         )
 
-        result = controller.run("Analyze the repository.", require_structured_finish=True)
+        result = controller.run("Return a string result.", finish_validator=validate_string)
 
         self.assertEqual(result.status, "finished")
-        self.assertEqual(result.result["summary"], "fixed")
-        self.assertIn("Invalid analysis result format", client.prompts[1])
+        self.assertEqual(result.result, "fixed")
+        self.assertIn("Invalid finish result: Expected string result.", client.prompts[1])
 
     def test_finish_stops_following_side_effects(self):
         with IsolatedREPL(self.root, BudgetLimits()) as repl:
@@ -156,12 +200,31 @@ class TestRLMRuntime(unittest.TestCase):
         self.assertNotIn("value", observation.state)
         self.assertNotIn("after", observation.stdout)
 
+    def test_repl_defines_main_module_name(self):
+        with IsolatedREPL(self.root, BudgetLimits()) as repl:
+            observation = repl.execute(
+                "def main():\n    finish('ran-main')\n\nif __name__ == '__main__':\n    main()",
+                lambda prompt, context: None,
+            )
+
+        self.assertTrue(observation.finished)
+        self.assertEqual(observation.result, "ran-main")
+
     def test_repl_blocks_root_escape(self):
         with IsolatedREPL(self.root, BudgetLimits()) as repl:
             observation = repl.execute("read_text('../outside.txt')", lambda prompt, context: None)
 
         self.assertEqual(observation.kind, "execution_error")
         self.assertIn("escapes root", observation.error)
+
+    def test_repl_allows_root_name_prefix_in_paths(self):
+        with IsolatedREPL(self.root, BudgetLimits()) as repl:
+            observation = repl.execute("finish(list_dir('src'))", lambda prompt, context: None)
+            prefixed = repl.execute(f"finish(list_dir('{self.root.name}/src'))", lambda prompt, context: None)
+
+        self.assertTrue(observation.finished)
+        self.assertTrue(prefixed.finished)
+        self.assertEqual(prefixed.result, observation.result)
 
     def test_extract_symbols_helper_available_without_tree_sitter(self):
         with IsolatedREPL(self.root, BudgetLimits()) as repl:
@@ -186,6 +249,66 @@ class TestRLMRuntime(unittest.TestCase):
         self.assertEqual(result.result["summary"], "child-summary")
         self.assertEqual(len(client.prompts), 2)
         self.assertIn("Parent context: dict {'path': 'src/app.py'}", client.prompts[1])
+
+    def test_llm_query_wait_time_does_not_trip_parent_step_timeout(self):
+        with IsolatedREPL(self.root, BudgetLimits(step_timeout_seconds=0.2)) as repl:
+            observation = repl.execute(
+                "child = llm_query('slow child')\nfinish(child)",
+                lambda prompt, context: (time.sleep(0.3) or "child-summary"),
+            )
+
+        self.assertTrue(observation.finished)
+        self.assertEqual(observation.result, "child-summary")
+
+    def test_short_text_can_finish_without_divide_and_conquer(self):
+        short_text = "短い文章です。分割せずに要点を返せる入力です。"
+        controller, client = self._controller(
+            [
+                "finish({'strategy': 'direct', 'summary': '短文なので直接要約した'})",
+            ],
+            max_steps=3,
+            max_depth=2,
+        )
+
+        result = controller.run(f"Summarize this short text directly when possible:\n{short_text}")
+
+        self.assertEqual(result.status, "finished")
+        self.assertEqual(result.result["strategy"], "direct")
+        self.assertEqual(result.result["summary"], "短文なので直接要約した")
+        self.assertEqual(len(client.prompts), 1)
+        self.assertEqual(result.budget.llm_calls, 1)
+        self.assertIn(short_text, client.prompts[0])
+
+    def test_very_long_text_can_be_processed_with_divide_and_conquer(self):
+        first_chunk = "A" * 5000
+        second_chunk = "B" * 5000
+        long_text = f"{first_chunk}\n--- SPLIT ---\n{second_chunk}"
+        controller, client = self._controller(
+            [
+                "\n".join(
+                    [
+                        "left = llm_query('Summarize chunk A', {'chunk_id': 'A', 'text': 'A' * 5000})",
+                        "right = llm_query('Summarize chunk B', {'chunk_id': 'B', 'text': 'B' * 5000})",
+                        "finish({'strategy': 'divide-and-conquer', 'summary': left + ' / ' + right})",
+                    ]
+                ),
+                "finish('summary-A')",
+                "finish('summary-B')",
+            ],
+            max_steps=6,
+            max_depth=2,
+        )
+
+        result = controller.run(f"Summarize this very long text by splitting it if useful:\n{long_text}")
+
+        self.assertEqual(result.status, "finished")
+        self.assertEqual(result.result["strategy"], "divide-and-conquer")
+        self.assertEqual(result.result["summary"], "summary-A / summary-B")
+        self.assertEqual(len(client.prompts), 3)
+        self.assertEqual(result.budget.llm_calls, 3)
+        self.assertGreater(len(client.prompts[0]), 10000)
+        self.assertIn("Parent context: dict {'chunk_id': 'A', 'text': str(len=5000)", client.prompts[1])
+        self.assertIn("Parent context: dict {'chunk_id': 'B', 'text': str(len=5000)", client.prompts[2])
 
     def test_llm_query_uses_independent_child_step_limit(self):
         controller, _ = self._controller(
@@ -280,61 +403,14 @@ class TestRLMRuntime(unittest.TestCase):
             "Child query failed (execution_error): ValueError: noisy detail",
         )
 
-    def test_write_analysis_docs_sanitizes_parent_traversal_paths(self):
-        controller, _ = self._controller(["finish({'summary': 'done', 'documents': []})"])
-        result = controller.run("Return a minimal document payload.")
-        result.result = {
-            "summary": "done",
-            "documents": [{"path": "../escape.md", "title": "Escape", "content": "blocked"}],
-        }
-
-        output_dir = self.root / "docs"
-        outside = self.root / "escape.md"
-        write_analysis_docs(output_dir, self.root, result, backend="test", model="fake")
-
-        self.assertFalse(outside.exists())
-        self.assertTrue((output_dir / "escape.md").exists())
-
-    def test_write_analysis_docs_marks_nonfinished_runs(self):
-        result = ControllerResult(
-            status="budget_exceeded",
-            result=None,
-            steps=[],
-            error="max_total_tokens=10 reached",
-            budget=BudgetSnapshot(
-                steps_used=1,
-                llm_calls=1,
-                prompt_tokens=8,
-                response_tokens=4,
-                total_tokens=12,
-            ),
-            final_state={},
-        )
-
-        output_dir = self.root / "docs"
-        structured = write_analysis_docs(output_dir, self.root, result, backend="test", model="fake")
-        index = (output_dir / "index.md").read_text(encoding="utf-8")
-        report = (output_dir / "analysis_report.md").read_text(encoding="utf-8")
-
-        self.assertIn("[budget_exceeded]", structured.summary)
-        self.assertIn("Try increasing --max-total-tokens or --max-steps.", index)
-        self.assertIn("--runtime legacy", index)
-        self.assertIn("**Status:** budget_exceeded", report)
-
-    def test_system_prompt_contains_strict_schema(self):
-        from rlm_runtime import PromptBuilder
-        prompt = PromptBuilder.SYSTEM_PROMPT
-        self.assertIn("'summary': str", prompt)
-        self.assertIn("'documents': [", prompt)
-        self.assertIn("'path': str", prompt)
-        self.assertIn("'title': str", prompt)
-        self.assertIn("'content': str", prompt)
-
     def test_system_prompt_contains_new_helpers(self):
         prompt = PromptBuilder.SYSTEM_PROMPT
         self.assertIn("path_exists", prompt)
         self.assertIn("is_dir", prompt)
         self.assertIn("read_json", prompt)
+        self.assertIn("file_info", prompt)
+        self.assertIn("search_text", prompt)
+        self.assertIn("repo_map", prompt)
 
     def test_repl_path_exists_and_is_dir(self):
         with IsolatedREPL(self.root, BudgetLimits()) as repl:
@@ -366,6 +442,64 @@ class TestRLMRuntime(unittest.TestCase):
         self.assertTrue(obs.finished)
         self.assertEqual(obs.result, "value")
 
+    def test_repl_read_text_supports_offset_and_capped_limit(self):
+        (self.root / "long.txt").write_text("abcdef" * 500, encoding="utf-8")
+        with IsolatedREPL(self.root, BudgetLimits()) as repl:
+            obs = repl.execute(
+                "finish({'slice': read_text('long.txt', offset=3, limit=4), 'capped_len': len(read_text('long.txt', limit=3000))})",
+                lambda prompt, context: None,
+            )
+
+        self.assertTrue(obs.finished)
+        self.assertEqual(obs.result["slice"], "defa")
+        self.assertEqual(obs.result["capped_len"], 2000)
+
+    def test_repl_file_info_reports_text_metadata(self):
+        (self.root / "notes.txt").write_text("one\ntwo\nthree", encoding="utf-8")
+        with IsolatedREPL(self.root, BudgetLimits()) as repl:
+            obs = repl.execute("finish(file_info('notes.txt'))", lambda prompt, context: None)
+
+        self.assertTrue(obs.finished)
+        self.assertTrue(obs.result["exists"])
+        self.assertTrue(obs.result["is_file"])
+        self.assertEqual(obs.result["line_count"], 3)
+        self.assertEqual(obs.result["char_count"], len("one\ntwo\nthree"))
+        self.assertEqual(obs.result["language"], None)
+        self.assertFalse(obs.result["binary"])
+
+    def test_repl_file_info_reports_missing_path(self):
+        with IsolatedREPL(self.root, BudgetLimits()) as repl:
+            obs = repl.execute("finish(file_info('missing.txt'))", lambda prompt, context: None)
+
+        self.assertTrue(obs.finished)
+        self.assertFalse(obs.result["exists"])
+        self.assertIsNone(obs.result["size_bytes"])
+
+    def test_repl_search_text_returns_offsets_lines_and_excerpts(self):
+        (self.root / "rfc.txt").write_text(
+            "first stream mention\nsecond line\nanother STREAM mention",
+            encoding="utf-8",
+        )
+        with IsolatedREPL(self.root, BudgetLimits()) as repl:
+            obs = repl.execute(
+                "finish(search_text('rfc.txt', 'stream', max_results=5, context_chars=8))",
+                lambda prompt, context: None,
+            )
+
+        self.assertTrue(obs.finished)
+        self.assertEqual(len(obs.result), 2)
+        self.assertEqual(obs.result[0]["line"], 1)
+        self.assertEqual(obs.result[0]["match"], "stream")
+        self.assertEqual(obs.result[1]["line"], 3)
+        self.assertEqual(obs.result[1]["match"], "STREAM")
+        self.assertIn("mention", obs.result[1]["excerpt"])
+
+    def test_repl_search_text_blocks_root_escape(self):
+        with IsolatedREPL(self.root, BudgetLimits()) as repl:
+            obs = repl.execute("search_text('../outside.txt', 'x')", lambda prompt, context: None)
+        self.assertEqual(obs.kind, "execution_error")
+        self.assertIn("escapes root", obs.error)
+
     def test_repl_read_json_blocks_root_escape(self):
         with IsolatedREPL(self.root, BudgetLimits()) as repl:
             obs = repl.execute("read_json('../outside.json')", lambda prompt, context: None)
@@ -388,226 +522,128 @@ class TestRLMRuntime(unittest.TestCase):
         self.assertEqual(obs.kind, "execution_error")
         self.assertIn("too large", obs.error)
 
+    def test_repl_repo_map_injected(self):
+        (self.root / "src").mkdir(exist_ok=True)
+        (self.root / "src" / "main.py").write_text("print('hello')", encoding="utf-8")
+        (self.root / "README.md").write_text("Hello", encoding="utf-8")
+        with IsolatedREPL(self.root, BudgetLimits()) as repl:
+            obs = repl.execute(
+                "finish(repo_map)", 
+                lambda prompt, context: None
+            )
+        self.assertTrue(obs.finished, f"Execution failed: {obs.error}")
+        self.assertIsInstance(obs.result, dict)
+        self.assertEqual(obs.result["root"], ".")
+        self.assertIn("nodes", obs.result)
+        # New schema fields
+        self.assertIn("_meta", obs.result)
+        self.assertIn("note", obs.result["_meta"])
+        self.assertIn("truncated", obs.result)
+        self.assertFalse(obs.result["truncated"])
+        nodes = obs.result["nodes"]
+        paths = [node["path"] for node in nodes]
+        self.assertIn("src", paths)
+        self.assertIn("src/main.py", paths)
+        self.assertIn("README.md", paths)
+        
+        readme_node = next(n for n in nodes if n["path"] == "README.md")
+        self.assertEqual(readme_node["node_type"], "file")
+        self.assertEqual(readme_node["category"], "doc")
+        
+        src_node = next(n for n in nodes if n["path"] == "src")
+        self.assertEqual(src_node["node_type"], "dir")
+        self.assertEqual(src_node["category"], "code")
+
+    def test_generate_repo_map_truncated_at_max_nodes(self):
+        from isohyps.rlm_runtime import _generate_repo_map
+        # Create 10 files and set max_nodes=5 to force truncation
+        for i in range(10):
+            (self.root / f"file_{i:02d}.py").write_text("", encoding="utf-8")
+        result = _generate_repo_map(self.root, max_depth=1, max_nodes=5)
+        self.assertTrue(result["truncated"])
+        self.assertLessEqual(len(result["nodes"]), 5)
+        self.assertIn("_meta", result)
+
+    def test_generate_repo_map_no_truncation_within_limit(self):
+        from isohyps.rlm_runtime import _generate_repo_map
+        (self.root / "a.py").write_text("", encoding="utf-8")
+        (self.root / "b.py").write_text("", encoding="utf-8")
+        result = _generate_repo_map(self.root, max_depth=1, max_nodes=500)
+        self.assertFalse(result["truncated"])
+
+    def test_generate_repo_map_respects_depth_limit_and_ignores_generated_dirs(self):
+        from isohyps.rlm_runtime import _generate_repo_map
+
+        (self.root / "src" / "pkg").mkdir(parents=True)
+        (self.root / "src" / "pkg" / "deep.py").write_text("", encoding="utf-8")
+        (self.root / "node_modules").mkdir()
+        (self.root / "node_modules" / "package.js").write_text("", encoding="utf-8")
+        (self.root / "build").mkdir()
+        (self.root / "build" / "artifact.py").write_text("", encoding="utf-8")
+
+        result = _generate_repo_map(self.root, max_depth=2)
+        paths = [node["path"] for node in result["nodes"]]
+
+        self.assertIn("src", paths)
+        self.assertIn("src/pkg", paths)
+        self.assertNotIn("src/pkg/deep.py", paths)
+        self.assertNotIn("node_modules", paths)
+        self.assertNotIn("node_modules/package.js", paths)
+        self.assertNotIn("build", paths)
+        self.assertNotIn("build/artifact.py", paths)
+
+    def test_generate_repo_map_excludes_symlinks(self):
+        import os
+        from isohyps.rlm_runtime import _generate_repo_map
+        real_dir = self.root / "real_dir"
+        real_dir.mkdir()
+        (real_dir / "real_file.py").write_text("", encoding="utf-8")
+        link_path = self.root / "link_to_real"
+        os.symlink(str(real_dir), str(link_path))
+        result = _generate_repo_map(self.root, max_depth=2)
+        paths = [n["path"] for n in result["nodes"]]
+        self.assertNotIn("link_to_real", paths)
+        self.assertIn("real_dir", paths)
+
     def test_summarize_value_large_list(self):
-        from rlm_runtime import _summarize_value
+        from isohyps.rlm_runtime import _summarize_value
         large_list = list(range(200))
         result = _summarize_value(large_list, 160)
         self.assertIn("list(len=200)", result)
         self.assertNotIn(repr(large_list), result)
 
     def test_summarize_value_large_dict(self):
-        from rlm_runtime import _summarize_value
+        from isohyps.rlm_runtime import _summarize_value
         large_dict = {str(i): i for i in range(100)}
         result = _summarize_value(large_dict, 160)
         self.assertIn("dict(len=100)", result)
 
     def test_summarize_value_nested_large_collection(self):
-        from rlm_runtime import _summarize_value
+        from isohyps.rlm_runtime import _summarize_value
         value = {"items": list(range(200))}
         result = _summarize_value(value, 160)
         self.assertIn("dict {'items': list(len=200)", result)
         self.assertNotIn(repr(value), result)
 
     def test_summarize_value_self_reference(self):
-        from rlm_runtime import _summarize_value
+        from isohyps.rlm_runtime import _summarize_value
         value = []
         value.append(value)
         result = _summarize_value(value, 160)
         self.assertIn("list [...]", result)
 
     def test_summarize_value_large_str(self):
-        from rlm_runtime import _summarize_value
+        from isohyps.rlm_runtime import _summarize_value
         long_str = "a" * 500
         result = _summarize_value(long_str, 160)
         self.assertIn("str(len=500)", result)
 
     def test_sanitize_md_table_cell(self):
-        from rlm_runtime import _sanitize_md_table_cell
+        from isohyps.rlm_runtime import _sanitize_md_table_cell
         self.assertEqual(_sanitize_md_table_cell("hello | world"), "hello &#124; world")
         self.assertEqual(_sanitize_md_table_cell("line1\nline2"), "line1 line2")
         self.assertEqual(_sanitize_md_table_cell("ok"), "ok")
         self.assertEqual(_sanitize_md_table_cell("ends\\"), "ends\\\\")
-
-    def test_write_analysis_docs_step_history_sanitizes_pipe_chars(self):
-        result = ControllerResult(
-            status="finished",
-            result={"summary": "done"},
-            steps=[
-                __import__("rlm_runtime").ExecutionObservation(
-                    kind="ok",
-                    stdout="col1 | col2",
-                    error=None,
-                    state={},
-                    finished=False,
-                    result=None,
-                )
-            ],
-            error=None,
-            budget=BudgetSnapshot(
-                steps_used=1, llm_calls=1, prompt_tokens=10, response_tokens=5, total_tokens=15
-            ),
-            final_state={},
-        )
-        output_dir = self.root / "docs_sanitize"
-        write_analysis_docs(output_dir, self.root, result, backend="test", model="fake")
-        report = (output_dir / "analysis_report.md").read_text(encoding="utf-8")
-        self.assertNotIn("col1 | col2", report)
-        self.assertIn("&#124;", report)
-
-
-class TestAnalysisDocBuilder(unittest.TestCase):
-    def setUp(self):
-        self.temp_dir = tempfile.mkdtemp()
-        self.output_dir = Path(self.temp_dir) / "output"
-
-    def tearDown(self):
-        shutil.rmtree(self.temp_dir)
-
-    def _make_result(self, status="finished", result=None, error=None):
-        return ControllerResult(
-            status=status,
-            result=result,
-            steps=[],
-            error=error,
-            budget=BudgetSnapshot(steps_used=1, llm_calls=1, prompt_tokens=10, response_tokens=5, total_tokens=15),
-            final_state={},
-        )
-
-    def test_sanitize_path_strips_parent_traversal(self):
-        builder = AnalysisDocBuilder(self.output_dir)
-        result = builder._sanitize_path("../escape.md")
-        self.assertEqual(result, self.output_dir.resolve() / "escape.md")
-
-    def test_sanitize_path_strips_absolute_path(self):
-        builder = AnalysisDocBuilder(self.output_dir)
-        result = builder._sanitize_path("/etc/passwd")
-        self.assertTrue(str(result).startswith(str(self.output_dir.resolve())))
-        self.assertNotIn("/etc", str(result.relative_to(self.output_dir.resolve())))
-
-    def test_sanitize_path_strips_multiple_traversals(self):
-        builder = AnalysisDocBuilder(self.output_dir)
-        result = builder._sanitize_path("foo/../../bar.md")
-        # Both '..' parts are stripped; safe parts are ['foo', 'bar.md']
-        self.assertEqual(result, self.output_dir.resolve() / "foo" / "bar.md")
-
-    def test_sanitize_path_strips_windows_parent_traversal(self):
-        builder = AnalysisDocBuilder(self.output_dir)
-        result = builder._sanitize_path(r"..\escape.md")
-        self.assertEqual(result, self.output_dir.resolve() / "escape.md")
-
-    def test_sanitize_path_strips_windows_drive_prefix(self):
-        builder = AnalysisDocBuilder(self.output_dir)
-        result = builder._sanitize_path(r"C:\temp\escape.md")
-        self.assertEqual(result, self.output_dir.resolve() / "temp" / "escape.md")
-
-    def test_sanitize_path_strips_windows_drive_relative_prefix(self):
-        builder = AnalysisDocBuilder(self.output_dir)
-        result = builder._sanitize_path(r"C:temp\escape.md")
-        self.assertEqual(result, self.output_dir.resolve() / "temp" / "escape.md")
-
-    def test_sanitize_path_strips_unc_root_marker(self):
-        builder = AnalysisDocBuilder(self.output_dir)
-        result = builder._sanitize_path(r"\\server\share\escape.md")
-        self.assertEqual(result, self.output_dir.resolve() / "server" / "share" / "escape.md")
-
-    def test_sanitize_path_empty_string_returns_index_md(self):
-        builder = AnalysisDocBuilder(self.output_dir)
-        result = builder._sanitize_path("")
-        self.assertEqual(result, self.output_dir.resolve() / "index.md")
-
-    def test_avoid_collision_no_conflict(self):
-        builder = AnalysisDocBuilder(self.output_dir)
-        path = self.output_dir / "doc.md"
-        self.assertEqual(builder._avoid_collision(path), path)
-
-    def test_avoid_collision_adds_suffix(self):
-        builder = AnalysisDocBuilder(self.output_dir)
-        path = self.output_dir / "doc.md"
-        builder._written_paths.add(path)
-        result = builder._avoid_collision(path)
-        self.assertEqual(result, self.output_dir / "doc_1.md")
-
-    def test_avoid_collision_increments_suffix(self):
-        builder = AnalysisDocBuilder(self.output_dir)
-        path = self.output_dir / "doc.md"
-        builder._written_paths.add(path)
-        builder._written_paths.add(self.output_dir / "doc_1.md")
-        result = builder._avoid_collision(path)
-        self.assertEqual(result, self.output_dir / "doc_2.md")
-
-    def test_avoid_collision_truncates_long_stem(self):
-        builder = AnalysisDocBuilder(self.output_dir)
-        long_stem = "a" * 253
-        path = self.output_dir / f"{long_stem}.md"
-        builder._written_paths.add(path)
-        result = builder._avoid_collision(path)
-        self.assertLessEqual(len(result.name), AnalysisDocBuilder.MAX_FILENAME_LENGTH)
-
-    def test_avoid_collision_truncates_long_stem_without_conflict(self):
-        builder = AnalysisDocBuilder(self.output_dir)
-        long_stem = "a" * 300
-        path = self.output_dir / f"{long_stem}.md"
-        result = builder._avoid_collision(path)
-        self.assertLessEqual(len(result.name), AnalysisDocBuilder.MAX_FILENAME_LENGTH)
-
-    def test_build_creates_index_and_report(self):
-        builder = AnalysisDocBuilder(self.output_dir)
-        result = self._make_result(result={"summary": "all good", "documents": []})
-        builder.build(Path(self.temp_dir), result, backend="test", model="fake")
-        self.assertTrue((self.output_dir / "index.md").exists())
-        self.assertTrue((self.output_dir / "analysis_report.md").exists())
-
-    def test_build_llm_cannot_claim_analysis_report(self):
-        builder = AnalysisDocBuilder(self.output_dir)
-        result = self._make_result(
-            result={
-                "summary": "done",
-                "documents": [{"path": "analysis_report.md", "title": "My Report", "content": "LLM content"}],
-            }
-        )
-        builder.build(Path(self.temp_dir), result, backend="test", model="fake")
-        # LLM doc must be renamed; system report keeps the real path
-        self.assertTrue((self.output_dir / "analysis_report_1.md").exists())
-        report_text = (self.output_dir / "analysis_report.md").read_text(encoding="utf-8")
-        self.assertIn("Project Analysis Report", report_text)
-
-    def test_build_deduplicates_same_path(self):
-        builder = AnalysisDocBuilder(self.output_dir)
-        result = self._make_result(
-            result={
-                "summary": "done",
-                "documents": [
-                    {"path": "research.md", "title": "R1", "content": "first"},
-                    {"path": "research.md", "title": "R2", "content": "second"},
-                ],
-            }
-        )
-        builder.build(Path(self.temp_dir), result, backend="test", model="fake")
-        self.assertTrue((self.output_dir / "research.md").exists())
-        self.assertTrue((self.output_dir / "research_1.md").exists())
-
-    def test_build_sanitizes_traversal_path(self):
-        builder = AnalysisDocBuilder(self.output_dir)
-        outside = Path(self.temp_dir) / "escape.md"
-        result = self._make_result(
-            result={
-                "summary": "done",
-                "documents": [{"path": "../escape.md", "title": "Escape", "content": "blocked"}],
-            }
-        )
-        builder.build(Path(self.temp_dir), result, backend="test", model="fake")
-        self.assertFalse(outside.exists())
-        self.assertTrue((self.output_dir / "escape.md").exists())
-
-    def test_build_budget_exceeded_produces_minimal_output(self):
-        builder = AnalysisDocBuilder(self.output_dir)
-        result = self._make_result(status="budget_exceeded", error="max_steps=1 reached")
-        structured = builder.build(Path(self.temp_dir), result, backend="test", model="fake")
-        self.assertIn("[budget_exceeded]", structured.summary)
-        self.assertTrue((self.output_dir / "index.md").exists())
-        self.assertTrue((self.output_dir / "analysis_report.md").exists())
-        index_text = (self.output_dir / "index.md").read_text(encoding="utf-8")
-        self.assertIn("Try increasing --max-total-tokens or --max-steps.", index_text)
 
 
 if __name__ == "__main__":

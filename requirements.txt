@@ -1,5 +1,3 @@
 google-genai
 ollama
 python-dotenv
-tree-sitter>=0.21.0,<0.22
-tree-sitter-languages

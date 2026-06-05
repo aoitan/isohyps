@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import concurrent.futures
 import io
 import json
 import math
@@ -12,10 +13,10 @@ import traceback
 from contextlib import redirect_stdout
 from dataclasses import dataclass, replace
 from multiprocessing.connection import Connection
-from pathlib import Path, PurePosixPath
-from typing import Any, Protocol, TypedDict
+from pathlib import Path
+from typing import Any, Callable, Protocol
 
-from analysis_helpers import detect_language, extract_symbols, read_text_excerpt
+from isohyps.analysis_helpers import detect_language, extract_symbols, is_probably_binary, read_text_excerpt
 
 _DEBUG = bool(os.getenv("DEBUG"))
 
@@ -156,6 +157,7 @@ class BudgetLimits:
     max_depth: int = 2
     max_total_tokens: int = 30000
     step_timeout_seconds: float = 15.0
+    llm_timeout_seconds: float = 120.0
     max_stdout_chars: int = 2000
     max_state_items: int = 20
     max_state_value_chars: int = 160
@@ -203,6 +205,14 @@ class RunContext:
     def ensure_depth(self, depth: int) -> None:
         if depth > self.limits.max_depth:
             raise BudgetExceededError(f"max_depth={self.limits.max_depth} reached")
+
+    def ensure_prompt_budget(self, prompt: str) -> None:
+        prompt_tokens = _approx_tokens(prompt)
+        if self.total_tokens + prompt_tokens > self.limits.max_total_tokens:
+            raise BudgetExceededError(
+                f"max_total_tokens={self.limits.max_total_tokens} would be exceeded by prompt "
+                f"(prompt_tokens={prompt_tokens}, current_total_tokens={self.total_tokens})"
+            )
 
     def record_query(self, prompt: str, response: str) -> None:
         self.llm_calls += 1
@@ -275,98 +285,95 @@ class ValidatedCode:
     error: str | None
 
 
-class AnalysisDocumentDict(TypedDict, total=False):
-    path: str
-    title: str
-    content: str
+def query_with_timeout(client: QueryClient, prompt: str, timeout_seconds: float) -> str:
+    """Run a model query with a wall-clock timeout.
 
+    The runtime previously had a timeout only for sandbox execution. When the
+    backend HTTP call wedges after model generation, the controller could hang
+    indefinitely. This wrapper bounds the wait and lets the controller recover.
+    """
+    if timeout_seconds <= 0:
+        return client.query(prompt)
 
-class _AnalysisResultOptionalDict(TypedDict, total=False):
-    documents: list[AnalysisDocumentDict]
-
-
-class AnalysisResultDict(_AnalysisResultOptionalDict):
-    summary: str
-
-
-ANALYSIS_RESULT_SCHEMA_TEXT = (
-    "  {\n"
-    "    'summary': str,        # High-level overview of the findings\n"
-    "    'documents': [         # Optional list; omit it when no detailed docs are needed\n"
-    "      {\n"
-    "        'path': str,       # Optional relative path (e.g., 'auth.md')\n"
-    "        'title': str,      # Optional document title\n"
-    "        'content': str     # Optional Markdown content\n"
-    "      }, ...\n"
-    "    ]\n"
-    "  }\n"
-)
-
-DEFAULT_GOAL_TEMPLATE = (
-    "Analyze the project rooted at '{root_name}'. "
-    "Inspect the repository using helpers, use llm_query only for focused subproblems, "
-    "and finish with a dict containing a string 'summary'. "
-    "Optionally include a 'documents' list; document path, title, and content fields are optional strings."
-)
-
-
-def validate_analysis_result(value: Any) -> list[str]:
-    if not isinstance(value, dict):
-        return [f"Expected finish(value) to receive a dict, got {type(value).__name__}."]
-
-    errors: list[str] = []
-    if "summary" not in value:
-        errors.append("Missing required key 'summary'.")
-    elif not isinstance(value["summary"], str):
-        errors.append(f"Expected 'summary' to be str, got {type(value['summary']).__name__}.")
-
-    documents = value.get("documents")
-    if documents is None:
-        return errors
-    if not isinstance(documents, list):
-        errors.append(f"Expected 'documents' to be list, got {type(documents).__name__}.")
-        return errors
-
-    for index, document in enumerate(documents):
-        if not isinstance(document, dict):
-            errors.append(f"Expected documents[{index}] to be dict, got {type(document).__name__}.")
-            continue
-        for field in ("path", "title", "content"):
-            field_value = document.get(field)
-            if field_value is not None and not isinstance(field_value, str):
-                errors.append(
-                    f"Expected documents[{index}]['{field}'] to be str, got {type(field_value).__name__}."
-                )
-    return errors
-
-
-def format_analysis_result_errors(errors: list[str]) -> str:
-    detail = " ".join(errors)
-    return (
-        f"Invalid analysis result format: {detail} "
-        "Call finish() with a dict containing at least a string 'summary' and, if provided, "
-        "a 'documents' list of dicts with string 'path', 'title', and 'content' fields."
-    )
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(client.query, prompt)
+    try:
+        return future.result(timeout=timeout_seconds)
+    except concurrent.futures.TimeoutError as exc:
+        future.cancel()
+        raise TimeoutError(f"LLM query timed out after {timeout_seconds:.1f}s") from exc
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 class CodeResponseValidator:
     MODEL_ERROR_PREFIXES = ("[Gemini Error:", "[Ollama Error:", "[Error:")
 
+    def _strip_blockquote_markers(self, text: str) -> str:
+        lines = text.splitlines()
+        non_empty = [line for line in lines if line.strip()]
+        if not non_empty:
+            return text
+        if not all(line.lstrip().startswith(">") for line in non_empty):
+            return text
+
+        stripped_lines = []
+        for line in lines:
+            if not line.strip():
+                stripped_lines.append("")
+                continue
+            stripped = line.lstrip()
+            stripped_lines.append(stripped[1:].lstrip())
+        return "\n".join(stripped_lines).strip()
+
+    def _extract_fenced_code(self, text: str) -> str:
+        lines = text.splitlines()
+        start = None
+        for index, line in enumerate(lines):
+            if line.strip().startswith("```"):
+                start = index
+                break
+        if start is None:
+            return text
+
+        end = None
+        for index in range(start + 1, len(lines)):
+            if lines[index].strip() == "```":
+                end = index
+                break
+        if end is None:
+            return text
+        return "\n".join(lines[start + 1 : end]).strip()
+
+    def _unwrap_string_literal_code(self, code: str) -> str:
+        try:
+            parsed = ast.parse(code)
+        except SyntaxError:
+            return code
+        if (
+            len(parsed.body) == 1
+            and isinstance(parsed.body[0], ast.Expr)
+            and isinstance(parsed.body[0].value, ast.Constant)
+            and isinstance(parsed.body[0].value.value, str)
+        ):
+            candidate = parsed.body[0].value.value.strip()
+            if candidate:
+                try:
+                    ast.parse(candidate)
+                except SyntaxError:
+                    return code
+                return candidate
+        return code
+
     def normalize(self, response: str) -> ValidatedCode:
-        stripped = response.strip()
+        stripped = self._strip_blockquote_markers(response.strip())
         if not stripped:
             return ValidatedCode(kind="invalid_code", code=None, error="Model returned an empty response.")
         if stripped.startswith(self.MODEL_ERROR_PREFIXES):
             return ValidatedCode(kind="model_error", code=None, error=stripped)
 
-        code = stripped
-        if stripped.startswith("```"):
-            lines = stripped.splitlines()
-            if lines and lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            code = "\n".join(lines).strip()
+        code = self._extract_fenced_code(stripped)
+        code = self._unwrap_string_literal_code(code)
 
         if not code:
             return ValidatedCode(kind="invalid_code", code=None, error="No Python code remained after normalization.")
@@ -387,18 +394,21 @@ class PromptBuilder:
         "Use helpers instead of imports or direct OS access.\n"
         "Available helpers:\n"
         "- list_dir(path='.') -> list[str]\n"
-        "- read_text(path, limit=2000) -> str\n"
+        "- read_text(path, offset=0, limit=2000) -> str\n"
+        "- file_info(path) -> dict(path, exists, is_file, is_dir, size_bytes, line_count, char_count, approx_tokens, language, binary)\n"
+        "- search_text(path, pattern, max_results=10, context_chars=160) -> list[dict(offset, line, match, excerpt)]\n"
         "- read_json(path) -> parsed json value\n"
         "- path_exists(path) -> bool\n"
         "- is_dir(path) -> bool\n"
         "- extract_symbols(path) -> dict(language, symbols, fallback_excerpt, error)\n"
         "- llm_query(prompt, context=None) -> child result value\n"
-        "- finish(value) -> immediately end the run. For top-level project analysis, the value MUST be a dict matching:\n"
-        f"{ANALYSIS_RESULT_SCHEMA_TEXT}"
+        "- finish(value) -> immediately end the run and return value to the caller.\n"
         "Rules:\n"
         "- Do not import modules.\n"
         "- Do not attempt network, subprocess, or filesystem mutation.\n"
+        "- All helper paths are relative to the analysis root. Use '.' for the root; do not prefix paths with the root directory name.\n"
         "- Prefer helper calls over large string constants.\n"
+        "- A global variable `repo_map` is available in your environment. It is a partial map (up to depth 2, capped at 500 nodes). Use it as a starting point to understand the project structure, but always use helpers (like list_dir) to confirm details or explore deeper paths.\n"
         "- When you are done, call finish(value).\n"
     )
 
@@ -444,11 +454,102 @@ class _CappedWriter(io.StringIO):
         return value
 
 
+def _generate_repo_map(root_path: Path, max_depth: int = 2, max_nodes: int = 500) -> dict[str, Any]:
+    ignore_dirs = {
+        ".git", "node_modules", "__pycache__", "dist", "build", "venv", ".venv",
+        ".pytest_cache", ".kelpie", ".serena", "target", "out", ".idea", ".vscode",
+        ".mypy_cache", ".tox", "coverage", ".eggs", "htmlcov",
+    }
+
+    def get_category(path: Path) -> str:
+        name = path.name.lower()
+        if path.is_dir():
+            if name in ["src", "lib", "app", "cmd", "pkg", "internal"]:
+                return "code"
+            if name in ["test", "tests", "spec", "specs"]:
+                return "test"
+            if name in ["doc", "docs"]:
+                return "doc"
+            if name in ["config", "conf", ".github", ".vscode"]:
+                return "config"
+            if name in ["scripts", "ci", "ops"]:
+                return "ci"
+        else:
+            if name.endswith((".py", ".js", ".ts", ".go", ".rs", ".java", ".c", ".cpp", ".h", ".hpp", ".rb")):
+                if "test" in name:
+                    return "test"
+                return "code"
+            if name.endswith((".md", ".txt", ".rst", ".pdf")):
+                return "doc"
+            if name.endswith((".json", ".yaml", ".yml", ".toml", ".ini", ".conf", ".cfg")):
+                return "config"
+            if name in ["dockerfile", "makefile", "build.gradle"]:
+                return "ci"
+        return "unknown"
+
+    nodes: list[dict[str, Any]] = []
+    truncated = False
+
+    def _traverse(current_path: Path, current_depth: int) -> None:
+        nonlocal truncated
+        if current_depth > max_depth or truncated:
+            return
+
+        try:
+            for item in sorted(current_path.iterdir(), key=lambda p: p.name):
+                if truncated:
+                    return
+                # Skip symlinks to avoid traversal anomalies and security issues
+                if item.is_symlink():
+                    continue
+                # Skip non-regular files and non-directories (FIFOs, sockets, etc.)
+                if not item.is_file() and not item.is_dir():
+                    continue
+                if item.is_dir() and item.name in ignore_dirs:
+                    continue
+
+                if len(nodes) >= max_nodes:
+                    truncated = True
+                    return
+
+                rel_path = item.relative_to(root_path).as_posix()
+                node_type = "dir" if item.is_dir() else "file"
+                category = get_category(item)
+
+                nodes.append({
+                    "path": rel_path,
+                    "node_type": node_type,
+                    "category": category,
+                })
+
+                if item.is_dir() and current_depth < max_depth:
+                    _traverse(item, current_depth + 1)
+        except PermissionError:
+            pass
+
+    _traverse(root_path, 1)
+
+    return {
+        "_meta": {
+            "note": (
+                f"This is a partial map up to depth {max_depth}, capped at {max_nodes} nodes. "
+                "Use list_dir for deeper exploration."
+            ),
+        },
+        "root": ".",
+        "max_depth": max_depth,
+        "truncated": truncated,
+        "nodes": nodes,
+    }
+
+
 def _sandbox_worker(connection: Connection, root: str, limits: BudgetLimits) -> None:
     root_path = Path(root).resolve()
     helper_names = {
         "list_dir",
         "read_text",
+        "file_info",
+        "search_text",
         "extract_symbols",
         "llm_query",
         "finish",
@@ -456,10 +557,29 @@ def _sandbox_worker(connection: Connection, root: str, limits: BudgetLimits) -> 
         "is_dir",
         "read_json",
     }
-    globals_dict: dict[str, Any] = {"__builtins__": SAFE_BUILTINS}
+    
+    try:
+        repo_map = _generate_repo_map(root_path)
+    except Exception as e:
+        _dbg("sandbox", f"failed to generate repo map: {e}")
+        repo_map = {"_meta": {"note": "repo_map unavailable"}, "root": ".", "max_depth": 0, "truncated": False, "nodes": []}
+
+    globals_dict: dict[str, Any] = {
+        "__builtins__": SAFE_BUILTINS,
+        "__name__": "__main__",
+        "repo_map": repo_map,
+    }
 
     def resolve_path(path: str | Path) -> Path:
-        candidate = (root_path / Path(path)).resolve()
+        raw_path = Path(path)
+        path_str = str(raw_path)
+        if path_str in {"", "."}:
+            candidate = root_path
+        else:
+            relative_parts = raw_path.parts
+            if relative_parts and relative_parts[0] == root_path.name:
+                relative_parts = relative_parts[1:]
+            candidate = (root_path / Path(*relative_parts)).resolve()
         if candidate != root_path and root_path not in candidate.parents:
             raise ValueError(f"path escapes root: {path}")
         return candidate
@@ -469,15 +589,97 @@ def _sandbox_worker(connection: Connection, root: str, limits: BudgetLimits) -> 
         target = resolve_path(path)
         return sorted(item.name for item in target.iterdir())
 
-    def read_text(path: str, limit: int = 2000) -> str:
-        _dbg("sandbox", f"read_text({path!r}, limit={limit})")
-        target = resolve_path(path)
+    def _file_size_guard(target: Path, helper_name: str) -> int:
         file_size = target.stat().st_size
         if file_size > _READ_SIZE_LIMIT:
             raise ValueError(
-                f"read_text: file too large ({file_size} bytes > {_READ_SIZE_LIMIT} bytes limit)"
+                f"{helper_name}: file too large ({file_size} bytes > {_READ_SIZE_LIMIT} bytes limit)"
             )
-        return read_text_excerpt(target, limit=min(limit, 2000))
+        return file_size
+
+    def read_text(path: str, offset: int = 0, limit: int = 2000) -> str:
+        _dbg("sandbox", f"read_text({path!r}, offset={offset}, limit={limit})")
+        target = resolve_path(path)
+        _file_size_guard(target, "read_text")
+        if offset < 0:
+            raise ValueError("read_text: offset must be >= 0")
+        if limit < 0:
+            raise ValueError("read_text: limit must be >= 0")
+        capped_limit = min(limit, 2000)
+        if is_probably_binary(target):
+            return "（バイナリファイルのため解析をスキップしました）"
+        content = target.read_text(encoding="utf-8", errors="ignore")
+        return content[offset : offset + capped_limit]
+
+    def file_info(path: str) -> dict[str, Any]:
+        _dbg("sandbox", f"file_info({path!r})")
+        target = resolve_path(path)
+        if not target.exists():
+            return {
+                "path": str(target.relative_to(root_path)) if target != root_path else ".",
+                "exists": False,
+                "is_file": False,
+                "is_dir": False,
+                "size_bytes": None,
+                "line_count": None,
+                "char_count": None,
+                "approx_tokens": None,
+                "language": None,
+                "binary": False,
+            }
+        stat = target.stat()
+        is_file = target.is_file()
+        line_count = None
+        char_count = None
+        if is_file and not is_probably_binary(target) and stat.st_size <= _READ_SIZE_LIMIT:
+            content = target.read_text(encoding="utf-8", errors="ignore")
+            line_count = content.count("\n") + (1 if content else 0)
+            char_count = len(content)
+        return {
+            "path": str(target.relative_to(root_path)) if target != root_path else ".",
+            "exists": target.exists(),
+            "is_file": is_file,
+            "is_dir": target.is_dir(),
+            "size_bytes": stat.st_size,
+            "line_count": line_count,
+            "char_count": char_count,
+            "approx_tokens": math.ceil((char_count if char_count is not None else stat.st_size) / 4),
+            "language": detect_language(target) if is_file else None,
+            "binary": is_probably_binary(target) if is_file else False,
+        }
+
+    def search_text(path: str, pattern: str, max_results: int = 10, context_chars: int = 160) -> list[dict[str, Any]]:
+        _dbg("sandbox", f"search_text({path!r}, pattern={pattern!r}, max_results={max_results}, context_chars={context_chars})")
+        target = resolve_path(path)
+        _file_size_guard(target, "search_text")
+        if not pattern:
+            raise ValueError("search_text: pattern must not be empty")
+        max_results = max(0, min(max_results, 50))
+        context_chars = max(0, min(context_chars, 1000))
+        if is_probably_binary(target):
+            return []
+        content = target.read_text(encoding="utf-8", errors="ignore")
+        lower_content = content.lower()
+        lower_pattern = pattern.lower()
+        results: list[dict[str, Any]] = []
+        start = 0
+        while len(results) < max_results:
+            index = lower_content.find(lower_pattern, start)
+            if index < 0:
+                break
+            excerpt_start = max(0, index - context_chars)
+            excerpt_end = min(len(content), index + len(pattern) + context_chars)
+            line_number = content.count("\n", 0, index) + 1
+            results.append(
+                {
+                    "offset": index,
+                    "line": line_number,
+                    "match": content[index : index + len(pattern)],
+                    "excerpt": content[excerpt_start:excerpt_end],
+                }
+            )
+            start = index + max(1, len(pattern))
+        return results
 
     def extract_symbols_helper(path: str) -> dict[str, Any]:
         _dbg("sandbox", f"extract_symbols({path!r})")
@@ -514,17 +716,15 @@ def _sandbox_worker(connection: Connection, root: str, limits: BudgetLimits) -> 
     def read_json(path: str) -> Any:
         _dbg("sandbox", f"read_json({path!r})")
         target = resolve_path(path)
-        file_size = target.stat().st_size
-        if file_size > _READ_SIZE_LIMIT:
-            raise ValueError(
-                f"read_json: file too large ({file_size} bytes > {_READ_SIZE_LIMIT} bytes limit)"
-            )
+        _file_size_guard(target, "read_json")
         return json.loads(target.read_text(encoding="utf-8"))
 
     globals_dict.update(
         {
             "list_dir": list_dir,
             "read_text": read_text,
+            "file_info": file_info,
+            "search_text": search_text,
             "extract_symbols": extract_symbols_helper,
             "llm_query": llm_query,
             "finish": finish,
@@ -614,7 +814,14 @@ class IsolatedREPL:
         self.close()
         self._ensure_worker()
 
-    def execute(self, code: str, llm_query_handler, finish_validator=None) -> ExecutionObservation:
+    def execute(
+        self,
+        code: str,
+        llm_query_handler,
+        finish_validator: Callable[[Any], list[str]] | None = None,
+        finish_normalizer: Callable[[Any], Any] | None = None,
+        finish_error_formatter: Callable[[list[str]], str] | None = None,
+    ) -> ExecutionObservation:
         self._ensure_worker()
         assert self._connection is not None
         assert self._process is not None
@@ -644,6 +851,7 @@ class IsolatedREPL:
                 except Exception as exc:
                     _dbg("repl", f"llm_query_handler error: {exc}")
                     self._connection.send({"type": "llm_query_error", "error": str(exc)})
+                deadline = time.monotonic() + self.limits.step_timeout_seconds
                 continue
             if message["type"] == "result":
                 obs = ExecutionObservation(
@@ -658,9 +866,13 @@ class IsolatedREPL:
                 if obs.error:
                     _dbg("repl", f"result error: {obs.error[:120]!r}")
                 if obs.finished and finish_validator is not None:
-                    validation_errors = finish_validator(obs.result)
+                    normalized_result = finish_normalizer(obs.result) if finish_normalizer is not None else obs.result
+                    validation_errors = finish_validator(normalized_result)
                     if validation_errors:
-                        validation_error = format_analysis_result_errors(validation_errors)
+                        if finish_error_formatter is not None:
+                            validation_error = finish_error_formatter(validation_errors)
+                        else:
+                            validation_error = "Invalid finish result: " + " ".join(validation_errors)
                         _dbg("repl", f"finish validation failed: {validation_error[:120]!r}")
                         return ExecutionObservation(
                             kind="execution_error",
@@ -670,6 +882,7 @@ class IsolatedREPL:
                             finished=False,
                             result=None,
                         )
+                    obs.result = normalized_result
                 return obs
 
     def close(self) -> None:
@@ -695,217 +908,6 @@ class IsolatedREPL:
         self.close()
 
 
-@dataclass
-class AnalysisDocument:
-    path: str
-    title: str
-    content: str
-
-
-@dataclass
-class StructuredAnalysis:
-    summary: str
-    documents: list[AnalysisDocument]
-
-
-def _normalize_structured_analysis(root_name: str, result: Any) -> StructuredAnalysis:
-    if isinstance(result, dict):
-        summary = str(result.get("summary") or result.get("result") or "")
-        raw_documents = result.get("documents") or []
-    else:
-        summary = str(result)
-        raw_documents = []
-
-    documents: list[AnalysisDocument] = []
-    for item in raw_documents:
-        if not isinstance(item, dict):
-            continue
-        path = str(item.get("path") or "index.md")
-        title = str(item.get("title") or Path(path).stem or root_name)
-        content = str(item.get("content") or "")
-        documents.append(AnalysisDocument(path=path, title=title, content=content))
-
-    if not any(doc.path == "index.md" for doc in documents):
-        documents.insert(0, AnalysisDocument(path="index.md", title=f"Directory: {root_name}", content=summary))
-
-    return StructuredAnalysis(summary=summary, documents=documents)
-
-
-def _summarize_observation(obs: ExecutionObservation) -> str:
-    if obs.error:
-        return obs.error.splitlines()[0]
-    if obs.stdout:
-        return obs.stdout.strip().splitlines()[0]
-    return f"Result: {_summarize_value(obs.result, 100)}"
-
-
-class AnalysisDocBuilder:
-    """Encapsulates document generation with path sanitization, collision avoidance, and minimal output guarantees."""
-
-    RESERVED_NAMES: frozenset[str] = frozenset({"analysis_report.md"})
-    MAX_FILENAME_LENGTH = 255
-
-    def __init__(self, output_dir: Path) -> None:
-        self.output_dir = output_dir.resolve()
-        # Tracks paths that are reserved or already written; used for collision detection.
-        self._written_paths: set[Path] = set()
-
-    def build(
-        self,
-        root_path: Path,
-        controller_result: ControllerResult,
-        backend: str,
-        model: str,
-    ) -> StructuredAnalysis:
-        """Generate documents and report from a controller result.
-
-        Always produces at least index.md content and analysis_report.md even on
-        abnormal termination.  Returns a StructuredAnalysis whose document paths
-        reflect the actual files written.
-        """
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-
-        # Reserve the system report path so LLM documents cannot claim it.
-        report_path = self.output_dir / "analysis_report.md"
-        self._written_paths.add(report_path)
-
-        structured = _normalize_structured_analysis(root_path.name, controller_result.result)
-
-        if controller_result.status != "finished":
-            detail = controller_result.error or structured.summary or str(controller_result.result)
-            guidance = []
-            if controller_result.status == "budget_exceeded":
-                guidance.append("Try increasing --max-total-tokens or --max-steps.")
-            guidance.append("If the controller keeps failing, retry with --runtime legacy.")
-            failure_summary = f"[{controller_result.status}] {detail} {' '.join(guidance)}".strip()
-            structured = StructuredAnalysis(
-                summary=failure_summary,
-                documents=[
-                    AnalysisDocument(
-                        path="index.md",
-                        title=f"Analysis stopped: {controller_result.status}",
-                        content=failure_summary,
-                    )
-                ],
-            )
-
-        for document in structured.documents:
-            sanitized = self._sanitize_path(document.path)
-            target = self._avoid_collision(sanitized)
-            self._written_paths.add(target)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            body = document.content
-            if body and not body.lstrip().startswith("#"):
-                body = f"# {document.title}\n\n{body}"
-            target.write_text(body or f"# {document.title}\n", encoding="utf-8")
-            # Update path to the actual written location relative to output_dir.
-            document.path = str(target.relative_to(self.output_dir))
-
-        report_path.write_text(
-            "\n".join(
-                [
-                    f"# Project Analysis Report: {root_path.name}",
-                    "",
-                    f"**Root Directory:** `{root_path}`  ",
-                    f"**Backend:** {backend} ({model})  ",
-                    f"**Runtime:** controller  ",
-                    f"**Status:** {controller_result.status}  ",
-                    f"**Steps Used:** {controller_result.budget.steps_used}  ",
-                    f"**Approx Tokens:** {controller_result.budget.total_tokens}  ",
-                    "",
-                    "## Executive Summary",
-                    "",
-                    structured.summary or str(controller_result.result),
-                    "",
-                    "## Final State",
-                    "",
-                    "\n".join(f"- {name}: {value}" for name, value in sorted(controller_result.final_state.items())) or "- (empty)",
-                    "",
-                    "## Step History",
-                    "",
-                    "| Step | Kind | Status | Summary |",
-                    "| :--- | :--- | :--- | :--- |",
-                    *[
-                        f"| {i+1} | {step.kind} | {'✅' if not step.error else '❌'} | {_sanitize_md_table_cell(_summarize_observation(step)[:100])} |"
-                        for i, step in enumerate(controller_result.steps)
-                    ],
-                    "",
-                ]
-            ),
-            encoding="utf-8",
-        )
-        return structured
-
-    def _sanitize_path(self, raw_path: str) -> Path:
-        """Return a path guaranteed to be inside output_dir.
-
-        Uses pure string-level normalization (no filesystem access) to strip
-        ``..`` components and absolute-path markers so symlink tricks cannot
-        bypass the sandbox boundary.
-        """
-        normalized = str(raw_path).replace("\\", "/")
-        parts = PurePosixPath(normalized).parts
-        safe_parts: list[str] = []
-        for part in parts:
-            if part.startswith("/") or part == "..":
-                continue
-            if part == ".":
-                continue
-            if part.endswith(":"):
-                continue
-            if len(part) >= 2 and part[1] == ":":
-                part = part[2:]
-                if not part:
-                    continue
-            if len(part) > self.MAX_FILENAME_LENGTH:
-                part = part[: self.MAX_FILENAME_LENGTH]
-            safe_parts.append(part)
-
-        if not safe_parts:
-            return self.output_dir / "index.md"
-
-        return self.output_dir / Path(*safe_parts)
-
-    def _avoid_collision(self, target_path: Path) -> Path:
-        """Return a path not in ``_written_paths``.
-
-        If ``target_path`` is already taken, appends ``_1``, ``_2``, …
-        immediately before the extension.  Truncates the stem when necessary to
-        respect ``MAX_FILENAME_LENGTH``.
-        """
-        stem = target_path.stem
-        ext = target_path.suffix
-        parent = target_path.parent
-
-        if len(target_path.name) > self.MAX_FILENAME_LENGTH:
-            max_stem_len = self.MAX_FILENAME_LENGTH - len(ext)
-            target_path = parent / f"{stem[: max(1, max_stem_len)]}{ext}"
-
-        if target_path not in self._written_paths:
-            return target_path
-
-        i = 1
-        while True:
-            suffix_str = f"_{i}"
-            max_stem_len = self.MAX_FILENAME_LENGTH - len(ext) - len(suffix_str)
-            truncated_stem = stem[: max(1, max_stem_len)]
-            new_name = f"{truncated_stem}{suffix_str}{ext}"
-            candidate = parent / new_name
-            if candidate not in self._written_paths:
-                return candidate
-            i += 1
-
-
-def write_analysis_docs(
-    output_dir: Path,
-    root_path: Path,
-    controller_result: ControllerResult,
-    backend: str,
-    model: str,
-) -> StructuredAnalysis:
-    return AnalysisDocBuilder(output_dir).build(root_path, controller_result, backend, model)
-
-
 class RLMController:
     def __init__(
         self,
@@ -928,7 +930,9 @@ class RLMController:
         goal: str,
         depth: int = 0,
         parent_context: Any | None = None,
-        require_structured_finish: bool = False,
+        finish_validator: Callable[[Any], list[str]] | None = None,
+        finish_normalizer: Callable[[Any], Any] | None = None,
+        finish_error_formatter: Callable[[list[str]], str] | None = None,
     ) -> ControllerResult:
         _dbg("ctrl", f"run start depth={depth} goal={goal[:80]!r}")
         steps: list[ExecutionObservation] = []
@@ -973,12 +977,27 @@ class RLMController:
                 _dbg("ctrl", f"step {self.run_context.steps_used}/{self.run_context.limits.max_steps}: sending prompt ({len(prompt)} chars)")
 
                 try:
-                    response = self.client.query(prompt)
+                    self.run_context.ensure_prompt_budget(prompt)
+                    response = query_with_timeout(
+                        self.client,
+                        prompt,
+                        timeout_seconds=self.run_context.limits.llm_timeout_seconds,
+                    )
                     _dbg("ctrl", f"llm response ({len(response)} chars): {response[:100]!r}...")
                     self.run_context.record_query(prompt, response)
                 except BudgetExceededError as exc:
                     _dbg("ctrl", f"token budget exceeded during query: {exc}")
                     observation = ExecutionObservation.issue("model_error", str(exc))
+                    steps.append(observation)
+                    final_state = observation.state or final_state
+                    return ControllerResult(
+                        status="budget_exceeded",
+                        result=None,
+                        steps=steps,
+                        error=str(exc),
+                        budget=self.run_context.snapshot(),
+                        final_state=final_state,
+                    )
                 except Exception as exc:
                     _dbg("ctrl", f"llm query error: {type(exc).__name__}: {exc}")
                     observation = ExecutionObservation.issue("model_error", f"{type(exc).__name__}: {exc}")
@@ -995,7 +1014,9 @@ class RLMController:
                                 child_context,
                                 depth=depth + 1,
                             ),
-                            finish_validator=validate_analysis_result if require_structured_finish else None,
+                            finish_validator=finish_validator,
+                            finish_normalizer=finish_normalizer,
+                            finish_error_formatter=finish_error_formatter,
                         )
 
                 steps.append(observation)

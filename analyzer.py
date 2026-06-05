@@ -5,8 +5,8 @@ import warnings
 from pathlib import Path
 from abc import ABC, abstractmethod
 
-from analysis_helpers import detect_language, extract_symbols, is_probably_binary
-from rlm_runtime import BudgetLimits, RLMController, RunContext, write_analysis_docs, DEFAULT_GOAL_TEMPLATE
+from isohyps.analysis_helpers import detect_language, extract_symbols, is_probably_binary
+from isohyps.project_analysis import RLMRuntimeAnalyzer
 
 try:
     from dotenv import load_dotenv
@@ -217,79 +217,6 @@ class RLMAnalyzer:
         return self.client.query(prompt)
 
 
-class RLMRuntimeAnalyzer:
-    def __init__(
-        self,
-        client: BaseLLMClient,
-        max_depth: int = 2,
-        max_steps: int = 8,
-        output_dir: Path | None = None,
-        step_timeout_seconds: float = 15.0,
-        max_total_tokens: int = 30000,
-        backend_name: str = "unknown",
-        model_name: str = "unknown",
-    ):
-        self.client = client
-        self.max_depth = max_depth
-        self.max_steps = max_steps
-        self.output_dir = output_dir
-        self.step_timeout_seconds = step_timeout_seconds
-        self.max_total_tokens = max_total_tokens
-        self.backend_name = backend_name
-        self.model_name = model_name
-        self.last_result = None
-        if self.output_dir:
-            self.output_dir.mkdir(parents=True, exist_ok=True)
-
-    def analyze(self, path: Path) -> str:
-        root = path.resolve()
-        _dbg("analyzer", (
-            f"controller runtime: root={root}"
-            f" max_steps={self.max_steps} max_depth={self.max_depth}"
-            f" max_total_tokens={self.max_total_tokens} step_timeout={self.step_timeout_seconds}s"
-        ))
-        limits = BudgetLimits(
-            max_steps=self.max_steps,
-            max_depth=self.max_depth,
-            max_total_tokens=self.max_total_tokens,
-            step_timeout_seconds=self.step_timeout_seconds,
-        )
-        controller = RLMController(
-            client=self.client,
-            root=root,
-            run_context=RunContext(limits=limits),
-        )
-        goal = DEFAULT_GOAL_TEMPLATE.format(root_name=root.name)
-        _dbg("analyzer", f"goal: {goal!r}")
-        result = controller.run(goal=goal, require_structured_finish=True)
-        _dbg("analyzer", (
-            f"controller.run() done: status={result.status}"
-            f" steps_used={result.budget.steps_used}"
-            f" llm_calls={result.budget.llm_calls}"
-            f" total_tokens={result.budget.total_tokens}"
-        ))
-        self.last_result = result
-
-        summary = result.error or str(result.result)
-        if result.status == "finished" and isinstance(result.result, dict):
-            summary = str(result.result.get("summary") or summary)
-        elif result.status != "finished":
-            guidance = []
-            if result.status == "budget_exceeded":
-                guidance.append("Try increasing --max-total-tokens or --max-steps.")
-            guidance.append("If the controller keeps failing, retry with --runtime legacy.")
-            summary = f"[{result.status}] {summary} {' '.join(guidance)}".strip()
-
-        if self.output_dir:
-            write_analysis_docs(
-                output_dir=self.output_dir,
-                root_path=root,
-                controller_result=result,
-                backend=self.backend_name,
-                model=self.model_name,
-            )
-        return summary
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Recursive Project Analyzer (RLM style)")
     parser.add_argument("root", help="Analysis root directory", default=".", nargs="?")
@@ -297,6 +224,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--runtime", choices=["legacy", "controller"], default="controller", help="Runtime to use (default: controller)")
     parser.add_argument("--max-steps", type=int, default=8, help="Max controller steps for the controller runtime")
     parser.add_argument("--step-timeout", type=float, default=15.0, help="Per-step timeout for the controller runtime")
+    parser.add_argument("--llm-timeout", type=float, default=120.0, help="Per-query timeout for backend LLM calls")
     parser.add_argument("--max-total-tokens", type=int, default=30000, help="Approximate shared token budget for the controller runtime")
     parser.add_argument("--backend", choices=["gemini", "ollama"], default="gemini", help="LLM backend to use")
     parser.add_argument("--model", help="LLM model name (defaults: gemini-1.5-flash or llama3)")
@@ -340,6 +268,7 @@ def main():
             max_steps=args.max_steps,
             output_dir=output_path,
             step_timeout_seconds=args.step_timeout,
+            llm_timeout_seconds=args.llm_timeout,
             max_total_tokens=args.max_total_tokens,
             backend_name=args.backend,
             model_name=model,
@@ -353,7 +282,7 @@ def main():
     if args.runtime == "controller":
         print(
             "Agentic controller runtime is active "
-            f"(depth={args.depth}, max_steps={args.max_steps}, token_budget={args.max_total_tokens})."
+            f"(depth={args.depth}, max_steps={args.max_steps}, token_budget={args.max_total_tokens}, llm_timeout={args.llm_timeout}s)."
         )
     if args.backend == "ollama":
         print(f"Ollama URL: {args.ollama_url if args.ollama_url else 'local'}")

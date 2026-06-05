@@ -413,8 +413,12 @@ dependencies = [
     { name = "google-genai" },
     { name = "ollama" },
     { name = "python-dotenv" },
-    { name = "tree-sitter" },
-    { name = "tree-sitter-languages" },
+]
+
+[package.optional-dependencies]
+symbols = [
+    { name = "tree-sitter", marker = "python_full_version < '3.12'" },
+    { name = "tree-sitter-languages", marker = "python_full_version < '3.12'" },
 ]
 
 [package.dev-dependencies]
@@ -427,9 +431,10 @@ requires-dist = [
     { name = "google-genai" },
     { name = "ollama" },
     { name = "python-dotenv" },
-    { name = "tree-sitter", specifier = ">=0.21.0,<0.22" },
-    { name = "tree-sitter-languages" },
+    { name = "tree-sitter", marker = "python_full_version < '3.12' and extra == 'symbols'", specifier = ">=0.21.0,<0.22" },
+    { name = "tree-sitter-languages", marker = "python_full_version < '3.12' and extra == 'symbols'" },
 ]
+provides-extras = ["symbols"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=7.0" }]
