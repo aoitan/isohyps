@@ -25,8 +25,8 @@ class TestRLMRuntimeAnalyzer(unittest.TestCase):
         (self.root / "README.md").write_text("# demo\n", encoding="utf-8")
         self.client = MagicMock(spec=BaseLLMClient)
         self.client.query.return_value = (
-            "finish({'summary': 'runtime summary', "
-            "'documents': [{'path': 'index.md', 'title': 'Root', 'content': 'runtime summary'}, "
+            "finish({'summary': 'runtime summary with project components and responsibilities', "
+            "'documents': [{'path': 'index.md', 'title': 'Root', 'content': 'runtime summary with enough project detail for validation'}, "
             "{'path': 'README.md', 'title': 'README', 'content': 'readme details'}]})"
         )
 
@@ -45,11 +45,11 @@ class TestRLMRuntimeAnalyzer(unittest.TestCase):
 
         summary = analyzer.analyze(self.root)
 
-        self.assertEqual(summary, "runtime summary")
+        self.assertEqual(summary, "runtime summary with project components and responsibilities")
         self.assertTrue((self.output_dir / "index.md").exists())
         self.assertTrue((self.output_dir / "README.md").exists())
         report = (self.output_dir / "analysis_report.md").read_text(encoding="utf-8")
-        self.assertIn("runtime summary", report)
+        self.assertIn("runtime summary with project components and responsibilities", report)
         self.assertIn("Runtime:** controller", report)
 
     def test_runtime_analyzer_defaults_to_30000_tokens(self):
@@ -120,7 +120,8 @@ class TestRLMRuntimeAnalyzerIntegration(unittest.TestCase):
         responses = [
             # Parent step 1: issue child query then finish with the result
             "child_result = llm_query('Analyze app.py', {'path': 'app.py'})\n"
-            "finish({'summary': f'Parent saw: {child_result}', 'documents': []})",
+            "finish({'summary': f'Parent saw: {child_result}; app.py was inspected through a child query.', "
+            "'documents': [{'path': 'index.md', 'title': 'Overview', 'content': f'Parent saw: {child_result}; app.py was inspected through a child query.'}]})",
             # Child step 1: analyse and finish
             "finish('Child summary of app.py')",
         ]
@@ -128,7 +129,7 @@ class TestRLMRuntimeAnalyzerIntegration(unittest.TestCase):
 
         summary = analyzer.analyze(self.root)
 
-        self.assertEqual(summary, "Parent saw: Child summary of app.py")
+        self.assertIn("Parent saw: Child summary of app.py", summary)
         self.assertTrue((self.output_dir / "index.md").exists())
         self.assertTrue((self.output_dir / "analysis_report.md").exists())
         report = (self.output_dir / "analysis_report.md").read_text(encoding="utf-8")
@@ -158,13 +159,14 @@ class TestRLMRuntimeAnalyzerIntegration(unittest.TestCase):
         """Model returns invalid Python first; after retry it finishes normally."""
         responses = [
             "This is not python code.",
-            "finish({'summary': 'recovered', 'documents': []})",
+            "finish({'summary': 'Recovered after invalid code and produced a substantive project analysis.', "
+            "'documents': [{'path': 'index.md', 'title': 'Overview', 'content': 'Recovered after invalid code and produced a substantive project analysis.'}]})",
         ]
         analyzer, client = self._make_analyzer(responses, max_steps=3)
 
         summary = analyzer.analyze(self.root)
 
-        self.assertEqual(summary, "recovered")
+        self.assertIn("Recovered after invalid code", summary)
         # Second prompt must contain feedback about the invalid code
         self.assertIn("invalid_code", client.prompts[1])
 
@@ -210,20 +212,21 @@ class TestRLMRuntimeAnalyzerIntegration(unittest.TestCase):
     # ------------------------------------------------------------------
     # Task 3.4: Docs fallback generation
     # ------------------------------------------------------------------
-    def test_docs_fallback_generation(self):
-        """Even with an empty documents list, index.md and analysis_report.md are generated."""
+    def test_docs_generation_with_valid_finish(self):
+        """A valid structured finish produces index.md and analysis_report.md."""
         responses = [
-            "finish({'summary': 'minimal summary', 'documents': []})",
+            "finish({'summary': 'Minimal project summary with enough detail to satisfy validation.', "
+            "'documents': [{'path': 'index.md', 'title': 'Overview', 'content': 'Minimal project summary with enough detail to satisfy validation.'}]})",
         ]
         analyzer, _ = self._make_analyzer(responses, max_steps=3)
 
         summary = analyzer.analyze(self.root)
 
-        self.assertEqual(summary, "minimal summary")
+        self.assertIn("Minimal project summary", summary)
         self.assertTrue((self.output_dir / "index.md").exists())
         self.assertTrue((self.output_dir / "analysis_report.md").exists())
         report = (self.output_dir / "analysis_report.md").read_text(encoding="utf-8")
-        self.assertIn("minimal summary", report)
+        self.assertIn("Minimal project summary", report)
 
 
 if __name__ == "__main__":

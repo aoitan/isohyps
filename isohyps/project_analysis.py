@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, TypedDict
 
+from isohyps.analysis_helpers import detect_language, extract_symbols, is_probably_binary
 from isohyps.rlm_runtime import (
     BudgetLimits,
     ControllerResult,
@@ -47,8 +48,9 @@ ANALYSIS_RESULT_SCHEMA_TEXT = (
 DEFAULT_GOAL_TEMPLATE = (
     "Analyze the project rooted at '{root_name}'. "
     "Inspect the repository using helpers, use llm_query only for focused subproblems, "
-    "and finish with a dict containing a string 'summary'. "
-    "Optionally include a 'documents' list; document path, title, and content fields are optional strings."
+    "consume the explicit source worklist in repo_map['source_worklist'], "
+    "and finish with a dict containing a string 'summary' and a non-empty 'documents' list. "
+    "Each document should have path, title, and content fields."
 )
 
 
@@ -82,6 +84,46 @@ def validate_analysis_result(value: Any) -> list[str]:
     return errors
 
 
+def validate_project_analysis_finish(value: Any) -> list[str]:
+    errors = validate_analysis_result(value)
+    if errors:
+        return errors
+
+    summary = value["summary"].strip()
+    lowered_summary = summary.lower()
+    if len(summary) < 40:
+        errors.append("Expected 'summary' to contain a substantive project analysis, got a very short summary.")
+    for shallow_phrase in (
+        "initial exploration",
+        "exploration of the root directory",
+        "exploration started",
+        "root directory only",
+    ):
+        if shallow_phrase in lowered_summary:
+            errors.append(
+                "Summary appears to describe an initial/root-only exploration. Continue inspecting important directories before finish()."
+            )
+            break
+
+    documents = value.get("documents")
+    if not isinstance(documents, list) or not documents:
+        errors.append("Expected 'documents' to contain at least one analysis document.")
+        return errors
+
+    has_substantive_document = False
+    for document in documents:
+        if not isinstance(document, dict):
+            continue
+        content = document.get("content")
+        if isinstance(content, str) and len(content.strip()) >= 40:
+            has_substantive_document = True
+            break
+    if not has_substantive_document:
+        errors.append("Expected at least one document with substantive 'content'.")
+
+    return errors
+
+
 def normalize_analysis_result(value: Any) -> Any:
     """Best-effort coercion for common model mistakes in finish(value)."""
     if not isinstance(value, dict):
@@ -102,8 +144,8 @@ def format_analysis_result_errors(errors: list[str]) -> str:
     detail = " ".join(errors)
     return (
         f"Invalid analysis result format: {detail} "
-        "Call finish() with a dict containing at least a string 'summary' and, if provided, "
-        "a 'documents' list of dicts with string 'path', 'title', and 'content' fields."
+        "Call finish() with a dict containing a substantive string 'summary' and a non-empty "
+        "'documents' list of dicts with string 'path', 'title', and 'content' fields."
     )
 
 
@@ -115,7 +157,9 @@ class ProjectAnalysisPromptBuilder(PromptBuilder):
         "Use helpers instead of imports or direct OS access.\n"
         "Available helpers:\n"
         "- list_dir(path='.') -> list[str]\n"
-        "- read_text(path, limit=2000) -> str\n"
+        "- read_text(path, offset=0, limit=2000) -> str\n"
+        "- file_info(path) -> dict(path, exists, is_file, is_dir, size_bytes, line_count, char_count, approx_tokens, language, binary)\n"
+        "- search_text(path, pattern, max_results=10, context_chars=160) -> list[dict(offset, line, match, excerpt)]\n"
         "- read_json(path) -> parsed json value\n"
         "- path_exists(path) -> bool\n"
         "- is_dir(path) -> bool\n"
@@ -126,9 +170,20 @@ class ProjectAnalysisPromptBuilder(PromptBuilder):
         "Rules:\n"
         "- Do not import modules.\n"
         "- Do not attempt network, subprocess, or filesystem mutation.\n"
+        "- Do not assign to helper names such as list_dir, read_text, file_info, search_text, read_json, path_exists, is_dir, extract_symbols, llm_query, or finish.\n"
         "- All helper paths are relative to the analysis root. Use '.' for the root; do not prefix paths with the root directory name.\n"
         "- Prefer helper calls over large string constants.\n"
-        "- A global variable `repo_map` is available in your environment. It is a partial map (up to depth 2, capped at 500 nodes). Use it as a starting point to understand the project structure, but always use helpers (like list_dir) to confirm details or explore deeper paths.\n"
+        "- A global variable `repo_map` is available in your environment. It is a partial map (up to depth 2, capped at 500 nodes) and includes `repo_map['source_worklist']`, the source files that need explanations. Use it as a starting point to understand the project structure, but always use helpers (like list_dir) to confirm details or explore deeper paths.\n"
+        "Minimum exploration before finish:\n"
+        "- Do not finish after only inspecting the root directory or README.\n"
+        "- Inspect repo_map first, then confirm important areas with helpers.\n"
+        "- Treat `repo_map['source_worklist']` as the explicit analysis worklist. Keep a pending list in sandbox state and reduce it as each source file is inspected.\n"
+        "- For each inspected source file, add a document whose path matches either `<source>.md` or the source path with a `.md` suffix, so coverage does not rely on fallback generation.\n"
+        "- Before finish, inspect at least two important non-root directories with list_dir(), file_info(), read_text(), extract_symbols(), or llm_query().\n"
+        "- Prioritize code, test, document, and configuration areas when present.\n"
+        "- Use llm_query for focused subproblems, such as summarizing a large directory or a cluster of files.\n"
+        "- The final summary should describe observed components and responsibilities, not just say exploration started.\n"
+        "- The final value MUST include a non-empty documents list with at least one substantive document.\n"
         "- When you are done, call finish(value).\n"
     )
 
@@ -144,6 +199,41 @@ class AnalysisDocument:
 class StructuredAnalysis:
     summary: str
     documents: list[AnalysisDocument]
+
+
+@dataclass(frozen=True)
+class SourceCoverage:
+    source_files: list[str]
+    documented_files: list[str]
+    missing_files: list[str]
+    extra_document_paths: list[str]
+    weak_document_paths: list[str]
+
+    @property
+    def total_count(self) -> int:
+        return len(self.source_files)
+
+    @property
+    def documented_count(self) -> int:
+        return len(self.documented_files)
+
+    @property
+    def missing_count(self) -> int:
+        return len(self.missing_files)
+
+    @property
+    def extra_document_count(self) -> int:
+        return len(self.extra_document_paths)
+
+    @property
+    def weak_document_count(self) -> int:
+        return len(self.weak_document_paths)
+
+    @property
+    def percent(self) -> float:
+        if not self.source_files:
+            return 100.0
+        return (self.documented_count / self.total_count) * 100
 
 
 def _normalize_structured_analysis(root_name: str, result: Any) -> StructuredAnalysis:
@@ -182,6 +272,20 @@ class AnalysisDocBuilder:
 
     RESERVED_NAMES: frozenset[str] = frozenset({"analysis_report.md"})
     MAX_FILENAME_LENGTH = 255
+    IGNORED_SOURCE_DIRS: frozenset[str] = frozenset(
+        {
+            ".git",
+            "__pycache__",
+            ".mypy_cache",
+            ".pytest_cache",
+            ".ruff_cache",
+            ".venv",
+            "venv",
+            "node_modules",
+            "dist",
+            "build",
+        }
+    )
 
     def __init__(self, output_dir: Path) -> None:
         self.output_dir = output_dir.resolve()
@@ -230,6 +334,11 @@ class AnalysisDocBuilder:
             target.write_text(body or f"# {document.title}\n", encoding="utf-8")
             document.path = str(target.relative_to(self.output_dir))
 
+        coverage = self._build_source_coverage(root_path, structured.documents)
+        fallback_generated_files = list(coverage.missing_files)
+        if fallback_generated_files:
+            self._write_fallback_source_docs(root_path, structured.documents, fallback_generated_files)
+            coverage = self._build_source_coverage(root_path, structured.documents)
         report_path.write_text(
             "\n".join(
                 [
@@ -245,6 +354,8 @@ class AnalysisDocBuilder:
                     "## Executive Summary",
                     "",
                     structured.summary or str(controller_result.result),
+                    "",
+                    *self._render_coverage_section(coverage, fallback_generated_files),
                     "",
                     "## Final State",
                     "",
@@ -264,6 +375,219 @@ class AnalysisDocBuilder:
             encoding="utf-8",
         )
         return structured
+
+    def _write_fallback_source_docs(
+        self,
+        root_path: Path,
+        documents: list[AnalysisDocument],
+        missing_files: list[str],
+    ) -> None:
+        for source_path in missing_files:
+            source_doc = AnalysisDocument(
+                path=f"{source_path}.md",
+                title=f"Source: {source_path}",
+                content=self._render_fallback_source_doc(root_path, source_path),
+            )
+            target = self._avoid_collision(self._sanitize_path(source_doc.path))
+            self._written_paths.add(target)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(source_doc.content, encoding="utf-8")
+            source_doc.path = str(target.relative_to(self.output_dir))
+            documents.append(source_doc)
+
+    def _render_fallback_source_doc(self, root_path: Path, source_path: str) -> str:
+        absolute_path = root_path / source_path
+        language = detect_language(absolute_path) or "unknown"
+        try:
+            line_count = len(absolute_path.read_text(encoding="utf-8", errors="ignore").splitlines())
+        except OSError:
+            line_count = 0
+
+        symbol_info = extract_symbols(absolute_path, lang=language, max_symbols=8, fallback_limit=1200)
+        symbols = symbol_info.get("symbols") if isinstance(symbol_info, dict) else []
+        fallback_excerpt = symbol_info.get("fallback_excerpt") if isinstance(symbol_info, dict) else ""
+        symbol_lines = []
+        if isinstance(symbols, list):
+            for symbol in symbols:
+                if isinstance(symbol, str) and symbol.strip():
+                    symbol_lines.append(f"- `{symbol.strip().splitlines()[0]}`")
+
+        lines = [
+            f"# Source: {source_path}",
+            "",
+            "## File Summary",
+            "",
+            f"- Path: `{source_path}`",
+            f"- Language: `{language}`",
+            f"- Lines: {line_count}",
+            "",
+            "This fallback document was generated because the controller did not return a document mapped to this source file.",
+            "",
+            "## Detected Symbols",
+            "",
+        ]
+        lines.extend(symbol_lines or ["- (none detected)"])
+        lines.extend(["", "## Excerpt", "", "```"])
+        if isinstance(fallback_excerpt, str):
+            lines.append(fallback_excerpt[:1200])
+        lines.extend(["```", ""])
+        return "\n".join(lines)
+
+    def _build_source_coverage(self, root_path: Path, documents: list[AnalysisDocument]) -> SourceCoverage:
+        source_files = self._collect_source_files(root_path)
+        documented_paths = self._documented_paths(documents)
+        documented_files = [source for source in source_files if self._source_has_matching_doc(source, documented_paths)]
+        documented_set = set(documented_files)
+        missing_files = [source for source in source_files if source not in documented_set]
+        matched_document_paths = {
+            document_path
+            for source in source_files
+            for document_path in self._matching_doc_candidates(source)
+            if document_path in documented_paths
+        }
+        extra_document_paths = sorted(documented_paths - matched_document_paths)
+        weak_document_paths = sorted(
+            self._document_path(document)
+            for document in documents
+            if self._document_path(document) in documented_paths and self._is_weak_document(document)
+        )
+        return SourceCoverage(
+            source_files=source_files,
+            documented_files=documented_files,
+            missing_files=missing_files,
+            extra_document_paths=extra_document_paths,
+            weak_document_paths=weak_document_paths,
+        )
+
+    def _collect_source_files(self, root_path: Path) -> list[str]:
+        root = root_path.resolve()
+        output_dir = self.output_dir.resolve()
+        source_files: list[str] = []
+
+        for path in sorted(root.rglob("*")):
+            if not path.is_file() or path.is_symlink():
+                continue
+            if self._is_ignored_source_path(path, root, output_dir):
+                continue
+            if is_probably_binary(path) or detect_language(path) is None:
+                continue
+            source_files.append(path.relative_to(root).as_posix())
+
+        return source_files
+
+    def _is_ignored_source_path(self, path: Path, root: Path, output_dir: Path) -> bool:
+        try:
+            path.relative_to(output_dir)
+            return True
+        except ValueError:
+            pass
+
+        relative_parts = path.relative_to(root).parts
+        return any(part in self.IGNORED_SOURCE_DIRS for part in relative_parts)
+
+    def _documented_paths(self, documents: list[AnalysisDocument]) -> set[str]:
+        paths: set[str] = set()
+        for document in documents:
+            doc_path = PurePosixPath(str(document.path).replace("\\", "/"))
+            normalized = doc_path.as_posix().lstrip("./")
+            if not normalized or normalized == "index.md":
+                continue
+            paths.add(normalized)
+        return paths
+
+    def _source_has_matching_doc(self, source_path: str, documented_paths: set[str]) -> bool:
+        return bool(self._matching_doc_candidates(source_path) & documented_paths)
+
+    def _matching_doc_candidates(self, source_path: str) -> set[str]:
+        source = PurePosixPath(source_path)
+        return {
+            source.as_posix(),
+            source.with_suffix(".md").as_posix(),
+            f"{source.as_posix()}.md",
+        }
+
+    def _document_path(self, document: AnalysisDocument) -> str:
+        return PurePosixPath(str(document.path).replace("\\", "/")).as_posix().lstrip("./")
+
+    def _is_weak_document(self, document: AnalysisDocument) -> bool:
+        content = document.content.strip()
+        if len(content) < 40:
+            return True
+        lowered = content.lower()
+        failure_markers = (
+            "analysis failed",
+            "failed to analyze",
+            "model_error",
+            "budget_exceeded",
+            "invalid analysis result",
+        )
+        return any(marker in lowered for marker in failure_markers)
+
+    def _render_coverage_section(self, coverage: SourceCoverage, fallback_generated_files: list[str] | None = None) -> list[str]:
+        fallback_generated_files = fallback_generated_files or []
+        percent = f"{coverage.percent:.1f}%"
+        lines = [
+            "## Source Coverage",
+            "",
+            f"- Source files discovered: {coverage.total_count}",
+            f"- Source files with matching docs: {coverage.documented_count}",
+            f"- Source files missing matching docs: {coverage.missing_count}",
+            f"- Extra docs without matching source: {coverage.extra_document_count}",
+            f"- Weak or failed docs: {coverage.weak_document_count}",
+            f"- Fallback docs generated: {len(fallback_generated_files)}",
+            f"- Coverage: {percent}",
+            "",
+        ]
+
+        if fallback_generated_files:
+            lines.extend(
+                [
+                    "### Fallback Generated Source Docs",
+                    "",
+                    *[f"- `{path}`" for path in fallback_generated_files],
+                    "",
+                ]
+            )
+        else:
+            lines.extend(["### Fallback Generated Source Docs", "", "- (none)", ""])
+
+        if coverage.missing_files:
+            lines.extend(
+                [
+                    "### Missing Source Docs",
+                    "",
+                    *[f"- `{path}`" for path in coverage.missing_files],
+                    "",
+                ]
+            )
+        else:
+            lines.extend(["### Missing Source Docs", "", "- (none)", ""])
+
+        if coverage.extra_document_paths:
+            lines.extend(
+                [
+                    "### Extra Docs Without Matching Source",
+                    "",
+                    *[f"- `{path}`" for path in coverage.extra_document_paths],
+                    "",
+                ]
+            )
+        else:
+            lines.extend(["### Extra Docs Without Matching Source", "", "- (none)", ""])
+
+        if coverage.weak_document_paths:
+            lines.extend(
+                [
+                    "### Weak Or Failed Docs",
+                    "",
+                    *[f"- `{path}`" for path in coverage.weak_document_paths],
+                    "",
+                ]
+            )
+        else:
+            lines.extend(["### Weak Or Failed Docs", "", "- (none)", ""])
+
+        return lines
 
     def _sanitize_path(self, raw_path: str) -> Path:
         normalized = str(raw_path).replace("\\", "/")
@@ -287,7 +611,12 @@ class AnalysisDocBuilder:
         if not safe_parts:
             return self.output_dir / "index.md"
 
-        return self.output_dir / Path(*safe_parts)
+        return self._ensure_markdown_path(self.output_dir / Path(*safe_parts))
+
+    def _ensure_markdown_path(self, target_path: Path) -> Path:
+        if target_path.suffix == ".md":
+            return target_path
+        return target_path.with_name(f"{target_path.name}.md")
 
     def _avoid_collision(self, target_path: Path) -> Path:
         stem = target_path.stem
@@ -366,7 +695,7 @@ class RLMRuntimeAnalyzer:
         goal = DEFAULT_GOAL_TEMPLATE.format(root_name=root.name)
         result = controller.run(
             goal=goal,
-            finish_validator=validate_analysis_result,
+            finish_validator=validate_project_analysis_finish,
             finish_normalizer=normalize_analysis_result,
             finish_error_formatter=format_analysis_result_errors,
         )

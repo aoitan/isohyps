@@ -40,6 +40,18 @@ class TestCodeResponseValidator(unittest.TestCase):
         validated = validator.normalize("Here is the plan: inspect the files first.")
         self.assertEqual(validated.kind, "invalid_code")
 
+    def test_rejects_import_statements_before_execution(self):
+        validator = CodeResponseValidator()
+        validated = validator.normalize("import os\nfinish('done')")
+        self.assertEqual(validated.kind, "invalid_code")
+        self.assertIn("Import statements are not allowed", validated.error)
+
+    def test_rejects_from_import_statements_before_execution(self):
+        validator = CodeResponseValidator()
+        validated = validator.normalize("from pathlib import Path\nfinish('done')")
+        self.assertEqual(validated.kind, "invalid_code")
+        self.assertIn("Import statements are not allowed", validated.error)
+
     def test_accepts_fenced_python(self):
         validator = CodeResponseValidator()
         validated = validator.normalize("```python\nx = 1\n```")
@@ -232,6 +244,17 @@ class TestRLMRuntime(unittest.TestCase):
 
         self.assertTrue(observation.finished)
         self.assertEqual(observation.result, "python")
+
+    def test_repo_map_exposes_source_worklist(self):
+        (self.root / "src" / "nested").mkdir()
+        (self.root / "src" / "nested" / "worker.py").write_text("class Worker:\n    pass\n", encoding="utf-8")
+        (self.root / "uv.lock").write_text("# lock\n", encoding="utf-8")
+
+        with IsolatedREPL(self.root, BudgetLimits()) as repl:
+            observation = repl.execute("finish(repo_map['source_worklist'])", lambda prompt, context: None)
+
+        self.assertTrue(observation.finished)
+        self.assertEqual(observation.result, ["src/app.py", "src/nested/worker.py"])
 
     def test_llm_query_returns_child_value(self):
         controller, client = self._controller(
@@ -591,6 +614,20 @@ class TestRLMRuntime(unittest.TestCase):
         self.assertNotIn("node_modules/package.js", paths)
         self.assertNotIn("build", paths)
         self.assertNotIn("build/artifact.py", paths)
+
+    def test_generate_repo_map_ignores_lockfiles(self):
+        from isohyps.rlm_runtime import _generate_repo_map
+
+        (self.root / "uv.lock").write_text("package = []\n", encoding="utf-8")
+        (self.root / "package-lock.json").write_text("{}", encoding="utf-8")
+        (self.root / "src" / "app.py").write_text("", encoding="utf-8")
+
+        result = _generate_repo_map(self.root, max_depth=2)
+        paths = [node["path"] for node in result["nodes"]]
+
+        self.assertIn("src/app.py", paths)
+        self.assertNotIn("uv.lock", paths)
+        self.assertNotIn("package-lock.json", paths)
 
     def test_generate_repo_map_excludes_symlinks(self):
         import os

@@ -365,6 +365,12 @@ class CodeResponseValidator:
                 return candidate
         return code
 
+    def _reject_disallowed_syntax(self, parsed: ast.AST) -> str | None:
+        for node in ast.walk(parsed):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                return "Import statements are not allowed. Use sandbox helpers instead."
+        return None
+
     def normalize(self, response: str) -> ValidatedCode:
         stripped = self._strip_blockquote_markers(response.strip())
         if not stripped:
@@ -379,9 +385,13 @@ class CodeResponseValidator:
             return ValidatedCode(kind="invalid_code", code=None, error="No Python code remained after normalization.")
 
         try:
-            ast.parse(code)
+            parsed = ast.parse(code)
         except SyntaxError as exc:
             return ValidatedCode(kind="invalid_code", code=None, error=f"SyntaxError: {exc}")
+
+        disallowed_error = self._reject_disallowed_syntax(parsed)
+        if disallowed_error:
+            return ValidatedCode(kind="invalid_code", code=None, error=disallowed_error)
 
         return ValidatedCode(kind="code", code=code, error=None)
 
@@ -408,7 +418,7 @@ class PromptBuilder:
         "- Do not attempt network, subprocess, or filesystem mutation.\n"
         "- All helper paths are relative to the analysis root. Use '.' for the root; do not prefix paths with the root directory name.\n"
         "- Prefer helper calls over large string constants.\n"
-        "- A global variable `repo_map` is available in your environment. It is a partial map (up to depth 2, capped at 500 nodes). Use it as a starting point to understand the project structure, but always use helpers (like list_dir) to confirm details or explore deeper paths.\n"
+        "- A global variable `repo_map` is available in your environment. It is a partial map (up to depth 2, capped at 500 nodes) and includes `repo_map['source_worklist']`, the source files that need explanations. Use it as a starting point to understand the project structure, but always use helpers (like list_dir) to confirm details or explore deeper paths.\n"
         "- When you are done, call finish(value).\n"
     )
 
@@ -460,6 +470,17 @@ def _generate_repo_map(root_path: Path, max_depth: int = 2, max_nodes: int = 500
         ".pytest_cache", ".kelpie", ".serena", "target", "out", ".idea", ".vscode",
         ".mypy_cache", ".tox", "coverage", ".eggs", "htmlcov",
     }
+    ignore_files = {
+        "bun.lock",
+        "cargo.lock",
+        "composer.lock",
+        "gemfile.lock",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "poetry.lock",
+        "uv.lock",
+        "yarn.lock",
+    }
 
     def get_category(path: Path) -> str:
         name = path.name.lower()
@@ -490,6 +511,31 @@ def _generate_repo_map(root_path: Path, max_depth: int = 2, max_nodes: int = 500
     nodes: list[dict[str, Any]] = []
     truncated = False
 
+    def is_ignored_path(path: Path) -> bool:
+        relative_parts = path.relative_to(root_path).parts
+        if any(part in ignore_dirs for part in relative_parts):
+            return True
+        return path.is_file() and path.name.lower() in ignore_files
+
+    def collect_source_worklist(max_files: int = 1000) -> tuple[list[str], bool]:
+        source_paths: list[str] = []
+        source_truncated = False
+        try:
+            for item in sorted(root_path.rglob("*")):
+                if len(source_paths) >= max_files:
+                    source_truncated = True
+                    break
+                if item.is_symlink() or not item.is_file():
+                    continue
+                if is_ignored_path(item):
+                    continue
+                if is_probably_binary(item) or detect_language(item) is None:
+                    continue
+                source_paths.append(item.relative_to(root_path).as_posix())
+        except PermissionError:
+            pass
+        return source_paths, source_truncated
+
     def _traverse(current_path: Path, current_depth: int) -> None:
         nonlocal truncated
         if current_depth > max_depth or truncated:
@@ -505,7 +551,7 @@ def _generate_repo_map(root_path: Path, max_depth: int = 2, max_nodes: int = 500
                 # Skip non-regular files and non-directories (FIFOs, sockets, etc.)
                 if not item.is_file() and not item.is_dir():
                     continue
-                if item.is_dir() and item.name in ignore_dirs:
+                if is_ignored_path(item):
                     continue
 
                 if len(nodes) >= max_nodes:
@@ -528,6 +574,7 @@ def _generate_repo_map(root_path: Path, max_depth: int = 2, max_nodes: int = 500
             pass
 
     _traverse(root_path, 1)
+    source_worklist, source_worklist_truncated = collect_source_worklist()
 
     return {
         "_meta": {
@@ -539,6 +586,8 @@ def _generate_repo_map(root_path: Path, max_depth: int = 2, max_nodes: int = 500
         "root": ".",
         "max_depth": max_depth,
         "truncated": truncated,
+        "source_worklist": source_worklist,
+        "source_worklist_truncated": source_worklist_truncated,
         "nodes": nodes,
     }
 
