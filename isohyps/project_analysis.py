@@ -7,14 +7,19 @@ from typing import Any, TypedDict
 from isohyps.analysis_helpers import detect_language, extract_symbols, is_probably_binary
 from isohyps.rlm_runtime import (
     BudgetLimits,
+    ChildQueryConfig,
     ControllerResult,
     ExecutionObservation,
+    PartialBudgetLimits,
     PromptBuilder,
     RLMController,
     RunContext,
     _sanitize_md_table_cell,
     _summarize_value,
 )
+
+
+PROJECT_ANALYSIS_CHILD_MAX_STEPS = 3
 
 
 class AnalysisDocumentDict(TypedDict, total=False):
@@ -49,8 +54,10 @@ DEFAULT_GOAL_TEMPLATE = (
     "Analyze the project rooted at '{root_name}'. "
     "Inspect the repository using helpers, use llm_query only for focused subproblems, "
     "consume the explicit source worklist in repo_map['source_worklist'], "
-    "and finish with a dict containing a string 'summary' and a non-empty 'documents' list. "
-    "Each document should have path, title, and content fields."
+    "build mechanical file cards for every source file, select a small justified deep-dive set from those cards, "
+    "use llm_query only for the selected deep-dive files, "
+    "and finish with a dict containing a string 'summary'. "
+    "Do not repeat recorded document contents in finish(); the runtime will attach them."
 )
 
 
@@ -84,7 +91,36 @@ def validate_analysis_result(value: Any) -> list[str]:
     return errors
 
 
-def validate_project_analysis_finish(value: Any) -> list[str]:
+def _documented_analysis_paths(value: Any) -> set[str]:
+    if not isinstance(value, dict):
+        return set()
+    documents = value.get("documents")
+    if not isinstance(documents, list):
+        return set()
+
+    paths: set[str] = set()
+    for document in documents:
+        if not isinstance(document, dict):
+            continue
+        path = document.get("path")
+        if not isinstance(path, str):
+            continue
+        normalized = PurePosixPath(path.replace("\\", "/")).as_posix().lstrip("./")
+        if normalized and normalized != "index.md":
+            paths.add(normalized)
+    return paths
+
+
+def _matching_source_doc_candidates(source_path: str) -> set[str]:
+    source = PurePosixPath(source_path)
+    return {
+        source.as_posix(),
+        source.with_suffix(".md").as_posix(),
+        f"{source.as_posix()}.md",
+    }
+
+
+def validate_project_analysis_finish(value: Any, source_files: list[str] | None = None) -> list[str]:
     errors = validate_analysis_result(value)
     if errors:
         return errors
@@ -120,6 +156,22 @@ def validate_project_analysis_finish(value: Any) -> list[str]:
             break
     if not has_substantive_document:
         errors.append("Expected at least one document with substantive 'content'.")
+
+    if source_files:
+        documented_paths = _documented_analysis_paths(value)
+        missing_sources = [
+            source_path
+            for source_path in source_files
+            if not (_matching_source_doc_candidates(source_path) & documented_paths)
+        ]
+        if missing_sources:
+            preview = ", ".join(missing_sources[:10])
+            if len(missing_sources) > 10:
+                preview += f", ... ({len(missing_sources)} total)"
+            errors.append(
+                "Expected 'documents' to include one Markdown document for every source file in "
+                f"repo_map['source_worklist']; missing: {preview}."
+            )
 
     return errors
 
@@ -165,6 +217,7 @@ class ProjectAnalysisPromptBuilder(PromptBuilder):
         "- is_dir(path) -> bool\n"
         "- extract_symbols(path) -> dict(language, symbols, fallback_excerpt, error)\n"
         "- llm_query(prompt, context=None) -> child result value\n"
+        "- record_document(path, title, content) -> persist one completed Markdown source document for partial output\n"
         "- finish(value) -> immediately end the run. For top-level project analysis, the value MUST be a dict matching:\n"
         f"{ANALYSIS_RESULT_SCHEMA_TEXT}"
         "Rules:\n"
@@ -178,13 +231,97 @@ class ProjectAnalysisPromptBuilder(PromptBuilder):
         "- Do not finish after only inspecting the root directory or README.\n"
         "- Inspect repo_map first, then confirm important areas with helpers.\n"
         "- Treat `repo_map['source_worklist']` as the explicit analysis worklist. Keep a pending list in sandbox state and reduce it as each source file is inspected.\n"
+        "- Before spending child-query budget, create a mechanical file card for each pending source file with file_info(), extract_symbols(), and a short read_text() excerpt only when useful.\n"
+        "- Select a small deep-dive set from those cards before calling llm_query. Prefer entrypoints, CLI files, application/controller/runtime modules, import hubs, large or symbol-rich source files, and files explicitly named or implied by the user goal.\n"
+        "- Deprioritize tests, __init__.py, generated/cache/build files, snapshots, fixtures, and simple config/data files unless the user goal targets them directly.\n"
+        "- Keep the child-query count controlled: call llm_query for one selected deep-dive file at a time with only that file's card, excerpt, symbols, and selection reasons. Do not call llm_query for files selected as machine-card-only.\n"
+        "- For every source file, record exactly one source document. Deep-dive documents must include the selection reason. Machine-card-only documents must state why no deep dive was used and summarize the mechanical card.\n"
+        "- Do not bundle multiple source files into one child query; large multi-file child prompts are likely to time out before finish().\n"
         "- For each inspected source file, add a document whose path matches either `<source>.md` or the source path with a `.md` suffix, so coverage does not rely on fallback generation.\n"
+        "- As soon as one source document is complete, call record_document(path, title, content). Do not repeat recorded document contents in the final finish() value.\n"
+        "- Do not call finish() while pending source files remain. End the step without finish() and continue from sandbox state on the next step.\n"
         "- Before finish, inspect at least two important non-root directories with list_dir(), file_info(), read_text(), extract_symbols(), or llm_query().\n"
         "- Prioritize code, test, document, and configuration areas when present.\n"
         "- Use llm_query for focused subproblems, such as summarizing a large directory or a cluster of files.\n"
         "- The final summary should describe observed components and responsibilities, not just say exploration started.\n"
-        "- The final value MUST include a non-empty documents list with at least one substantive document.\n"
+        "- The final value MUST include a substantive summary. It may omit documents when every source document was already recorded with record_document().\n"
+        "Valid controller-code example:\n"
+        "if 'pending' not in globals():\n"
+        "    pending = list(repo_map['source_worklist'])\n"
+        "    file_cards = []\n"
+        "    for path in pending:\n"
+        "        info = file_info(path)\n"
+        "        symbols = extract_symbols(path)\n"
+        "        excerpt = read_text(path, 0, 1200) if info.get('size_bytes', 0) <= 6000 else ''\n"
+        "        reasons = []\n"
+        "        if path.endswith('/cli.py') or path.endswith('__main__.py') or path.endswith('application.py'):\n"
+        "            reasons.append('entrypoint_or_application')\n"
+        "        if info.get('line_count', 0) >= 120:\n"
+        "            reasons.append('large_source')\n"
+        "        if isinstance(symbols.get('symbols'), list) and len(symbols.get('symbols')) >= 4:\n"
+        "            reasons.append('symbol_rich')\n"
+        "        if path.startswith('tests/') or path.endswith('/__init__.py') or path == '__init__.py':\n"
+        "            reasons.append('noise_or_low_priority')\n"
+        "        score = len([reason for reason in reasons if reason != 'noise_or_low_priority'])\n"
+        "        if 'noise_or_low_priority' in reasons:\n"
+        "            score = 0\n"
+        "        file_cards.append({'path': path, 'info': info, 'symbols': symbols, 'excerpt': excerpt, 'reasons': reasons, 'score': score})\n"
+        "    deep_cards = sorted([card for card in file_cards if card['score'] > 0], key=lambda card: card['score'], reverse=True)[:5]\n"
+        "    deep_paths = [card['path'] for card in deep_cards]\n"
+        "    pending = list(deep_paths) + [card['path'] for card in file_cards if card['path'] not in deep_paths]\n"
+        "target_path = pending[0] if pending else None\n"
+        "target_card = next((card for card in file_cards if card['path'] == target_path), None) if target_path else None\n"
+        "if target_card:\n"
+        "    path = target_card['path']\n"
+        "    if path in deep_paths:\n"
+        "        target_doc = llm_query(\n"
+        "            'Write one concrete Markdown explanation for the single source file in Parent context. Include: responsibility, main classes/functions, inputs/outputs, dependencies, and caveats. Call finish(markdown_text) in the first child step. Do not use generic placeholder text.',\n"
+        "            {'file': target_card},\n"
+        "        )\n"
+        "        doc = '# Analysis of ' + path + '\\n\\n## Deep-dive decision\\n\\nSelected for: ' + ', '.join(target_card['reasons']) + '\\n\\n' + str(target_doc)\n"
+        "    else:\n"
+        "        doc = '# Analysis of ' + path + '\\n\\n## Deep-dive decision\\n\\nMachine-card only: lower priority for limited budget. Reasons: ' + ', '.join(target_card['reasons'] or ['not selected']) + '\\n\\n## File Card\\n\\n- Language: ' + str(target_card['info'].get('language')) + '\\n- Lines: ' + str(target_card['info'].get('line_count')) + '\\n- Symbols: ' + str(target_card['symbols'].get('symbols'))[:600] + '\\n\\n## Excerpt\\n\\n```\\n' + str(target_card['excerpt'])[:800] + '\\n```'\n"
+        "    record_document(path + '.md', 'Analysis of ' + path, doc)\n"
+        "    pending = pending[1:]\n"
+        "if pending:\n"
+        "    progress_note = 'Recorded one source document; continue next step with remaining pending files.'\n"
+        "if not pending:\n"
+        "    summary = '# Project Index\\n\\nAnalyzed all source files from repo_map source_worklist.\\n\\n## Deep-dive files\\n\\n' + '\\n'.join('- ' + path for path in deep_paths) + '\\n\\n## Coverage\\n\\nRecorded one Markdown document for every source file; low-priority files kept machine-card only.'\n"
+        "    finish({'summary': summary})\n"
+        "Do not write `import`, `from ... import ...`, or finish(None). Do not finish with a bare string.\n"
         "- When you are done, call finish(value).\n"
+    )
+
+
+class ProjectAnalysisChildPromptBuilder(PromptBuilder):
+    SYSTEM_PROMPT = (
+        "You are a child Recursive Language Model query for project analysis.\n"
+        "Return only Python code and no prose.\n"
+        "Your job is to answer the focused child goal using the provided Parent context.\n"
+        "When the child goal asks for one Markdown explanation, produce a Python string and call finish(markdown_text).\n"
+        "When the Parent context contains a `file` card, produce one Markdown explanation for that exact file and call finish(markdown_text).\n"
+        "For a `file` card, do not call helper functions to gather more context; use only the path, source excerpt, symbols, and selection reasons already shown in Parent context, then finish in the first step.\n"
+        "Prefer finishing in one step. Do not create documents, do not call record_document(), and do not return a dict for single-file Markdown.\n"
+        "Available helpers:\n"
+        "- list_dir(path='.') -> list[str]\n"
+        "- read_text(path, offset=0, limit=2000) -> str\n"
+        "- file_info(path) -> dict(path, exists, is_file, is_dir, size_bytes, line_count, char_count, approx_tokens, language, binary)\n"
+        "- search_text(path, pattern, max_results=10, context_chars=160) -> list[dict(offset, line, match, excerpt)]\n"
+        "- read_json(path) -> parsed json value\n"
+        "- path_exists(path) -> bool\n"
+        "- is_dir(path) -> bool\n"
+        "- extract_symbols(path) -> dict(language, symbols, fallback_excerpt, error)\n"
+        "- finish(value) -> immediately end the child run and return value to the parent.\n"
+        "Rules:\n"
+        "- Do not import modules.\n"
+        "- Do not attempt network, subprocess, or filesystem mutation.\n"
+        "- Do not call llm_query from child analysis unless the child goal explicitly requires deeper recursion.\n"
+        "- All helper paths are relative to the analysis root.\n"
+        "- If Parent context contains source text or symbols, base the Markdown on that context instead of re-reading large files.\n"
+        "- For a `file` card, the only valid first action is building `markdown_text` and calling finish(markdown_text).\n"
+        "Valid child-code example:\n"
+        "markdown_text = '## Responsibility\\n\\nThis file is responsible for the behavior described in the child goal and Parent context.\\n\\n## Main Elements\\n\\n- Describe concrete functions/classes seen in context.\\n\\n## Inputs and Outputs\\n\\n- Describe inputs and outputs visible in context.\\n\\n## Dependencies and Caveats\\n\\n- Note imports, callers, or limits visible in context.'\n"
+        "finish(markdown_text)\n"
     )
 
 
@@ -261,7 +398,8 @@ def _normalize_structured_analysis(root_name: str, result: Any) -> StructuredAna
 
 def _summarize_observation(obs: ExecutionObservation) -> str:
     if obs.error:
-        return obs.error.splitlines()[0]
+        lines = [line.strip() for line in obs.error.splitlines() if line.strip()]
+        return lines[-1] if lines else obs.error
     if obs.stdout:
         return obs.stdout.strip().splitlines()[0]
     return f"Result: {_summarize_value(obs.result, 100)}"
@@ -312,6 +450,7 @@ class AnalysisDocBuilder:
                 guidance.append("Try increasing --max-total-tokens or --max-steps.")
             guidance.append("If the controller keeps failing, retry with --runtime legacy.")
             failure_summary = f"[{controller_result.status}] {detail} {' '.join(guidance)}".strip()
+            partial_documents = [document for document in structured.documents if document.path != "index.md"]
             structured = StructuredAnalysis(
                 summary=failure_summary,
                 documents=[
@@ -319,7 +458,8 @@ class AnalysisDocBuilder:
                         path="index.md",
                         title=f"Analysis stopped: {controller_result.status}",
                         content=failure_summary,
-                    )
+                    ),
+                    *partial_documents,
                 ],
             )
 
@@ -656,11 +796,11 @@ class RLMRuntimeAnalyzer:
         self,
         client,
         max_depth: int = 2,
-        max_steps: int = 8,
+        max_steps: int = 30,
         output_dir: Path | None = None,
         step_timeout_seconds: float = 15.0,
         llm_timeout_seconds: float = 120.0,
-        max_total_tokens: int = 30000,
+        max_total_tokens: int = 90000,
         backend_name: str = "unknown",
         model_name: str = "unknown",
     ):
@@ -691,11 +831,20 @@ class RLMRuntimeAnalyzer:
             root=root,
             run_context=RunContext(limits=limits),
             prompt_builder=ProjectAnalysisPromptBuilder(),
+            child_config=ChildQueryConfig(
+                prompt_builder=ProjectAnalysisChildPromptBuilder(),
+                limits=PartialBudgetLimits(max_steps=PROJECT_ANALYSIS_CHILD_MAX_STEPS),
+            ),
         )
+        source_files = AnalysisDocBuilder(self.output_dir or (root / ".isohyps-output-validation"))._collect_source_files(root)
+
+        def validate_finish(value: Any) -> list[str]:
+            return validate_project_analysis_finish(value, source_files=source_files)
+
         goal = DEFAULT_GOAL_TEMPLATE.format(root_name=root.name)
         result = controller.run(
             goal=goal,
-            finish_validator=validate_project_analysis_finish,
+            finish_validator=validate_finish,
             finish_normalizer=normalize_analysis_result,
             finish_error_formatter=format_analysis_result_errors,
         )

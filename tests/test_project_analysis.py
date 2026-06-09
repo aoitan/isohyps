@@ -8,6 +8,8 @@ from unittest.mock import MagicMock, patch
 from analyzer import BaseLLMClient
 from isohyps.project_analysis import (
     AnalysisDocBuilder,
+    PROJECT_ANALYSIS_CHILD_MAX_STEPS,
+    ProjectAnalysisChildPromptBuilder,
     ProjectAnalysisPromptBuilder,
     RLMRuntimeAnalyzer,
     normalize_analysis_result,
@@ -15,7 +17,7 @@ from isohyps.project_analysis import (
     validate_project_analysis_finish,
     write_analysis_docs,
 )
-from isohyps.rlm_runtime import BudgetSnapshot, ControllerResult, ExecutionObservation
+from isohyps.rlm_runtime import BudgetSnapshot, ChildQueryConfig, ControllerResult, ExecutionObservation
 from tests.test_utils import ScriptedClient
 
 
@@ -59,6 +61,40 @@ class TestProjectAnalysisContract(unittest.TestCase):
 
         self.assertEqual(errors, [])
 
+    def test_validate_project_analysis_finish_rejects_missing_source_documents(self):
+        errors = validate_project_analysis_finish(
+            {
+                "summary": "The project contains a CLI layer, runtime controller, tests, and documentation areas.",
+                "documents": [
+                    {
+                        "path": "index.md",
+                        "title": "Overview",
+                        "content": "The repository includes a CLI entrypoint, core runtime modules, tests, and documentation.",
+                    }
+                ],
+            },
+            source_files=["app.py"],
+        )
+
+        self.assertTrue(any("missing: app.py" in error for error in errors))
+
+    def test_validate_project_analysis_finish_accepts_source_path_markdown_document(self):
+        errors = validate_project_analysis_finish(
+            {
+                "summary": "The project contains a CLI layer, runtime controller, tests, and documentation areas.",
+                "documents": [
+                    {
+                        "path": "app.py.md",
+                        "title": "App",
+                        "content": "The app module exposes a small CLI-facing function and its runtime behavior.",
+                    }
+                ],
+            },
+            source_files=["app.py"],
+        )
+
+        self.assertEqual(errors, [])
+
     def test_normalize_analysis_result_flattens_nested_summary_dict(self):
         normalized = normalize_analysis_result(
             {
@@ -90,7 +126,64 @@ class TestProjectAnalysisContract(unittest.TestCase):
         self.assertIn("Do not assign to helper names", prompt)
         self.assertIn("repo_map['source_worklist']", prompt)
         self.assertIn("explicit analysis worklist", prompt)
+        self.assertIn("create a mechanical file card for each pending source file", prompt)
+        self.assertIn("Select a small deep-dive set", prompt)
+        self.assertIn("Prefer entrypoints, CLI files, application/controller/runtime modules", prompt)
+        self.assertIn("Deprioritize tests, __init__.py", prompt)
+        self.assertIn("call llm_query for one selected deep-dive file at a time", prompt)
+        self.assertIn("Machine-card-only documents must state why no deep dive was used", prompt)
+        self.assertIn("Do not bundle multiple source files into one child query", prompt)
         self.assertIn("coverage does not rely on fallback generation", prompt)
+        self.assertIn("record_document(path, title, content)", prompt)
+        self.assertIn("Do not call finish() while pending source files remain.", prompt)
+
+    def test_project_analysis_prompt_contains_valid_controller_code_example(self):
+        prompt = ProjectAnalysisPromptBuilder.SYSTEM_PROMPT
+        self.assertIn("Valid controller-code example", prompt)
+        self.assertIn("if 'pending' not in globals():", prompt)
+        self.assertIn("pending = list(repo_map['source_worklist'])", prompt)
+        self.assertIn("file_cards = []", prompt)
+        self.assertIn("reasons.append('entrypoint_or_application')", prompt)
+        self.assertIn("reasons.append('noise_or_low_priority')", prompt)
+        self.assertIn("deep_cards = sorted", prompt)
+        self.assertIn("deep_paths = [card['path'] for card in deep_cards]", prompt)
+        self.assertIn("target_path = pending[0] if pending else None", prompt)
+        self.assertIn("target_card = next((card for card in file_cards if card['path'] == target_path), None)", prompt)
+        self.assertIn("excerpt = read_text(path, 0, 1200)", prompt)
+        self.assertIn("symbols = extract_symbols(path)", prompt)
+        self.assertIn("if path in deep_paths:", prompt)
+        self.assertIn("target_doc = llm_query(", prompt)
+        self.assertIn("Write one concrete Markdown explanation for the single source file", prompt)
+        self.assertIn("responsibility, main classes/functions, inputs/outputs, dependencies, and caveats", prompt)
+        self.assertIn("Call finish(markdown_text) in the first child step.", prompt)
+        self.assertIn("Do not use generic placeholder text.", prompt)
+        self.assertIn("{'file': target_card}", prompt)
+        self.assertIn("## Deep-dive decision", prompt)
+        self.assertIn("Machine-card only: lower priority for limited budget.", prompt)
+        self.assertIn("record_document(path + '.md'", prompt)
+        self.assertNotIn("Purpose and key behavior based on inspected source", prompt)
+        self.assertIn("pending = pending[1:]", prompt)
+        self.assertIn("if pending:", prompt)
+        self.assertIn("continue next step with remaining pending files", prompt)
+        self.assertIn("summary = '# Project Index", prompt)
+        self.assertIn("## Deep-dive files", prompt)
+        self.assertIn("if not pending:", prompt)
+        self.assertIn("    finish({'summary': summary})", prompt)
+        self.assertNotIn("pending = []", prompt)
+        self.assertIn("Do not write `import`, `from ... import ...`, or finish(None).", prompt)
+        self.assertIn("Do not finish with a bare string.", prompt)
+
+    def test_project_analysis_child_prompt_requires_python_finish_for_markdown(self):
+        prompt = ProjectAnalysisChildPromptBuilder.SYSTEM_PROMPT
+        self.assertIn("Return only Python code and no prose.", prompt)
+        self.assertIn("finish(markdown_text)", prompt)
+        self.assertIn("When the Parent context contains a `file` card", prompt)
+        self.assertIn("do not return a dict for single-file Markdown", prompt)
+        self.assertIn("do not call helper functions to gather more context", prompt)
+        self.assertIn("the only valid first action is building `markdown_text`", prompt)
+        self.assertIn("Prefer finishing in one step.", prompt)
+        self.assertIn("Do not create documents", prompt)
+        self.assertIn("do not call record_document()", prompt)
 
 
 class TestRLMRuntimeAnalyzer(unittest.TestCase):
@@ -129,10 +222,11 @@ class TestRLMRuntimeAnalyzer(unittest.TestCase):
         self.assertIn("runtime summary with project components and responsibilities", report)
         self.assertIn("Runtime:** controller", report)
 
-    def test_runtime_analyzer_defaults_to_30000_tokens(self):
+    def test_runtime_analyzer_defaults_to_expanded_controller_budget(self):
         analyzer = RLMRuntimeAnalyzer(self.client)
         self.assertEqual(analyzer.max_depth, 2)
-        self.assertEqual(analyzer.max_total_tokens, 30000)
+        self.assertEqual(analyzer.max_steps, 30)
+        self.assertEqual(analyzer.max_total_tokens, 90000)
         self.assertEqual(analyzer.step_timeout_seconds, 15.0)
         self.assertEqual(analyzer.llm_timeout_seconds, 120.0)
 
@@ -152,6 +246,35 @@ class TestRLMRuntimeAnalyzer(unittest.TestCase):
 
         self.assertIn("Try increasing --max-total-tokens or --max-steps.", summary)
         self.assertIn("--runtime legacy", summary)
+
+    def test_runtime_analyzer_configures_child_project_analysis_prompt(self):
+        fake_controller = MagicMock()
+        fake_controller.run.return_value = ControllerResult(
+            status="finished",
+            result={
+                "summary": "runtime summary with project components and responsibilities",
+                "documents": [
+                    {
+                        "path": "README.md",
+                        "title": "README",
+                        "content": "README source document with enough detail for validation.",
+                    }
+                ],
+            },
+            steps=[],
+            error=None,
+            budget=BudgetSnapshot(steps_used=1, llm_calls=1, prompt_tokens=10, response_tokens=5, total_tokens=15),
+            final_state={},
+        )
+
+        with patch("isohyps.project_analysis.RLMController", return_value=fake_controller) as controller_cls:
+            analyzer = RLMRuntimeAnalyzer(self.client)
+            analyzer.analyze(self.root)
+
+        child_config = controller_cls.call_args.kwargs["child_config"]
+        self.assertIsInstance(child_config, ChildQueryConfig)
+        self.assertIsInstance(child_config.prompt_builder, ProjectAnalysisChildPromptBuilder)
+        self.assertEqual(child_config.limits.max_steps, PROJECT_ANALYSIS_CHILD_MAX_STEPS)
 
 
 class TestRLMRuntimeAnalyzerIntegration(unittest.TestCase):
@@ -179,7 +302,8 @@ class TestRLMRuntimeAnalyzerIntegration(unittest.TestCase):
         responses = [
             "child_result = llm_query('Analyze app.py', {'path': 'app.py'})\n"
             "finish({'summary': f'Parent saw: {child_result}; app.py was inspected through a child query.', "
-            "'documents': [{'path': 'index.md', 'title': 'Overview', 'content': f'Parent saw: {child_result}; app.py was inspected through a child query.'}]})",
+            "'documents': [{'path': 'index.md', 'title': 'Overview', 'content': f'Parent saw: {child_result}; app.py was inspected through a child query.'}, "
+            "{'path': 'app.py.md', 'title': 'app.py', 'content': f'app.py was inspected through a child query. {child_result}'}]})",
             "finish('Child summary of app.py')",
         ]
         analyzer, _ = self._make_analyzer(responses, max_steps=5)
@@ -199,12 +323,46 @@ class TestRLMRuntimeAnalyzerIntegration(unittest.TestCase):
         self.assertIn("--runtime legacy", summary)
         self.assertIn("max_steps=1", summary)
 
+    def test_budget_exceeded_preserves_recorded_source_documents(self):
+        responses = [
+            "src = read_text('app.py')\n"
+            "record_document('app.py.md', 'app.py', 'app.py defines hello and this recorded analysis survives step budget exhaustion. ' + src)"
+        ]
+        analyzer, _ = self._make_analyzer(responses, max_steps=1)
+
+        summary = analyzer.analyze(self.root)
+
+        self.assertIn("budget_exceeded", summary)
+        doc = (self.output_dir / "app.py.md").read_text(encoding="utf-8")
+        self.assertIn("recorded analysis survives step budget exhaustion", doc)
+        self.assertNotIn("This fallback document was generated", doc)
+        report = (self.output_dir / "analysis_report.md").read_text(encoding="utf-8")
+        self.assertIn("Fallback docs generated: 0", report)
+        self.assertIn("Source files missing matching docs: 0", report)
+
+    def test_recorded_source_documents_satisfy_summary_only_finish(self):
+        responses = [
+            "record_document('app.py.md', 'app.py', 'app.py defines hello and is covered by a recorded source document.')\n"
+            "finish({'summary': 'Finished with recorded source documents attached by the runtime.'})",
+        ]
+        analyzer, _ = self._make_analyzer(responses, max_steps=2)
+
+        summary = analyzer.analyze(self.root)
+
+        self.assertIn("Finished with recorded source documents", summary)
+        doc = (self.output_dir / "app.py.md").read_text(encoding="utf-8")
+        self.assertIn("recorded source document", doc)
+        report = (self.output_dir / "analysis_report.md").read_text(encoding="utf-8")
+        self.assertIn("**Status:** finished", report)
+        self.assertIn("Fallback docs generated: 0", report)
+
     def test_invalid_code_retry(self):
         analyzer, client = self._make_analyzer(
             [
                 "This is not python code.",
                 "finish({'summary': 'Recovered after invalid code and produced a substantive project analysis.', "
-                "'documents': [{'path': 'index.md', 'title': 'Overview', 'content': 'Recovered after invalid code and produced a substantive project analysis.'}]})",
+                "'documents': [{'path': 'index.md', 'title': 'Overview', 'content': 'Recovered after invalid code and produced a substantive project analysis.'}, "
+                "{'path': 'app.py.md', 'title': 'app.py', 'content': 'app.py has a small hello function and is covered by a source document.'}]})",
             ],
             max_steps=3,
         )
@@ -232,6 +390,26 @@ class TestAnalysisDocBuilder(unittest.TestCase):
             budget=BudgetSnapshot(steps_used=1, llm_calls=1, prompt_tokens=10, response_tokens=5, total_tokens=15),
             final_state={},
         )
+
+    def test_build_step_history_reports_traceback_cause(self):
+        builder = AnalysisDocBuilder(self.output_dir)
+        result = self._make_result(result={"summary": "all good", "documents": []})
+        result.steps.append(
+            ExecutionObservation(
+                kind="execution_error",
+                stdout="",
+                error="Traceback (most recent call last):\n  File '<stdin>', line 1, in <module>\nValueError: boom",
+                state={},
+                finished=False,
+                result=None,
+            )
+        )
+
+        builder.build(Path(self.temp_dir), result, backend="test", model="fake")
+
+        report = (self.output_dir / "analysis_report.md").read_text(encoding="utf-8")
+        self.assertIn("| 1 | execution_error | ERR | ValueError: boom |", report)
+        self.assertNotIn("| 1 | execution_error | ERR | Traceback", report)
 
     def test_sanitize_path_strips_parent_traversal(self):
         builder = AnalysisDocBuilder(self.output_dir)

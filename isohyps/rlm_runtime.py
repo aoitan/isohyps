@@ -170,6 +170,54 @@ def _summarize_child_error(error: str | None, limit: int = 200) -> str:
     return _cap_text(detail, limit)
 
 
+def _child_query_fallback_result(goal: str, child_context: Any, status: str, error: str | None) -> str:
+    detail = _summarize_child_error(error)
+    card = child_context.get("file") if isinstance(child_context, dict) else None
+    if not isinstance(card, dict) and isinstance(child_context, dict):
+        card = child_context
+
+    if not isinstance(card, dict):
+        return (
+            "## Child Query Fallback\n\n"
+            f"The child query could not complete ({status}: {detail}). "
+            "No file card was provided, so only the parent-visible context is available.\n\n"
+            "## Focus\n\n"
+            f"{_cap_text(goal, 500)}"
+        )
+
+    info = card.get("info") if isinstance(card.get("info"), dict) else {}
+    symbols = card.get("symbols") if isinstance(card.get("symbols"), dict) else {}
+    path = card.get("path") or info.get("path") or "unknown"
+    reasons = card.get("reasons")
+    if not isinstance(reasons, list):
+        reasons = []
+    excerpt = card.get("excerpt")
+    if not isinstance(excerpt, str):
+        excerpt = symbols.get("fallback_excerpt") if isinstance(symbols.get("fallback_excerpt"), str) else ""
+    symbol_items = symbols.get("symbols")
+
+    return (
+        "## Child Query Fallback\n\n"
+        f"The deep-dive child query for `{path}` could not complete ({status}: {detail}). "
+        "This document is a mechanical fallback built from the file card so the parent can continue.\n\n"
+        "## Responsibility\n\n"
+        f"File-card-only responsibility estimate for `{path}` based on language, size, symbols, and excerpt.\n\n"
+        "## Main Elements\n\n"
+        f"- Language: {info.get('language')}\n"
+        f"- Lines: {info.get('line_count')}\n"
+        f"- Selection reasons: {', '.join(str(reason) for reason in reasons) if reasons else 'not recorded'}\n"
+        f"- Symbols: {_cap_text(str(symbol_items), 800)}\n\n"
+        "## Inputs and Outputs\n\n"
+        "Inputs and outputs were not model-expanded because the child query failed; infer them from the listed symbols and excerpt.\n\n"
+        "## Dependencies and Caveats\n\n"
+        "This fallback is less reliable than a completed deep dive and should be reviewed if the file is critical.\n\n"
+        "## Excerpt\n\n"
+        "```\n"
+        f"{_cap_text(excerpt, 1200)}\n"
+        "```"
+    )
+
+
 def _merge_recorded_documents(result: Any, documents: list[dict[str, str]]) -> Any:
     if not documents or not isinstance(result, dict):
         return result
@@ -894,6 +942,40 @@ def _sandbox_worker(connection: Connection, root: str, limits: BudgetLimits) -> 
                 sanitized_documents.append({"path": path, "title": title, "content": content})
         return sanitized_documents
 
+    def should_prune_transient_global(name: str, value: Any, pre_existing_names: set[str]) -> bool:
+        if (
+            name in pre_existing_names
+            or name.startswith("_")
+            or name == "__builtins__"
+            or name in helper_names
+            or name == "analysis_documents"
+            or name == "file_cards"
+            or callable(value)
+        ):
+            return False
+        if isinstance(value, str):
+            return len(value) > 4000
+        if isinstance(value, (list, tuple, set)):
+            if len(value) <= 25:
+                return False
+            return any(
+                isinstance(item, (dict, list, tuple, set)) or (isinstance(item, str) and len(item) > 500)
+                for item in value
+            )
+        if isinstance(value, dict):
+            if len(value) > 25:
+                return True
+            return any(
+                isinstance(item, (dict, list, tuple, set)) or (isinstance(item, str) and len(item) > 500)
+                for item in value.values()
+            )
+        return False
+
+    def prune_transient_globals(pre_existing_names: set[str]) -> None:
+        for name in list(globals_dict):
+            if should_prune_transient_global(name, globals_dict[name], pre_existing_names):
+                del globals_dict[name]
+
     def snapshot_state() -> dict[str, str]:
         state: dict[str, str] = {}
         for name, value in globals_dict.items():
@@ -922,6 +1004,7 @@ def _sandbox_worker(connection: Connection, root: str, limits: BudgetLimits) -> 
         finished = False
         result = None
         kind = "ok"
+        pre_existing_names = set(globals_dict)
         with redirect_stdout(stream):
             try:
                 exec(command["code"], globals_dict, globals_dict)
@@ -932,6 +1015,7 @@ def _sandbox_worker(connection: Connection, root: str, limits: BudgetLimits) -> 
             except Exception:
                 error = _cap_text(traceback.format_exc(), limits.max_stdout_chars)
                 kind = "execution_error"
+        prune_transient_globals(pre_existing_names)
         connection.send(
             {
                 "type": "result",
@@ -1234,9 +1318,12 @@ class RLMController:
         try:
             child_result = child_controller.run(goal=goal, depth=depth, parent_context=child_context)
         except Exception as exc:
-            raise RuntimeError(
-                f"Child query failed (execution_error): {_summarize_child_error(f'{type(exc).__name__}: {exc}')}"
-            ) from exc
+            return _child_query_fallback_result(
+                goal,
+                child_context,
+                "execution_error",
+                f"{type(exc).__name__}: {exc}",
+            )
         finally:
             self.run_context.accumulate(child_run_context.snapshot())
         _dbg(
@@ -1244,8 +1331,11 @@ class RLMController:
             f"subquery done status={child_result.status} steps_used={child_result.budget.steps_used} tokens={child_result.budget.total_tokens}",
         )
         if child_result.status != "finished":
-            raise RuntimeError(
-                f"Child query failed ({child_result.status}): {_summarize_child_error(child_result.error)}"
+            return _child_query_fallback_result(
+                goal,
+                child_context,
+                child_result.status,
+                child_result.error,
             )
         return child_result.result
 

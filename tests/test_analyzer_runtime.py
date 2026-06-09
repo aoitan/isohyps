@@ -52,10 +52,11 @@ class TestRLMRuntimeAnalyzer(unittest.TestCase):
         self.assertIn("runtime summary with project components and responsibilities", report)
         self.assertIn("Runtime:** controller", report)
 
-    def test_runtime_analyzer_defaults_to_30000_tokens(self):
+    def test_runtime_analyzer_defaults_to_expanded_controller_budget(self):
         analyzer = RLMRuntimeAnalyzer(self.client)
         self.assertEqual(analyzer.max_depth, 2)
-        self.assertEqual(analyzer.max_total_tokens, 30000)
+        self.assertEqual(analyzer.max_steps, 30)
+        self.assertEqual(analyzer.max_total_tokens, 90000)
         self.assertEqual(analyzer.step_timeout_seconds, 15.0)
         self.assertEqual(analyzer.llm_timeout_seconds, 120.0)
 
@@ -84,7 +85,8 @@ class TestCLIParser(unittest.TestCase):
         self.assertEqual(args.root, ".")
         self.assertEqual(args.runtime, "controller")
         self.assertEqual(args.depth, 2)
-        self.assertEqual(args.max_total_tokens, 30000)
+        self.assertEqual(args.max_steps, 30)
+        self.assertEqual(args.max_total_tokens, 90000)
         self.assertEqual(args.step_timeout, 15.0)
         self.assertEqual(args.llm_timeout, 120.0)
 
@@ -121,7 +123,8 @@ class TestRLMRuntimeAnalyzerIntegration(unittest.TestCase):
             # Parent step 1: issue child query then finish with the result
             "child_result = llm_query('Analyze app.py', {'path': 'app.py'})\n"
             "finish({'summary': f'Parent saw: {child_result}; app.py was inspected through a child query.', "
-            "'documents': [{'path': 'index.md', 'title': 'Overview', 'content': f'Parent saw: {child_result}; app.py was inspected through a child query.'}]})",
+            "'documents': [{'path': 'index.md', 'title': 'Overview', 'content': f'Parent saw: {child_result}; app.py was inspected through a child query.'}, "
+            "{'path': 'app.py.md', 'title': 'app.py', 'content': f'app.py was inspected through a child query. {child_result}'}]})",
             # Child step 1: analyse and finish
             "finish('Child summary of app.py')",
         ]
@@ -160,7 +163,8 @@ class TestRLMRuntimeAnalyzerIntegration(unittest.TestCase):
         responses = [
             "This is not python code.",
             "finish({'summary': 'Recovered after invalid code and produced a substantive project analysis.', "
-            "'documents': [{'path': 'index.md', 'title': 'Overview', 'content': 'Recovered after invalid code and produced a substantive project analysis.'}]})",
+            "'documents': [{'path': 'index.md', 'title': 'Overview', 'content': 'Recovered after invalid code and produced a substantive project analysis.'}, "
+            "{'path': 'app.py.md', 'title': 'app.py', 'content': 'app.py has a small hello function and is covered by a source document.'}]})",
         ]
         analyzer, client = self._make_analyzer(responses, max_steps=3)
 
@@ -216,7 +220,8 @@ class TestRLMRuntimeAnalyzerIntegration(unittest.TestCase):
         """A valid structured finish produces index.md and analysis_report.md."""
         responses = [
             "finish({'summary': 'Minimal project summary with enough detail to satisfy validation.', "
-            "'documents': [{'path': 'index.md', 'title': 'Overview', 'content': 'Minimal project summary with enough detail to satisfy validation.'}]})",
+            "'documents': [{'path': 'index.md', 'title': 'Overview', 'content': 'Minimal project summary with enough detail to satisfy validation.'}, "
+            "{'path': 'app.py.md', 'title': 'app.py', 'content': 'app.py has a small hello function and is covered by a source document.'}]})",
         ]
         analyzer, _ = self._make_analyzer(responses, max_steps=3)
 

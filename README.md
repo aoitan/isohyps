@@ -124,10 +124,10 @@ uv run python analyzer.py . \
 |---|---|---|
 | `root` | `.` | 解析を開始するルートディレクトリ |
 | `--depth` | `2` | Child Query による再帰探索の最大深さ |
-| `--max-steps` | `8` | Controller の最大ステップ数 |
+| `--max-steps` | `30` | Controller の最大ステップ数 |
 | `--step-timeout` | `15.0` | 1ステップあたりのタイムアウト秒数 |
 | `--llm-timeout` | `120.0` | 1回の LLM バックエンド呼び出しに対するタイムアウト秒数 |
-| `--max-total-tokens` | `30000` | Controller 全体の共有トークン予算 |
+| `--max-total-tokens` | `90000` | Controller 全体の共有トークン予算 |
 | `--backend` | `gemini` | LLM バックエンド（`gemini` または `ollama`） |
 | `--model` | — | 使用するモデル名 |
 | `--out` | `analysis_docs` | 出力先ディレクトリ |
@@ -141,12 +141,12 @@ uv run python analyzer.py . \
 
 Controller ランタイムは、無限ループや過剰な API 課金を防ぐために以下の実行時制約を持ちます。各制約に達した場合の**システムの振る舞い**を理解しておくことが重要です。
 
-### `--max-steps`（デフォルト: `8`）
+### `--max-steps`（デフォルト: `30`）
 Controller が LLM ツールコールを実行できる最大ループ回数です。
 
 **上限到達時の挙動:** 上限に達すると `BudgetExceededError` が発生し、探索は即座に打ち切られます。ツール全体はクラッシュせず、**そこまでに収集できた情報を使って出力ドキュメントを生成**し、ステータス `budget_exceeded` で正常終了します。
 
-### `--max-total-tokens`（デフォルト: `30000`）
+### `--max-total-tokens`（デフォルト: `90000`）
 Controller 全体（すべての LLM 呼び出しの合計）で消費可能なトークン数の上限です。
 
 **上限到達時の挙動:** `--max-steps` と同様に `BudgetExceededError` として扱われます。**そこまでの結果で出力を生成**し、`budget_exceeded` ステータスで終了します。出力ドキュメントの `analysis_report.md` にステータスと使用済みトークン数が記録されます。

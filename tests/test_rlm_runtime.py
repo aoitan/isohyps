@@ -296,6 +296,30 @@ class TestRLMRuntime(unittest.TestCase):
             {"caught": "NameError", "has_state": True, "has_names": True, "items": ["src"]},
         )
 
+    def test_repl_keeps_file_cards_while_pruning_large_transient_globals(self):
+        with IsolatedREPL(self.root, BudgetLimits()) as repl:
+            observation = repl.execute(
+                "file_cards = [{'path': str(index), 'info': {'line_count': index}} for index in range(50)]\n"
+                "pending = [str(index) for index in range(50)]\n"
+                "target_doc = 'x' * 5000\n"
+                "keep = 'small-state'",
+                lambda prompt, context: None,
+            )
+            followup = repl.execute(
+                "finish({'has_file_cards': 'file_cards' in globals(), 'has_target_doc': 'target_doc' in globals(), 'pending_len': len(pending), 'keep': keep})",
+                lambda prompt, context: None,
+            )
+
+        self.assertEqual(observation.kind, "ok")
+        self.assertIn("file_cards", observation.state)
+        self.assertNotIn("target_doc", observation.state)
+        self.assertIn("pending", observation.state)
+        self.assertTrue(followup.finished)
+        self.assertEqual(
+            followup.result,
+            {"has_file_cards": True, "has_target_doc": False, "pending_len": 50, "keep": "small-state"},
+        )
+
     def test_repl_blocks_root_escape(self):
         with IsolatedREPL(self.root, BudgetLimits()) as repl:
             observation = repl.execute("read_text('../outside.txt')", lambda prompt, context: None)
@@ -407,12 +431,12 @@ class TestRLMRuntime(unittest.TestCase):
         self.assertIn("Parent context: dict {'chunk_id': 'A', 'text': str(len=5000)", client.prompts[1])
         self.assertIn("Parent context: dict {'chunk_id': 'B', 'text': str(len=5000)", client.prompts[2])
 
-    def test_llm_query_uses_independent_child_step_limit(self):
+    def test_llm_query_child_budget_failure_returns_fallback(self):
         controller, _ = self._controller(
             [
-                "try:\n    llm_query('Need another step')\nexcept RuntimeError as exc:\n    child_error = str(exc)",
+                "child_result = llm_query('Need another step', {'file': {'path': 'src/app.py', 'info': file_info('src/app.py'), 'symbols': extract_symbols('src/app.py'), 'excerpt': read_text('src/app.py'), 'reasons': ['entrypoint_or_application']}})",
                 "x = 1",
-                "finish({'summary': child_error, 'documents': []})",
+                "finish({'summary': child_result, 'documents': []})",
             ],
             max_steps=2,
             child_config=ChildQueryConfig(limits=PartialBudgetLimits(max_steps=1)),
@@ -422,7 +446,9 @@ class TestRLMRuntime(unittest.TestCase):
 
         self.assertEqual(result.status, "finished")
         self.assertEqual(result.budget.steps_used, 2)
-        self.assertIn("Child query failed (budget_exceeded): max_steps=1 reached", result.result["summary"])
+        self.assertIn("## Child Query Fallback", result.result["summary"])
+        self.assertIn("budget_exceeded: max_steps=1 reached", result.result["summary"])
+        self.assertIn("src/app.py", result.result["summary"])
 
     def test_run_context_accumulates_child_token_usage(self):
         controller, _ = self._controller(
@@ -465,7 +491,7 @@ class TestRLMRuntime(unittest.TestCase):
         self.assertNotIn("CHILD-PROMPT", client.prompts[0])
         self.assertIn("CHILD-PROMPT", client.prompts[1])
 
-    def test_llm_query_sanitizes_child_failure_details(self):
+    def test_llm_query_sanitizes_child_failure_details_in_fallback(self):
         controller, _ = self._controller([])
         child_result = ControllerResult(
             status="execution_error",
@@ -487,22 +513,19 @@ class TestRLMRuntime(unittest.TestCase):
         )
 
         with patch.object(RLMController, "run", return_value=child_result):
-            with self.assertRaises(RuntimeError) as exc_info:
-                controller._run_subquery("Summarize src/app.py", None, depth=1)
+            fallback = controller._run_subquery("Summarize src/app.py", None, depth=1)
 
-        self.assertEqual(str(exc_info.exception), "Child query failed (execution_error): ValueError: boom")
+        self.assertIn("## Child Query Fallback", fallback)
+        self.assertIn("execution_error: ValueError: boom", fallback)
 
-    def test_llm_query_sanitizes_unexpected_child_exception(self):
+    def test_llm_query_sanitizes_unexpected_child_exception_in_fallback(self):
         controller, _ = self._controller([])
 
         with patch.object(RLMController, "run", side_effect=RuntimeError("Traceback\nValueError: noisy detail")):
-            with self.assertRaises(RuntimeError) as exc_info:
-                controller._run_subquery("Summarize src/app.py", None, depth=1)
+            fallback = controller._run_subquery("Summarize src/app.py", None, depth=1)
 
-        self.assertEqual(
-            str(exc_info.exception),
-            "Child query failed (execution_error): ValueError: noisy detail",
-        )
+        self.assertIn("## Child Query Fallback", fallback)
+        self.assertIn("execution_error: ValueError: noisy detail", fallback)
 
     def test_system_prompt_contains_new_helpers(self):
         prompt = PromptBuilder.SYSTEM_PROMPT
