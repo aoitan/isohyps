@@ -253,6 +253,11 @@ class BudgetLimits:
     max_depth: int = 1
     max_total_tokens: int = 90000
     max_local_tokens: int = 90000
+    max_worker_tokens: int = 90000
+    max_synthesis_tokens: int = 90000
+    max_global_llm_calls: int | None = None
+    max_worker_llm_calls: int | None = None
+    max_synthesis_llm_calls: int | None = None
     step_timeout_seconds: float = 15.0
     llm_timeout_seconds: float = 120.0
     max_stdout_chars: int = 2000
@@ -280,6 +285,14 @@ class BudgetSnapshot:
     prompt_tokens: int
     response_tokens: int
     total_tokens: int
+    worker_llm_calls: int = 0
+    worker_prompt_tokens: int = 0
+    worker_response_tokens: int = 0
+    worker_total_tokens: int = 0
+    synthesis_llm_calls: int = 0
+    synthesis_prompt_tokens: int = 0
+    synthesis_response_tokens: int = 0
+    synthesis_total_tokens: int = 0
     global_llm_calls: int = 0
     global_prompt_tokens: int = 0
     global_response_tokens: int = 0
@@ -293,34 +306,52 @@ class BudgetExceededError(RuntimeError):
 @dataclass
 class RunContext:
     limits: BudgetLimits
+    budget_phase: str = "synthesis"
     steps_used: int = 0
     llm_calls: int = 0
     prompt_tokens: int = 0
     response_tokens: int = 0
+    worker_llm_calls: int = 0
+    worker_prompt_tokens: int = 0
+    worker_response_tokens: int = 0
+    synthesis_llm_calls: int = 0
+    synthesis_prompt_tokens: int = 0
+    synthesis_response_tokens: int = 0
     global_llm_calls: int = 0
     global_prompt_tokens: int = 0
     global_response_tokens: int = 0
 
+    def _raise_budget_error(self, message: str) -> None:
+        _dbg("budget_exceeded", message)
+        raise BudgetExceededError(message)
+
     def reserve_step(self) -> None:
         if self.steps_used >= self.limits.max_steps:
-            raise BudgetExceededError(f"max_steps={self.limits.max_steps} reached")
+            self._raise_budget_error(f"[Step Budget Exceeded] max_steps={self.limits.max_steps} reached")
         self.steps_used += 1
         _dbg("budget", f"step reserved: {self.steps_used}/{self.limits.max_steps}")
 
     def ensure_depth(self, depth: int) -> None:
         if depth > self.limits.max_depth:
-            raise BudgetExceededError(f"max_depth={self.limits.max_depth} reached")
+            self._raise_budget_error(f"[Depth Budget Exceeded] max_depth={self.limits.max_depth} reached")
 
     def ensure_prompt_budget(self, prompt: str) -> None:
         prompt_tokens = _approx_tokens(prompt)
         if self.total_tokens + prompt_tokens > self.limits.max_local_tokens:
-            raise BudgetExceededError(
-                f"max_local_tokens={self.limits.max_local_tokens} would be exceeded by prompt "
+            self._raise_budget_error(
+                f"[Local Token Budget Exceeded] max_local_tokens={self.limits.max_local_tokens} would be exceeded by prompt "
                 f"(prompt_tokens={prompt_tokens}, current_local_tokens={self.total_tokens})"
             )
+        phase_total = self._phase_total_tokens() + prompt_tokens
+        phase_limit = self._phase_token_limit()
+        if phase_total > phase_limit:
+            self._raise_budget_error(
+                f"[{self.budget_phase.capitalize()} Token Budget Exceeded] max_{self.budget_phase}_tokens={phase_limit} would be exceeded by prompt "
+                f"(prompt_tokens={prompt_tokens}, current_{self.budget_phase}_tokens={self._phase_total_tokens()})"
+            )
         if self.global_total_tokens + prompt_tokens > self.limits.max_total_tokens:
-            raise BudgetExceededError(
-                f"max_total_tokens={self.limits.max_total_tokens} would be exceeded by prompt "
+            self._raise_budget_error(
+                f"[Global Token Budget Exceeded] max_total_tokens={self.limits.max_total_tokens} would be exceeded by prompt "
                 f"(prompt_tokens={prompt_tokens}, current_global_tokens={self.global_total_tokens})"
             )
 
@@ -331,6 +362,7 @@ class RunContext:
         self.llm_calls += 1
         self.prompt_tokens += prompt_tokens
         self.response_tokens += response_tokens
+        self._record_phase_usage(prompt_tokens, response_tokens, llm_calls=1)
         
         self.global_llm_calls += 1
         self.global_prompt_tokens += prompt_tokens
@@ -338,9 +370,21 @@ class RunContext:
         
         _dbg("budget", f"llm_call #{self.llm_calls}: total_tokens={self.total_tokens}/{self.limits.max_local_tokens} (prompt_cumul={self.prompt_tokens} resp_cumul={self.response_tokens})")
         if self.total_tokens > self.limits.max_local_tokens:
-            raise BudgetExceededError(f"max_local_tokens={self.limits.max_local_tokens} reached")
+            self._raise_budget_error(f"[Local Token Budget Exceeded] max_local_tokens={self.limits.max_local_tokens} reached")
+        self._ensure_phase_limits()
         if self.global_total_tokens > self.limits.max_total_tokens:
-            raise BudgetExceededError(f"max_total_tokens={self.limits.max_total_tokens} reached")
+            self._raise_budget_error(f"[Global Token Budget Exceeded] max_total_tokens={self.limits.max_total_tokens} reached")
+        self._ensure_llm_call_limit("global", self.global_llm_calls, self.limits.max_global_llm_calls)
+
+    def record_worker_usage(self, input_text: str, output_text: str, llm_calls: int = 0) -> None:
+        prompt_tokens = _approx_tokens(input_text)
+        response_tokens = _approx_tokens(output_text)
+        self._record_phase_usage(prompt_tokens, response_tokens, llm_calls=llm_calls, phase="worker")
+        self.global_llm_calls += llm_calls
+        self._ensure_worker_limits()
+        if self.global_total_tokens > self.limits.max_total_tokens:
+            self._raise_budget_error(f"[Global Token Budget Exceeded] max_total_tokens={self.limits.max_total_tokens} reached")
+        self._ensure_llm_call_limit("global", self.global_llm_calls, self.limits.max_global_llm_calls)
 
     @property
     def total_tokens(self) -> int:
@@ -350,6 +394,67 @@ class RunContext:
     def global_total_tokens(self) -> int:
         return self.global_prompt_tokens + self.global_response_tokens
 
+    @property
+    def worker_total_tokens(self) -> int:
+        return self.worker_prompt_tokens + self.worker_response_tokens
+
+    @property
+    def synthesis_total_tokens(self) -> int:
+        return self.synthesis_prompt_tokens + self.synthesis_response_tokens
+
+    def _phase_token_limit(self, phase: str | None = None) -> int:
+        phase = phase or self.budget_phase
+        if phase == "worker":
+            return self.limits.max_worker_tokens
+        if phase == "synthesis":
+            return self.limits.max_synthesis_tokens
+        raise BudgetExceededError(f"unknown_budget_phase={phase}")
+
+    def _phase_total_tokens(self, phase: str | None = None) -> int:
+        phase = phase or self.budget_phase
+        if phase == "worker":
+            return self.worker_total_tokens
+        if phase == "synthesis":
+            return self.synthesis_total_tokens
+        raise BudgetExceededError(f"unknown_budget_phase={phase}")
+
+    def _record_phase_usage(self, prompt_tokens: int, response_tokens: int, llm_calls: int, phase: str | None = None) -> None:
+        phase = phase or self.budget_phase
+        if phase == "worker":
+            self.worker_llm_calls += llm_calls
+            self.worker_prompt_tokens += prompt_tokens
+            self.worker_response_tokens += response_tokens
+            return
+        if phase == "synthesis":
+            self.synthesis_llm_calls += llm_calls
+            self.synthesis_prompt_tokens += prompt_tokens
+            self.synthesis_response_tokens += response_tokens
+            return
+        raise BudgetExceededError(f"unknown_budget_phase={phase}")
+
+    def _ensure_phase_limits(self) -> None:
+        if self.budget_phase == "worker":
+            self._ensure_worker_limits()
+            return
+        if self.budget_phase == "synthesis":
+            self._ensure_synthesis_limits()
+            return
+        raise BudgetExceededError(f"unknown_budget_phase={self.budget_phase}")
+
+    def _ensure_worker_limits(self) -> None:
+        if self.worker_total_tokens > self.limits.max_worker_tokens:
+            self._raise_budget_error(f"[Worker Token Budget Exceeded] max_worker_tokens={self.limits.max_worker_tokens} reached")
+        self._ensure_llm_call_limit("worker", self.worker_llm_calls, self.limits.max_worker_llm_calls)
+
+    def _ensure_synthesis_limits(self) -> None:
+        if self.synthesis_total_tokens > self.limits.max_synthesis_tokens:
+            self._raise_budget_error(f"[Synthesis Token Budget Exceeded] max_synthesis_tokens={self.limits.max_synthesis_tokens} reached")
+        self._ensure_llm_call_limit("synthesis", self.synthesis_llm_calls, self.limits.max_synthesis_llm_calls)
+
+    def _ensure_llm_call_limit(self, name: str, current: int, limit: int | None) -> None:
+        if limit is not None and current > limit:
+            self._raise_budget_error(f"[{name.capitalize()} Call Budget Exceeded] max_{name}_llm_calls={limit} reached")
+
     def snapshot(self) -> BudgetSnapshot:
         return BudgetSnapshot(
             steps_used=self.steps_used,
@@ -357,6 +462,14 @@ class RunContext:
             prompt_tokens=self.prompt_tokens,
             response_tokens=self.response_tokens,
             total_tokens=self.total_tokens,
+            worker_llm_calls=self.worker_llm_calls,
+            worker_prompt_tokens=self.worker_prompt_tokens,
+            worker_response_tokens=self.worker_response_tokens,
+            worker_total_tokens=self.worker_total_tokens,
+            synthesis_llm_calls=self.synthesis_llm_calls,
+            synthesis_prompt_tokens=self.synthesis_prompt_tokens,
+            synthesis_response_tokens=self.synthesis_response_tokens,
+            synthesis_total_tokens=self.synthesis_total_tokens,
             global_llm_calls=self.global_llm_calls,
             global_prompt_tokens=self.global_prompt_tokens,
             global_response_tokens=self.global_response_tokens,
@@ -367,8 +480,16 @@ class RunContext:
         self.global_llm_calls = other.global_llm_calls
         self.global_prompt_tokens = other.global_prompt_tokens
         self.global_response_tokens = other.global_response_tokens
+        self.worker_llm_calls = other.worker_llm_calls
+        self.worker_prompt_tokens = other.worker_prompt_tokens
+        self.worker_response_tokens = other.worker_response_tokens
+        self.synthesis_llm_calls = other.synthesis_llm_calls
+        self.synthesis_prompt_tokens = other.synthesis_prompt_tokens
+        self.synthesis_response_tokens = other.synthesis_response_tokens
         if self.global_total_tokens > self.limits.max_total_tokens:
-            raise BudgetExceededError(f"max_total_tokens={self.limits.max_total_tokens} reached")
+            self._raise_budget_error(f"[Global Token Budget Exceeded] max_total_tokens={self.limits.max_total_tokens} reached")
+        self._ensure_worker_limits()
+        self._ensure_synthesis_limits()
 
 
 @dataclass
@@ -722,13 +843,42 @@ def _generate_repo_map(root_path: Path, max_depth: int = 2, max_nodes: int = 500
     }
 
 
-def _sandbox_worker(connection: Connection, root: str, limits: BudgetLimits) -> None:
+def _normalize_artifact_path(path: str | Path) -> str:
+    raw = str(path).replace("\\", "/")
+    if raw in {"", "."}:
+        return ""
+    if raw.startswith("/"):
+        raise ValueError(f"artifact path escapes artifact root: {path}")
+    parts: list[str] = []
+    for part in raw.split("/"):
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            raise ValueError(f"artifact path escapes artifact root: {path}")
+        parts.append(part)
+    return "/".join(parts)
+
+
+def _sandbox_worker(
+    connection: Connection,
+    root: str,
+    limits: BudgetLimits,
+    artifact_files: dict[str, str] | None = None,
+) -> None:
     root_path = Path(root).resolve()
+    artifact_files = {
+        _normalize_artifact_path(path): content
+        for path, content in (artifact_files or {}).items()
+        if _normalize_artifact_path(path)
+    }
     helper_names = {
         "list_dir",
         "read_text",
         "file_info",
         "search_text",
+        "list_artifacts",
+        "read_artifact",
+        "grep_artifacts",
         "extract_symbols",
         "llm_query",
         "finish",
@@ -911,12 +1061,73 @@ def _sandbox_worker(connection: Connection, root: str, limits: BudgetLimits) -> 
         _file_size_guard(target, "read_json")
         return json.loads(target.read_text(encoding="utf-8"))
 
+    def list_artifacts(path: str = ".") -> list[str]:
+        _dbg("sandbox", f"list_artifacts({path!r})")
+        prefix = _normalize_artifact_path(path)
+        prefix_with_slash = f"{prefix}/" if prefix else ""
+        children: set[str] = set()
+        for artifact_path in artifact_files:
+            if not artifact_path.startswith(prefix_with_slash):
+                continue
+            remainder = artifact_path[len(prefix_with_slash) :]
+            if not remainder:
+                continue
+            children.add(remainder.split("/", 1)[0])
+        return sorted(children)
+
+    def read_artifact(path: str, offset: int = 0, limit: int = 2000) -> str:
+        _dbg("sandbox", f"read_artifact({path!r}, offset={offset}, limit={limit})")
+        artifact_path = _normalize_artifact_path(path)
+        if artifact_path not in artifact_files:
+            raise ValueError(f"artifact not found: {path}")
+        if offset < 0:
+            raise ValueError("read_artifact: offset must be >= 0")
+        if limit < 0:
+            raise ValueError("read_artifact: limit must be >= 0")
+        capped_limit = min(limit, 2000)
+        content = artifact_files[artifact_path]
+        return content[offset : offset + capped_limit]
+
+    def grep_artifacts(pattern: str, max_results: int = 10, context_chars: int = 160) -> list[dict[str, Any]]:
+        _dbg("sandbox", f"grep_artifacts(pattern={pattern!r}, max_results={max_results}, context_chars={context_chars})")
+        if not pattern:
+            raise ValueError("grep_artifacts: pattern must not be empty")
+        max_results = max(0, min(max_results, 50))
+        context_chars = max(0, min(context_chars, 1000))
+        lower_pattern = pattern.lower()
+        results: list[dict[str, Any]] = []
+        for artifact_path in sorted(artifact_files):
+            content = artifact_files[artifact_path]
+            lower_content = content.lower()
+            start = 0
+            while len(results) < max_results:
+                index = lower_content.find(lower_pattern, start)
+                if index < 0:
+                    break
+                excerpt_start = max(0, index - context_chars)
+                excerpt_end = min(len(content), index + len(pattern) + context_chars)
+                results.append(
+                    {
+                        "path": artifact_path,
+                        "offset": index,
+                        "match": content[index : index + len(pattern)],
+                        "excerpt": content[excerpt_start:excerpt_end],
+                    }
+                )
+                start = index + max(1, len(pattern))
+            if len(results) >= max_results:
+                break
+        return results
+
     globals_dict.update(
         {
             "list_dir": list_dir,
             "read_text": read_text,
             "file_info": file_info,
             "search_text": search_text,
+            "list_artifacts": list_artifacts,
+            "read_artifact": read_artifact,
+            "grep_artifacts": grep_artifacts,
             "extract_symbols": extract_symbols_helper,
             "llm_query": llm_query,
             "finish": finish,
@@ -949,10 +1160,11 @@ def _sandbox_worker(connection: Connection, root: str, limits: BudgetLimits) -> 
             or name == "__builtins__"
             or name in helper_names
             or name == "analysis_documents"
-            or name == "file_cards"
             or callable(value)
         ):
             return False
+        if name in {"content", "contents", "manifest", "artifact_manifest", "source_docs_content", "readme", "target_doc"}:
+            return True
         if isinstance(value, str):
             return len(value) > 4000
         if isinstance(value, (list, tuple, set)):
@@ -1031,9 +1243,10 @@ def _sandbox_worker(connection: Connection, root: str, limits: BudgetLimits) -> 
 
 
 class IsolatedREPL:
-    def __init__(self, root: Path, limits: BudgetLimits):
+    def __init__(self, root: Path, limits: BudgetLimits, artifact_files: dict[str, str] | None = None):
         self.root = root.resolve()
         self.limits = limits
+        self.artifact_files = dict(artifact_files or {})
         self._process: multiprocessing.Process | None = None
         self._connection: Connection | None = None
 
@@ -1045,7 +1258,7 @@ class IsolatedREPL:
         parent_conn, child_conn = multiprocessing.Pipe()
         process = multiprocessing.Process(
             target=_sandbox_worker,
-            args=(child_conn, str(self.root), self.limits),
+            args=(child_conn, str(self.root), self.limits, self.artifact_files),
             daemon=True,
         )
         process.start()
@@ -1167,6 +1380,7 @@ class RLMController:
         prompt_builder: PromptBuilder | None = None,
         validator: CodeResponseValidator | None = None,
         child_config: ChildQueryConfig | None = None,
+        artifact_files: dict[str, str] | None = None,
     ):
         self.client = client
         self.root = root.resolve()
@@ -1174,6 +1388,7 @@ class RLMController:
         self.prompt_builder = prompt_builder or PromptBuilder()
         self.validator = validator or CodeResponseValidator()
         self.child_config = child_config or ChildQueryConfig()
+        self.artifact_files = dict(artifact_files or {})
 
     def run(
         self,
@@ -1202,7 +1417,7 @@ class RLMController:
                 final_state=final_state,
             )
 
-        with IsolatedREPL(self.root, self.run_context.limits) as repl:
+        with IsolatedREPL(self.root, self.run_context.limits, artifact_files=self.artifact_files) as repl:
             while True:
                 try:
                     self.run_context.reserve_step()
@@ -1303,6 +1518,13 @@ class RLMController:
         _dbg("ctrl", f"subquery depth={depth} goal={goal[:80]!r}")
         child_run_context = RunContext(
             limits=self._child_limits(),
+            budget_phase=self.run_context.budget_phase,
+            worker_llm_calls=self.run_context.worker_llm_calls,
+            worker_prompt_tokens=self.run_context.worker_prompt_tokens,
+            worker_response_tokens=self.run_context.worker_response_tokens,
+            synthesis_llm_calls=self.run_context.synthesis_llm_calls,
+            synthesis_prompt_tokens=self.run_context.synthesis_prompt_tokens,
+            synthesis_response_tokens=self.run_context.synthesis_response_tokens,
             global_llm_calls=self.run_context.global_llm_calls,
             global_prompt_tokens=self.run_context.global_prompt_tokens,
             global_response_tokens=self.run_context.global_response_tokens,
@@ -1314,6 +1536,7 @@ class RLMController:
             prompt_builder=self.child_config.prompt_builder or self.prompt_builder,
             validator=self.validator,
             child_config=self.child_config,
+            artifact_files=self.artifact_files,
         )
         try:
             child_result = child_controller.run(goal=goal, depth=depth, parent_context=child_context)
