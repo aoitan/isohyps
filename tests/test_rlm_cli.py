@@ -71,7 +71,7 @@ class TestRLMCLI(unittest.TestCase):
         self.assertEqual(payload["status"], "finished")
         self.assertEqual(payload["result"]["strategy"], "divide-and-conquer")
         self.assertEqual(payload["result"]["summary"], "summary-A / summary-B")
-        self.assertEqual(payload["budget"]["llm_calls"], 3)
+        self.assertEqual(payload["budget"]["global_llm_calls"], 3)
 
     def test_main_prints_json(self):
         argv = [
@@ -97,6 +97,22 @@ class TestRLMCLI(unittest.TestCase):
         exit_code = rlm_cli.main([str(self.root), "--backend", "scripted", "--goal", "Return ok."])
 
         self.assertEqual(exit_code, 2)
+
+    def test_parser_defaults_to_expanded_controller_budget(self):
+        args = rlm_cli.build_parser().parse_args(
+            [
+                str(self.root),
+                "--backend",
+                "scripted",
+                "--goal",
+                "Return ok.",
+                "--scripted-response",
+                "finish('ok')",
+            ]
+        )
+
+        self.assertEqual(args.max_steps, 30)
+        self.assertEqual(args.max_total_tokens, 90000)
 
     def test_oversized_goal_stops_before_scripted_llm_call(self):
         args = rlm_cli.build_parser().parse_args(

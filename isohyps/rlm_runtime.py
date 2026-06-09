@@ -11,7 +11,7 @@ import sys
 import time
 import traceback
 from contextlib import redirect_stdout
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -32,10 +32,16 @@ class QueryClient(Protocol):
 
 
 SAFE_BUILTINS = {
+    "AssertionError": AssertionError,
+    "AttributeError": AttributeError,
     "Exception": Exception,
     "False": False,
+    "IndexError": IndexError,
+    "KeyError": KeyError,
+    "NameError": NameError,
     "None": None,
     "RuntimeError": RuntimeError,
+    "StopIteration": StopIteration,
     "True": True,
     "TypeError": TypeError,
     "ValueError": ValueError,
@@ -44,13 +50,23 @@ SAFE_BUILTINS = {
     "any": any,
     "bool": bool,
     "dict": dict,
+    "dir": dir,
     "enumerate": enumerate,
+    "filter": filter,
     "float": float,
+    "getattr": getattr,
+    "globals": globals,
+    "hasattr": hasattr,
+    "id": id,
     "int": int,
+    "isinstance": isinstance,
+    "iter": iter,
     "len": len,
     "list": list,
+    "map": map,
     "max": max,
     "min": min,
+    "next": next,
     "print": print,
     "range": range,
     "repr": repr,
@@ -58,7 +74,10 @@ SAFE_BUILTINS = {
     "sorted": sorted,
     "str": str,
     "sum": sum,
+    "super": super,
     "tuple": tuple,
+    "type": type,
+    "vars": vars,
     "zip": zip,
 }
 
@@ -151,11 +170,41 @@ def _summarize_child_error(error: str | None, limit: int = 200) -> str:
     return _cap_text(detail, limit)
 
 
+def _merge_recorded_documents(result: Any, documents: list[dict[str, str]]) -> Any:
+    if not documents or not isinstance(result, dict):
+        return result
+
+    merged = dict(result)
+    raw_documents = merged.get("documents")
+    existing_documents = raw_documents if isinstance(raw_documents, list) else []
+    documents_by_path: dict[str, dict[str, str]] = {}
+
+    for document in existing_documents:
+        if not isinstance(document, dict):
+            continue
+        path = document.get("path")
+        title = document.get("title")
+        content = document.get("content")
+        if isinstance(path, str) and isinstance(title, str) and isinstance(content, str):
+            documents_by_path[path] = {"path": path, "title": title, "content": content}
+
+    for document in documents:
+        path = document.get("path")
+        title = document.get("title")
+        content = document.get("content")
+        if isinstance(path, str) and isinstance(title, str) and isinstance(content, str):
+            documents_by_path[path] = {"path": path, "title": title, "content": content}
+
+    merged["documents"] = list(documents_by_path.values())
+    return merged
+
+
 @dataclass
 class BudgetLimits:
-    max_steps: int = 8
-    max_depth: int = 2
-    max_total_tokens: int = 30000
+    max_steps: int = 30
+    max_depth: int = 1
+    max_total_tokens: int = 90000
+    max_local_tokens: int = 90000
     step_timeout_seconds: float = 15.0
     llm_timeout_seconds: float = 120.0
     max_stdout_chars: int = 2000
@@ -167,6 +216,7 @@ class BudgetLimits:
 class PartialBudgetLimits:
     max_steps: int | None = None
     max_total_tokens: int | None = None
+    max_local_tokens: int | None = None
 
 
 @dataclass
@@ -182,6 +232,10 @@ class BudgetSnapshot:
     prompt_tokens: int
     response_tokens: int
     total_tokens: int
+    global_llm_calls: int = 0
+    global_prompt_tokens: int = 0
+    global_response_tokens: int = 0
+    global_total_tokens: int = 0
 
 
 class BudgetExceededError(RuntimeError):
@@ -195,6 +249,9 @@ class RunContext:
     llm_calls: int = 0
     prompt_tokens: int = 0
     response_tokens: int = 0
+    global_llm_calls: int = 0
+    global_prompt_tokens: int = 0
+    global_response_tokens: int = 0
 
     def reserve_step(self) -> None:
         if self.steps_used >= self.limits.max_steps:
@@ -208,23 +265,42 @@ class RunContext:
 
     def ensure_prompt_budget(self, prompt: str) -> None:
         prompt_tokens = _approx_tokens(prompt)
-        if self.total_tokens + prompt_tokens > self.limits.max_total_tokens:
+        if self.total_tokens + prompt_tokens > self.limits.max_local_tokens:
+            raise BudgetExceededError(
+                f"max_local_tokens={self.limits.max_local_tokens} would be exceeded by prompt "
+                f"(prompt_tokens={prompt_tokens}, current_local_tokens={self.total_tokens})"
+            )
+        if self.global_total_tokens + prompt_tokens > self.limits.max_total_tokens:
             raise BudgetExceededError(
                 f"max_total_tokens={self.limits.max_total_tokens} would be exceeded by prompt "
-                f"(prompt_tokens={prompt_tokens}, current_total_tokens={self.total_tokens})"
+                f"(prompt_tokens={prompt_tokens}, current_global_tokens={self.global_total_tokens})"
             )
 
     def record_query(self, prompt: str, response: str) -> None:
+        prompt_tokens = _approx_tokens(prompt)
+        response_tokens = _approx_tokens(response)
+        
         self.llm_calls += 1
-        self.prompt_tokens += _approx_tokens(prompt)
-        self.response_tokens += _approx_tokens(response)
-        _dbg("budget", f"llm_call #{self.llm_calls}: total_tokens={self.total_tokens}/{self.limits.max_total_tokens} (prompt_cumul={self.prompt_tokens} resp_cumul={self.response_tokens})")
-        if self.total_tokens > self.limits.max_total_tokens:
+        self.prompt_tokens += prompt_tokens
+        self.response_tokens += response_tokens
+        
+        self.global_llm_calls += 1
+        self.global_prompt_tokens += prompt_tokens
+        self.global_response_tokens += response_tokens
+        
+        _dbg("budget", f"llm_call #{self.llm_calls}: total_tokens={self.total_tokens}/{self.limits.max_local_tokens} (prompt_cumul={self.prompt_tokens} resp_cumul={self.response_tokens})")
+        if self.total_tokens > self.limits.max_local_tokens:
+            raise BudgetExceededError(f"max_local_tokens={self.limits.max_local_tokens} reached")
+        if self.global_total_tokens > self.limits.max_total_tokens:
             raise BudgetExceededError(f"max_total_tokens={self.limits.max_total_tokens} reached")
 
     @property
     def total_tokens(self) -> int:
         return self.prompt_tokens + self.response_tokens
+
+    @property
+    def global_total_tokens(self) -> int:
+        return self.global_prompt_tokens + self.global_response_tokens
 
     def snapshot(self) -> BudgetSnapshot:
         return BudgetSnapshot(
@@ -233,13 +309,17 @@ class RunContext:
             prompt_tokens=self.prompt_tokens,
             response_tokens=self.response_tokens,
             total_tokens=self.total_tokens,
+            global_llm_calls=self.global_llm_calls,
+            global_prompt_tokens=self.global_prompt_tokens,
+            global_response_tokens=self.global_response_tokens,
+            global_total_tokens=self.global_total_tokens,
         )
 
     def accumulate(self, other: BudgetSnapshot) -> None:
-        self.llm_calls += other.llm_calls
-        self.prompt_tokens += other.prompt_tokens
-        self.response_tokens += other.response_tokens
-        if self.total_tokens > self.limits.max_total_tokens:
+        self.global_llm_calls = other.global_llm_calls
+        self.global_prompt_tokens = other.global_prompt_tokens
+        self.global_response_tokens = other.global_response_tokens
+        if self.global_total_tokens > self.limits.max_total_tokens:
             raise BudgetExceededError(f"max_total_tokens={self.limits.max_total_tokens} reached")
 
 
@@ -251,6 +331,7 @@ class ExecutionObservation:
     state: dict[str, str]
     finished: bool
     result: Any
+    partial_documents: list[dict[str, str]] = field(default_factory=list)
 
     def to_prompt(self) -> str:
         state_lines = "\n".join(f"- {name}: {value}" for name, value in sorted(self.state.items()))
@@ -412,6 +493,7 @@ class PromptBuilder:
         "- is_dir(path) -> bool\n"
         "- extract_symbols(path) -> dict(language, symbols, fallback_excerpt, error)\n"
         "- llm_query(prompt, context=None) -> child result value\n"
+        "- record_document(path, title, content) -> persist one completed Markdown source document for partial output\n"
         "- finish(value) -> immediately end the run and return value to the caller.\n"
         "Rules:\n"
         "- Do not import modules.\n"
@@ -605,6 +687,7 @@ def _sandbox_worker(connection: Connection, root: str, limits: BudgetLimits) -> 
         "path_exists",
         "is_dir",
         "read_json",
+        "record_document",
     }
     
     try:
@@ -617,6 +700,7 @@ def _sandbox_worker(connection: Connection, root: str, limits: BudgetLimits) -> 
         "__builtins__": SAFE_BUILTINS,
         "__name__": "__main__",
         "repo_map": repo_map,
+        "analysis_documents": [],
     }
 
     def resolve_path(path: str | Path) -> Path:
@@ -752,6 +836,17 @@ def _sandbox_worker(connection: Connection, root: str, limits: BudgetLimits) -> 
         _dbg("sandbox", f"finish({type(value).__name__}): {repr(value)[:80]!r}")
         raise _FinishSignal(value)
 
+    def record_document(path: str, title: str, content: str) -> dict[str, str]:
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError("record_document: path must be a non-empty string")
+        if not isinstance(title, str):
+            raise ValueError("record_document: title must be a string")
+        if not isinstance(content, str):
+            raise ValueError("record_document: content must be a string")
+        document = {"path": path, "title": title, "content": content}
+        globals_dict["analysis_documents"].append(document)
+        return {"path": path, "title": title, "content_chars": str(len(content))}
+
     def path_exists(path: str) -> bool:
         _dbg("sandbox", f"path_exists({path!r})")
         target = resolve_path(path)
@@ -780,13 +875,29 @@ def _sandbox_worker(connection: Connection, root: str, limits: BudgetLimits) -> 
             "path_exists": path_exists,
             "is_dir": is_dir,
             "read_json": read_json,
+            "record_document": record_document,
         }
     )
+
+    def partial_documents() -> list[dict[str, str]]:
+        documents = globals_dict.get("analysis_documents")
+        if not isinstance(documents, list):
+            return []
+        sanitized_documents: list[dict[str, str]] = []
+        for document in documents:
+            if not isinstance(document, dict):
+                continue
+            path = document.get("path")
+            title = document.get("title")
+            content = document.get("content")
+            if isinstance(path, str) and isinstance(title, str) and isinstance(content, str):
+                sanitized_documents.append({"path": path, "title": title, "content": content})
+        return sanitized_documents
 
     def snapshot_state() -> dict[str, str]:
         state: dict[str, str] = {}
         for name, value in globals_dict.items():
-            if name.startswith("_") or name == "__builtins__" or name in helper_names:
+            if name.startswith("_") or name == "__builtins__" or name in helper_names or name == "analysis_documents":
                 continue
             state[name] = _summarize_value(value, limits.max_state_value_chars)
             if len(state) >= limits.max_state_items:
@@ -830,6 +941,7 @@ def _sandbox_worker(connection: Connection, root: str, limits: BudgetLimits) -> 
                 "state": snapshot_state(),
                 "finished": finished,
                 "result": result,
+                "partial_documents": partial_documents(),
             }
         )
 
@@ -910,12 +1022,14 @@ class IsolatedREPL:
                     state=message["state"],
                     finished=message["finished"],
                     result=message["result"],
+                    partial_documents=message.get("partial_documents") or [],
                 )
                 _dbg("repl", f"result kind={obs.kind} finished={obs.finished} stdout={len(obs.stdout)}chars state_keys={list(obs.state.keys())[:5]}")
                 if obs.error:
                     _dbg("repl", f"result error: {obs.error[:120]!r}")
                 if obs.finished and finish_validator is not None:
                     normalized_result = finish_normalizer(obs.result) if finish_normalizer is not None else obs.result
+                    normalized_result = _merge_recorded_documents(normalized_result, obs.partial_documents)
                     validation_errors = finish_validator(normalized_result)
                     if validation_errors:
                         if finish_error_formatter is not None:
@@ -930,8 +1044,11 @@ class IsolatedREPL:
                             state=obs.state,
                             finished=False,
                             result=None,
+                            partial_documents=obs.partial_documents,
                         )
                     obs.result = normalized_result
+                elif obs.finished:
+                    obs.result = _merge_recorded_documents(obs.result, obs.partial_documents)
                 return obs
 
     def close(self) -> None:
@@ -1007,9 +1124,10 @@ class RLMController:
                     self.run_context.reserve_step()
                 except BudgetExceededError as exc:
                     _dbg("ctrl", f"step budget exceeded: {exc}")
+                    partial_documents = self._collect_partial_documents(steps)
                     return ControllerResult(
                         status="budget_exceeded",
-                        result=None,
+                        result=self._partial_analysis_result(partial_documents),
                         steps=steps,
                         error=str(exc),
                         budget=self.run_context.snapshot(),
@@ -1039,9 +1157,10 @@ class RLMController:
                     observation = ExecutionObservation.issue("model_error", str(exc))
                     steps.append(observation)
                     final_state = observation.state or final_state
+                    partial_documents = self._collect_partial_documents(steps)
                     return ControllerResult(
                         status="budget_exceeded",
-                        result=None,
+                        result=self._partial_analysis_result(partial_documents),
                         steps=steps,
                         error=str(exc),
                         budget=self.run_context.snapshot(),
@@ -1092,11 +1211,18 @@ class RLMController:
             child_limits.max_steps = overrides.max_steps
         if overrides.max_total_tokens is not None:
             child_limits.max_total_tokens = overrides.max_total_tokens
+        if overrides.max_local_tokens is not None:
+            child_limits.max_local_tokens = overrides.max_local_tokens
         return child_limits
 
     def _run_subquery(self, goal: str, child_context: Any, depth: int) -> Any:
         _dbg("ctrl", f"subquery depth={depth} goal={goal[:80]!r}")
-        child_run_context = RunContext(limits=self._child_limits())
+        child_run_context = RunContext(
+            limits=self._child_limits(),
+            global_llm_calls=self.run_context.global_llm_calls,
+            global_prompt_tokens=self.run_context.global_prompt_tokens,
+            global_response_tokens=self.run_context.global_response_tokens,
+        )
         child_controller = type(self)(
             client=self.client,
             root=self.root,
@@ -1122,3 +1248,22 @@ class RLMController:
                 f"Child query failed ({child_result.status}): {_summarize_child_error(child_result.error)}"
             )
         return child_result.result
+
+    def _collect_partial_documents(self, steps: list[ExecutionObservation]) -> list[dict[str, str]]:
+        documents_by_path: dict[str, dict[str, str]] = {}
+        for step in steps:
+            for document in step.partial_documents:
+                path = document.get("path")
+                title = document.get("title")
+                content = document.get("content")
+                if isinstance(path, str) and isinstance(title, str) and isinstance(content, str):
+                    documents_by_path[path] = {"path": path, "title": title, "content": content}
+        return list(documents_by_path.values())
+
+    def _partial_analysis_result(self, documents: list[dict[str, str]]) -> dict[str, Any] | None:
+        if not documents:
+            return None
+        return {
+            "summary": "Partial project analysis assembled from documents recorded before the controller stopped.",
+            "documents": documents,
+        }

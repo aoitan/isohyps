@@ -182,7 +182,8 @@ class TestRLMRuntime(unittest.TestCase):
     def test_budget_limits_defaults_match_controller_runtime_defaults(self):
         limits = BudgetLimits()
 
-        self.assertEqual(limits.max_total_tokens, 30000)
+        self.assertEqual(limits.max_steps, 30)
+        self.assertEqual(limits.max_total_tokens, 90000)
         self.assertEqual(limits.step_timeout_seconds, 15.0)
 
     def test_controller_retries_after_invalid_finish_callback(self):
@@ -203,6 +204,59 @@ class TestRLMRuntime(unittest.TestCase):
         self.assertEqual(result.result, "fixed")
         self.assertIn("Invalid finish result: Expected string result.", client.prompts[1])
 
+    def test_budget_exceeded_preserves_documents_after_invalid_finish(self):
+        def validate_string(value):
+            return [] if isinstance(value, str) else ["Expected string result."]
+
+        controller, _ = self._controller(
+            [
+                "record_document('src/app.py.md', 'App', 'Recorded source analysis before invalid finish.')\n"
+                "finish({'not': 'string'})",
+            ],
+            max_steps=1,
+        )
+
+        result = controller.run("Record a source document before invalid finish.", finish_validator=validate_string)
+
+        self.assertEqual(result.status, "budget_exceeded")
+        self.assertEqual(
+            result.result,
+            {
+                "summary": "Partial project analysis assembled from documents recorded before the controller stopped.",
+                "documents": [
+                    {
+                        "path": "src/app.py.md",
+                        "title": "App",
+                        "content": "Recorded source analysis before invalid finish.",
+                    }
+                ],
+            },
+        )
+
+    def test_finished_result_attaches_recorded_documents(self):
+        controller, _ = self._controller(
+            [
+                "record_document('src/app.py.md', 'App', 'Recorded source analysis before summary-only finish.')\n"
+                "finish({'summary': 'Finished after recording source documents without repeating them.'})",
+            ],
+            max_steps=1,
+        )
+
+        result = controller.run("Record a source document and finish with summary only.")
+
+        self.assertEqual(result.status, "finished")
+        self.assertEqual(
+            result.result["documents"],
+            [
+                {
+                    "path": "src/app.py.md",
+                    "title": "App",
+                    "content": "Recorded source analysis before summary-only finish.",
+                }
+            ],
+        )
+        self.assertNotIn("analysis_documents", result.final_state)
+
     def test_finish_stops_following_side_effects(self):
         with IsolatedREPL(self.root, BudgetLimits()) as repl:
             observation = repl.execute("finish('done')\nvalue = 1\nprint('after')", lambda prompt, context: None)
@@ -221,6 +275,26 @@ class TestRLMRuntime(unittest.TestCase):
 
         self.assertTrue(observation.finished)
         self.assertEqual(observation.result, "ran-main")
+
+    def test_repl_exposes_common_inspection_builtins_and_exceptions(self):
+        with IsolatedREPL(self.root, BudgetLimits()) as repl:
+            observation = repl.execute(
+                "try:\n"
+                "    missing_name\n"
+                "except NameError as exc:\n"
+                "    caught = type(exc).__name__\n"
+                "state = globals()\n"
+                "names = dir()\n"
+                "items = list(map(str, filter(lambda item: isinstance(item, str), ['src', 1])))\n"
+                "finish({'caught': caught, 'has_state': isinstance(state, dict), 'has_names': 'state' in names, 'items': items})",
+                lambda prompt, context: None,
+            )
+
+        self.assertTrue(observation.finished)
+        self.assertEqual(
+            observation.result,
+            {"caught": "NameError", "has_state": True, "has_names": True, "items": ["src"]},
+        )
 
     def test_repl_blocks_root_escape(self):
         with IsolatedREPL(self.root, BudgetLimits()) as repl:
@@ -328,7 +402,7 @@ class TestRLMRuntime(unittest.TestCase):
         self.assertEqual(result.result["strategy"], "divide-and-conquer")
         self.assertEqual(result.result["summary"], "summary-A / summary-B")
         self.assertEqual(len(client.prompts), 3)
-        self.assertEqual(result.budget.llm_calls, 3)
+        self.assertEqual(result.budget.global_llm_calls, 3)
         self.assertGreater(len(client.prompts[0]), 10000)
         self.assertIn("Parent context: dict {'chunk_id': 'A', 'text': str(len=5000)", client.prompts[1])
         self.assertIn("Parent context: dict {'chunk_id': 'B', 'text': str(len=5000)", client.prompts[2])
@@ -359,8 +433,8 @@ class TestRLMRuntime(unittest.TestCase):
         child_value = controller._run_subquery("Summarize src/app.py", {"path": "src/app.py"}, depth=1)
 
         self.assertEqual(child_value, "child-summary")
-        self.assertEqual(controller.run_context.llm_calls, 1)
-        self.assertGreater(controller.run_context.total_tokens, 0)
+        self.assertEqual(controller.run_context.global_llm_calls, 1)
+        self.assertGreater(controller.run_context.global_total_tokens, 0)
 
     def test_llm_query_child_tokens_can_trip_parent_budget(self):
         controller, _ = self._controller(
@@ -372,8 +446,8 @@ class TestRLMRuntime(unittest.TestCase):
         with self.assertRaises(BudgetExceededError):
             controller._run_subquery("Summarize src/app.py", None, depth=1)
 
-        self.assertEqual(controller.run_context.llm_calls, 1)
-        self.assertGreater(controller.run_context.total_tokens, controller.run_context.limits.max_total_tokens)
+        self.assertEqual(controller.run_context.global_llm_calls, 1)
+        self.assertGreater(controller.run_context.global_total_tokens, controller.run_context.limits.max_total_tokens)
 
     def test_llm_query_can_override_child_prompt_builder(self):
         child_prompt_builder = TaggedPromptBuilder("CHILD-PROMPT")
@@ -404,6 +478,10 @@ class TestRLMRuntime(unittest.TestCase):
                 prompt_tokens=0,
                 response_tokens=0,
                 total_tokens=0,
+                global_llm_calls=0,
+                global_prompt_tokens=0,
+                global_response_tokens=0,
+                global_total_tokens=0,
             ),
             final_state={},
         )
@@ -681,6 +759,40 @@ class TestRLMRuntime(unittest.TestCase):
         self.assertEqual(_sanitize_md_table_cell("line1\nline2"), "line1 line2")
         self.assertEqual(_sanitize_md_table_cell("ok"), "ok")
         self.assertEqual(_sanitize_md_table_cell("ends\\"), "ends\\\\")
+
+    def test_default_max_depth_is_1(self):
+        limits = BudgetLimits()
+        self.assertEqual(limits.max_depth, 1)
+
+    def test_parent_local_budget_separated_from_global(self):
+        controller, client = self._controller(
+            [
+                "child = llm_query('child_query')\nfinish('parent-done')",
+                "finish('child-done')",
+            ],
+            max_steps=4,
+            max_depth=2,
+        )
+        result = controller.run("Goal")
+        self.assertEqual(result.status, "finished")
+        
+        self.assertEqual(result.budget.llm_calls, 1)
+        self.assertEqual(result.budget.global_llm_calls, 2)
+        
+        self.assertGreater(result.budget.global_total_tokens, result.budget.total_tokens)
+        self.assertEqual(result.budget.total_tokens, result.budget.prompt_tokens + result.budget.response_tokens)
+
+    def test_local_budget_exceeded_raises_error(self):
+        controller, _ = self._controller(
+            [
+                "x = 1"
+            ],
+            max_steps=5,
+            max_local_tokens=10,
+        )
+        result = controller.run("Goal")
+        self.assertEqual(result.status, "budget_exceeded")
+        self.assertIn("max_local_tokens", result.error)
 
 
 if __name__ == "__main__":

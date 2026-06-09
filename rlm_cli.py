@@ -97,6 +97,10 @@ def result_to_dict(result: ControllerResult) -> dict[str, Any]:
             "prompt_tokens": result.budget.prompt_tokens,
             "response_tokens": result.budget.response_tokens,
             "total_tokens": result.budget.total_tokens,
+            "global_llm_calls": result.budget.global_llm_calls,
+            "global_prompt_tokens": result.budget.global_prompt_tokens,
+            "global_response_tokens": result.budget.global_response_tokens,
+            "global_total_tokens": result.budget.global_total_tokens,
         },
         "final_state": result.final_state,
         "steps": [
@@ -156,9 +160,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Scripted Python-code response for --backend scripted; repeat for multiple controller/child calls",
     )
 
-    parser.add_argument("--max-steps", type=int, default=8, help="Max controller steps")
-    parser.add_argument("--depth", type=int, default=2, help="Max child-query depth")
-    parser.add_argument("--max-total-tokens", type=int, default=30000, help="Approximate shared token budget")
+    parser.add_argument("--max-steps", type=int, default=30, help="Max controller steps")
+    parser.add_argument("--depth", type=int, default=1, help="Max child-query depth")
+    parser.add_argument("--max-total-tokens", type=int, default=90000, help="Approximate shared token budget")
+    parser.add_argument("--max-local-tokens", type=int, default=90000, help="Approximate local token budget")
     parser.add_argument("--step-timeout", type=float, default=15.0, help="Per-step sandbox timeout in seconds")
     parser.add_argument("--llm-timeout", type=float, default=120.0, help="Per-query model timeout in seconds")
     parser.add_argument("--max-stdout-chars", type=int, default=2000, help="Max captured stdout per step")
@@ -166,6 +171,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-state-value-chars", type=int, default=160, help="Max chars per state value summary")
     parser.add_argument("--child-max-steps", type=int, help="Override child-query max steps")
     parser.add_argument("--child-max-total-tokens", type=int, help="Override child-query token budget")
+    parser.add_argument("--child-max-local-tokens", type=int, help="Override child-query local token budget")
 
     parser.add_argument("--compact", action="store_true", help="Print compact JSON")
     parser.add_argument("--fail-on-nonfinished", action="store_true", help="Exit nonzero unless status is finished")
@@ -179,6 +185,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         max_steps=args.max_steps,
         max_depth=args.depth,
         max_total_tokens=args.max_total_tokens,
+        max_local_tokens=args.max_local_tokens,
         step_timeout_seconds=args.step_timeout,
         llm_timeout_seconds=args.llm_timeout,
         max_stdout_chars=args.max_stdout_chars,
@@ -187,10 +194,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
 
     child_limits = None
-    if args.child_max_steps is not None or args.child_max_total_tokens is not None:
+    if (
+        args.child_max_steps is not None
+        or args.child_max_total_tokens is not None
+        or args.child_max_local_tokens is not None
+    ):
         child_limits = PartialBudgetLimits(
             max_steps=args.child_max_steps,
             max_total_tokens=args.child_max_total_tokens,
+            max_local_tokens=args.child_max_local_tokens,
         )
 
     controller = RLMController(
