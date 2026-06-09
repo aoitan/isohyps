@@ -338,6 +338,7 @@ class TestRLMRuntime(unittest.TestCase):
                 "'root': list_artifacts('.'), "
                 "'source_docs': list_artifacts('source-docs/src'), "
                 "'manifest': read_artifact('manifest.json'), "
+                "'manifest_path': read_artifact_json('manifest.json')['documents'][0]['artifact_path'], "
                 "'hits': grep_artifacts('Responsibility')"
                 "})",
                 lambda prompt, context: None,
@@ -347,6 +348,7 @@ class TestRLMRuntime(unittest.TestCase):
         self.assertEqual(observation.result["root"], ["manifest.json", "source-docs"])
         self.assertEqual(observation.result["source_docs"], ["app.py.md"])
         self.assertIn("source-docs/src/app.py.md", observation.result["manifest"])
+        self.assertEqual(observation.result["manifest_path"], "source-docs/src/app.py.md")
         self.assertEqual(observation.result["hits"][0]["path"], "source-docs/src/app.py.md")
 
     def test_controller_can_synthesize_from_artifacts_without_storing_contents_in_state(self):
@@ -357,9 +359,9 @@ class TestRLMRuntime(unittest.TestCase):
         controller, _ = self._controller(
             [
                 "roots = list_artifacts('.')\n"
-                "manifest = read_artifact('manifest.json')\n"
+                "manifest = read_artifact_json('manifest.json')\n"
                 "hit = grep_artifacts('Responsibility')[0]\n"
-                "finish({'summary': 'Synthesized from artifact ' + hit['path'], 'roots': roots, 'manifest_seen': 'source-docs/src/app.py.md' in manifest})"
+                "finish({'summary': 'Synthesized from artifact ' + hit['path'], 'roots': roots, 'manifest_seen': manifest['documents'][0]['artifact_path'] == 'source-docs/src/app.py.md'})"
             ],
             artifact_files=artifact_files,
         )

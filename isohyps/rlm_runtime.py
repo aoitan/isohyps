@@ -878,6 +878,7 @@ def _sandbox_worker(
         "search_text",
         "list_artifacts",
         "read_artifact",
+        "read_artifact_json",
         "grep_artifacts",
         "extract_symbols",
         "llm_query",
@@ -1088,6 +1089,13 @@ def _sandbox_worker(
         content = artifact_files[artifact_path]
         return content[offset : offset + capped_limit]
 
+    def read_artifact_json(path: str) -> Any:
+        _dbg("sandbox", f"read_artifact_json({path!r})")
+        artifact_path = _normalize_artifact_path(path)
+        if artifact_path not in artifact_files:
+            raise ValueError(f"artifact not found: {path}")
+        return json.loads(artifact_files[artifact_path])
+
     def grep_artifacts(pattern: str, max_results: int = 10, context_chars: int = 160) -> list[dict[str, Any]]:
         _dbg("sandbox", f"grep_artifacts(pattern={pattern!r}, max_results={max_results}, context_chars={context_chars})")
         if not pattern:
@@ -1127,6 +1135,7 @@ def _sandbox_worker(
             "search_text": search_text,
             "list_artifacts": list_artifacts,
             "read_artifact": read_artifact,
+            "read_artifact_json": read_artifact_json,
             "grep_artifacts": grep_artifacts,
             "extract_symbols": extract_symbols_helper,
             "llm_query": llm_query,
