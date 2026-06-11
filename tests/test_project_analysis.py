@@ -63,12 +63,28 @@ class TestProjectAnalysisContract(unittest.TestCase):
         errors = validate_project_analysis_finish(
             {
                 "summary": "Initial exploration of the root directory completed.",
-                "documents": [],
+                "documents": [{"path": "a.md", "title": "A", "content": "Too short"}],
             }
         )
 
         self.assertTrue(any("initial/root-only exploration" in error for error in errors))
-        self.assertTrue(any("at least one analysis document" in error for error in errors))
+        self.assertTrue(any("substantive 'content'" in error for error in errors))
+
+    def test_validate_project_analysis_finish_accepts_omitted_documents(self):
+        errors_none = validate_project_analysis_finish(
+            {
+                "summary": self._summary_with_required_sections(),
+            }
+        )
+        self.assertEqual(errors_none, [])
+
+        errors_empty = validate_project_analysis_finish(
+            {
+                "summary": self._summary_with_required_sections(),
+                "documents": [],
+            }
+        )
+        self.assertEqual(errors_empty, [])
 
     def test_validate_project_analysis_finish_accepts_substantive_documents(self):
         errors = validate_project_analysis_finish(
@@ -161,6 +177,29 @@ class TestProjectAnalysisContract(unittest.TestCase):
         self.assertIn("'title': str", prompt)
         self.assertIn("'content': str", prompt)
 
+    def test_project_analysis_prompt_builder_build_includes_system_prompt_rules(self):
+        builder = ProjectAnalysisPromptBuilder(phase=1)
+        prompt = builder.build(
+            goal="Test goal",
+            step=1,
+            max_steps=3,
+            previous="Previous observations",
+            parent_context=None
+        )
+        self.assertIn("globals` and `locals` are functions, not dict variables", prompt)
+        self.assertIn("artifact_roots = list_artifacts('.')", prompt)
+
+    def test_project_analysis_prompt_builder_build_with_parent_context_does_not_raise(self):
+        builder = ProjectAnalysisPromptBuilder(phase=1)
+        prompt = builder.build(
+            goal="Test goal",
+            step=1,
+            max_steps=3,
+            previous="Previous observations",
+            parent_context="Some parent context"
+        )
+        self.assertIn("Parent context:", prompt)
+
     def test_default_goal_keeps_file_card_state_compact(self):
         goal = DEFAULT_GOAL_TEMPLATE_PHASE1
         self.assertIn("Phase 1: Survey the project rooted at", goal)
@@ -200,6 +239,11 @@ class TestProjectAnalysisContract(unittest.TestCase):
         self.assertIn("even when their repo_map node category is `unknown`", prompt)
         self.assertIn("When artifact_documents or source_doc_snippets contain concrete paths", prompt)
         self.assertIn("Do not say concrete file paths are unavailable", prompt)
+        self.assertIn("check that summary contains each required heading exactly once", prompt)
+        self.assertIn("Invalid controller-code examples", prompt)
+        self.assertIn("import os", prompt)
+        self.assertIn("from pathlib import Path", prompt)
+        self.assertIn("Initial Survey Complete.", prompt)
         self.assertIn("## Major directories", prompt)
         self.assertIn("## Important files", prompt)
         self.assertIn("## Relationships", prompt)
@@ -239,6 +283,9 @@ class TestProjectAnalysisContract(unittest.TestCase):
         self.assertIn("'source_doc_snippets': source_doc_snippets", prompt)
         self.assertIn("'important_file_details': details", prompt)
         self.assertIn("Worker-generated source documents are attached outside controller state.", prompt)
+        self.assertIn("required_headings = ['## Major directories', '## Important files', '## Relationships', '## Uncertainties']", prompt)
+        self.assertIn("summary.count(heading) != 1", prompt)
+        self.assertIn("build a replacement Markdown string", prompt)
         self.assertIn("## Relationships", prompt)
         self.assertIn("## Uncertainties", prompt)
         self.assertIn("finish({'summary': summary})", prompt)

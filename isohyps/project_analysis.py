@@ -16,6 +16,7 @@ from isohyps.rlm_runtime import (
     RLMController,
     RunContext,
     _sanitize_md_table_cell,
+    _summarize_parent_context,
     _summarize_value,
 )
 
@@ -173,20 +174,21 @@ def validate_project_analysis_finish(value: Any, source_files: list[str] | None 
             break
 
     documents = value.get("documents")
-    if not isinstance(documents, list) or not documents:
-        errors.append("Expected 'documents' to contain at least one analysis document.")
-        return errors
-
-    has_substantive_document = False
-    for document in documents:
-        if not isinstance(document, dict):
-            continue
-        content = document.get("content")
-        if isinstance(content, str) and len(content.strip()) >= 40:
-            has_substantive_document = True
-            break
-    if not has_substantive_document:
-        errors.append("Expected at least one document with substantive 'content'.")
+    if documents is not None:
+        if not isinstance(documents, list):
+            errors.append(f"Expected 'documents' to be list, got {type(documents).__name__}.")
+            return errors
+        if documents:
+            has_substantive_document = False
+            for document in documents:
+                if not isinstance(document, dict):
+                    continue
+                content = document.get("content")
+                if isinstance(content, str) and len(content.strip()) >= 40:
+                    has_substantive_document = True
+                    break
+            if not has_substantive_document:
+                errors.append("Expected at least one document with substantive 'content'.")
 
     return errors
 
@@ -268,6 +270,12 @@ class ProjectAnalysisPromptBuilder(PromptBuilder):
         "- Include project-specific top-level source directories from `repo_map['source_worklist']` in `observed_dirs`, even when their repo_map node category is `unknown`, so project packages are not replaced by artifact metadata directories.\n"
         "- When artifact_documents or source_doc_snippets contain concrete paths, the `## Important files` section MUST name those observed paths and their roles. Do not say concrete file paths are unavailable when the manifest or snippets list them.\n"
         "- The final summary MUST include these Markdown sections: `## Major directories`, `## Important files`, `## Relationships`, and `## Uncertainties`.\n"
+        "- Before calling finish(), check that summary contains each required heading exactly once. If any heading is missing, build a replacement Markdown string with all required headings instead of finishing invalid output.\n"
+        "Invalid controller-code examples:\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "finish({'summary': 'Initial Survey Complete.'})\n"
+        "finish('## Major directories\\n\\n- Only a bare string result.')\n"
         "Valid controller-code example:\n"
         "artifact_roots = list_artifacts('.')\n"
         "artifact_manifest = read_artifact_json('manifest.json')\n"
@@ -317,6 +325,9 @@ class ProjectAnalysisPromptBuilder(PromptBuilder):
         "        'coverage_note': 'Worker-generated source documents are attached outside controller state.',\n"
         "    },\n"
         ")\n"
+        "required_headings = ['## Major directories', '## Important files', '## Relationships', '## Uncertainties']\n"
+        "if not isinstance(summary, str) or any(summary.count(heading) != 1 for heading in required_headings):\n"
+        "    summary = '## Major directories\\n\\n- Describe observed source directories.\\n\\n## Important files\\n\\n- Describe selected important source files.\\n\\n## Relationships\\n\\n- Describe observed dependencies and interactions.\\n\\n## Uncertainties\\n\\n- List concrete unknowns or evidence gaps.'\n"
         "finish({'summary': summary})\n"
         "Do not write `import`, `from ... import ...`, or finish(None). Do not finish with a bare string.\n"
         "- When you are done, call finish(value).\n"
@@ -338,56 +349,23 @@ class ProjectAnalysisPromptBuilder(PromptBuilder):
         )
 
     def _get_system_prompt(self) -> str:
-        common_header = (
-            "You are operating a Recursive Language Model runtime for project analysis.\n"
-            "Return only Python code and no prose.\n"
-            "State persists across steps inside a Python sandbox.\n"
-            "Use helpers instead of imports or direct OS access.\n"
-            "Available helpers:\n"
-            "- list_dir(path='.') -> list[str]\n"
-            "- read_text(path, offset=0, limit=2000) -> str\n"
-            "- file_info(path) -> dict(path, exists, is_file, is_dir, size_bytes, line_count, char_count, approx_tokens, language, binary)\n"
-            "- search_text(path, pattern, max_results=10, context_chars=160) -> list[dict(offset, line, match, excerpt)]\n"
-            "- list_artifacts(path='.') -> list[str]\n"
-            "- read_artifact(path, offset=0, limit=2000) -> str\n"
-            "- read_artifact_json(path) -> parsed artifact json value\n"
-            "- grep_artifacts(pattern, max_results=10, context_chars=160) -> list[dict(path, offset, match, excerpt)]\n"
-            "- read_json(path) -> parsed json value\n"
-            "- path_exists(path) -> bool\n"
-            "- is_dir(path) -> bool\n"
-            "- extract_symbols(path) -> dict(language, symbols, fallback_excerpt, error)\n"
-            "- llm_query(prompt, context=None) -> child result value\n"
-            "- record_document(path, title, content) -> persist one completed Markdown source document for partial output\n"
-            "- finish(value) -> immediately end the run. For top-level project analysis, the value MUST be a dict matching:\n"
-            f"{ANALYSIS_RESULT_SCHEMA_TEXT}"
-            "Rules:\n"
-            "- Do not import modules.\n"
-            "- Do not attempt network, subprocess, or filesystem mutation.\n"
-            "- Do not assign to helper names such as list_dir, read_text, file_info, search_text, list_artifacts, read_artifact, read_artifact_json, grep_artifacts, read_json, path_exists, is_dir, extract_symbols, llm_query, or finish.\n"
-            "- `globals` and `locals` are functions, not dict variables. Do not write globals[...] or locals[...]; call globals() or locals() before membership checks or subscripting, such as globals()['name'].\n"
-            "- All helper paths are relative to the analysis root. Use '.' for the root; do not prefix paths with the root directory name.\n"
-            "- Prefer helper calls over large string constants.\n"
-            "- A global variable `repo_map` is available in your environment. It is a partial map (up to depth 2, capped at 500 nodes) and includes `repo_map['source_worklist']`, the source files that need explanations. Use it as a starting point to understand the project structure, but always use helpers (like list_dir) to confirm details or explore deeper paths.\n"
-        )
         if self.phase == 1:
-            return common_header + (
-                "Minimum exploration before finish:\n"
-                "- Do not finish after only inspecting the root directory or README.\n"
-                "- Inspect repo_map first, then confirm important areas with helpers.\n"
+            return self.SYSTEM_PROMPT + (
+                "\nPhase 1 Specific Guidelines:\n"
                 "- Focus on drafting the high-level architecture overview. Outline the system overall layout, major directories, and general purpose.\n"
                 "- Do not loop over source files to write detailed descriptions yet.\n"
                 "- The final value MUST include a 'summary' containing: ## Major directories (and optionally ## Uncertainties).\n"
             )
         elif self.phase == 2:
-            return common_header + (
-                "Minimum exploration before finish:\n"
+            return self.SYSTEM_PROMPT + (
+                "\nPhase 2 Specific Guidelines:\n"
                 "- Focus on analyzing component relationships, interactions, and dependency graphs.\n"
                 "- Read relationships.json and check import statements to understand data flow.\n"
                 "- The final value MUST include a 'summary' containing a Mermaid diagram (```mermaid) showing the component interactions, and detailed text explanations under the section '## Relationships'.\n"
             )
         else:
-            return common_header + (
-                "Minimum exploration before finish:\n"
+            return self.SYSTEM_PROMPT + (
+                "\nPhase 3 Specific Guidelines:\n"
                 "- Focus on synthesizing the final report by merging Phase 1 and Phase 2 summaries and resolving uncertainties.\n"
                 "- Ensure the output follows the final report format.\n"
                 "- The final summary MUST include exactly these Markdown sections: ## Major directories, ## Important files, ## Relationships (containing the Mermaid diagram), and ## Uncertainties.\n"
