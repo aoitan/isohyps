@@ -99,6 +99,7 @@ class TestRLMRuntime(unittest.TestCase):
         prompt_builder = limits_kwargs.pop("prompt_builder", None)
         validator = limits_kwargs.pop("validator", None)
         child_config = limits_kwargs.pop("child_config", None)
+        artifact_files = limits_kwargs.pop("artifact_files", None)
         limits = BudgetLimits(max_steps=limits_kwargs.pop("max_steps", 4), max_depth=limits_kwargs.pop("max_depth", 2), **limits_kwargs)
         controller = RLMController(
             client=client,
@@ -107,6 +108,7 @@ class TestRLMRuntime(unittest.TestCase):
             prompt_builder=prompt_builder,
             validator=validator,
             child_config=child_config,
+            artifact_files=artifact_files,
         )
         return controller, client
 
@@ -284,41 +286,106 @@ class TestRLMRuntime(unittest.TestCase):
                 "except NameError as exc:\n"
                 "    caught = type(exc).__name__\n"
                 "state = globals()\n"
+                "local_state = locals()\n"
                 "names = dir()\n"
                 "items = list(map(str, filter(lambda item: isinstance(item, str), ['src', 1])))\n"
-                "finish({'caught': caught, 'has_state': isinstance(state, dict), 'has_names': 'state' in names, 'items': items})",
+                "finish({'caught': caught, 'has_state': isinstance(state, dict), 'has_local_state': isinstance(local_state, dict), 'has_names': 'state' in names, 'items': items})",
                 lambda prompt, context: None,
             )
 
         self.assertTrue(observation.finished)
         self.assertEqual(
             observation.result,
-            {"caught": "NameError", "has_state": True, "has_names": True, "items": ["src"]},
+            {"caught": "NameError", "has_state": True, "has_local_state": True, "has_names": True, "items": ["src"]},
         )
 
-    def test_repl_keeps_file_cards_while_pruning_large_transient_globals(self):
+    def test_repl_exposes_parent_context_without_snapshotting_it(self):
+        parent_context = {"path": "src/app.py", "content": "parent details"}
+
+        with IsolatedREPL(self.root, BudgetLimits(), parent_context=parent_context) as repl:
+            observation = repl.execute(
+                "finish({'path': parent['path'], 'same': parent_context is parent})",
+                lambda prompt, context: None,
+            )
+
+        self.assertTrue(observation.finished)
+        self.assertEqual(observation.result, {"path": "src/app.py", "same": True})
+        self.assertNotIn("parent", observation.state)
+        self.assertNotIn("parent_context", observation.state)
+
+    def test_repl_prunes_large_file_cards_and_keeps_small_worklist_state(self):
         with IsolatedREPL(self.root, BudgetLimits()) as repl:
             observation = repl.execute(
                 "file_cards = [{'path': str(index), 'info': {'line_count': index}} for index in range(50)]\n"
                 "pending = [str(index) for index in range(50)]\n"
+                "content = read_text('src/app.py')\n"
+                "contents = [{'path': 'src/app.py', 'content': content}]\n"
                 "target_doc = 'x' * 5000\n"
                 "keep = 'small-state'",
                 lambda prompt, context: None,
             )
             followup = repl.execute(
-                "finish({'has_file_cards': 'file_cards' in globals(), 'has_target_doc': 'target_doc' in globals(), 'pending_len': len(pending), 'keep': keep})",
+                "finish({'has_file_cards': 'file_cards' in globals(), 'has_content': 'content' in globals(), 'has_contents': 'contents' in globals(), 'has_target_doc': 'target_doc' in globals(), 'pending_len': len(pending), 'keep': keep})",
                 lambda prompt, context: None,
             )
 
         self.assertEqual(observation.kind, "ok")
-        self.assertIn("file_cards", observation.state)
+        self.assertNotIn("file_cards", observation.state)
+        self.assertNotIn("content", observation.state)
+        self.assertNotIn("contents", observation.state)
         self.assertNotIn("target_doc", observation.state)
         self.assertIn("pending", observation.state)
         self.assertTrue(followup.finished)
         self.assertEqual(
             followup.result,
-            {"has_file_cards": True, "has_target_doc": False, "pending_len": 50, "keep": "small-state"},
+            {"has_file_cards": False, "has_content": False, "has_contents": False, "has_target_doc": False, "pending_len": 50, "keep": "small-state"},
         )
+
+    def test_repl_exposes_read_only_artifact_helpers(self):
+        artifact_files = {
+            "manifest.json": '{"documents": [{"artifact_path": "source-docs/src/app.py.md"}]}',
+            "source-docs/src/app.py.md": "# App\n\n## Responsibility\n\nExplains the source file.",
+        }
+
+        with IsolatedREPL(self.root, BudgetLimits(), artifact_files=artifact_files) as repl:
+            observation = repl.execute(
+                "finish({"
+                "'root': list_artifacts('.'), "
+                "'source_docs': list_artifacts('source-docs/src'), "
+                "'manifest': read_artifact('manifest.json'), "
+                "'manifest_path': read_artifact_json('manifest.json')['documents'][0]['artifact_path'], "
+                "'hits': grep_artifacts('Responsibility')"
+                "})",
+                lambda prompt, context: None,
+            )
+
+        self.assertTrue(observation.finished)
+        self.assertEqual(observation.result["root"], ["manifest.json", "source-docs"])
+        self.assertEqual(observation.result["source_docs"], ["app.py.md"])
+        self.assertIn("source-docs/src/app.py.md", observation.result["manifest"])
+        self.assertEqual(observation.result["manifest_path"], "source-docs/src/app.py.md")
+        self.assertEqual(observation.result["hits"][0]["path"], "source-docs/src/app.py.md")
+
+    def test_controller_can_synthesize_from_artifacts_without_storing_contents_in_state(self):
+        artifact_files = {
+            "manifest.json": '{"documents": [{"artifact_path": "source-docs/src/app.py.md"}]}',
+            "source-docs/src/app.py.md": "# App\n\n## Responsibility\n\nExplains the source file.",
+        }
+        controller, _ = self._controller(
+            [
+                "roots = list_artifacts('.')\n"
+                "manifest = read_artifact_json('manifest.json')\n"
+                "hit = grep_artifacts('Responsibility')[0]\n"
+                "finish({'summary': 'Synthesized from artifact ' + hit['path'], 'roots': roots, 'manifest_seen': manifest['documents'][0]['artifact_path'] == 'source-docs/src/app.py.md'})"
+            ],
+            artifact_files=artifact_files,
+        )
+
+        result = controller.run("inspect artifacts")
+
+        self.assertEqual(result.status, "finished")
+        self.assertEqual(result.result["summary"], "Synthesized from artifact source-docs/src/app.py.md")
+        self.assertNotIn("artifact_files", result.final_state)
 
     def test_repl_blocks_root_escape(self):
         with IsolatedREPL(self.root, BudgetLimits()) as repl:
@@ -370,6 +437,42 @@ class TestRLMRuntime(unittest.TestCase):
         self.assertEqual(result.result["summary"], "child-summary")
         self.assertEqual(len(client.prompts), 2)
         self.assertIn("Parent context: dict {'path': 'src/app.py'}", client.prompts[1])
+
+    def test_prompt_builder_keeps_nested_parent_context_details(self):
+        parent_context = {
+            "directories": [
+                {
+                    "path": "kuroko",
+                    "role": "analysis pipeline",
+                    "files": [
+                        {
+                            "path": "kuroko/application.py",
+                            "responsibility": "coordinates project analysis",
+                        }
+                    ],
+                }
+            ],
+            "relationships": [
+                {
+                    "from": "kuroko/application.py",
+                    "to": "kuroko/reporter.py",
+                    "kind": "writes markdown report",
+                }
+            ],
+        }
+
+        prompt = PromptBuilder().build(
+            goal="Synthesize project structure.",
+            step=1,
+            max_steps=3,
+            previous="No previous observation.",
+            parent_context=parent_context,
+        )
+
+        self.assertIn("kuroko/application.py", prompt)
+        self.assertIn("coordinates project analysis", prompt)
+        self.assertIn("writes markdown report", prompt)
+        self.assertNotIn("dict(len=2)", prompt)
 
     def test_llm_query_wait_time_does_not_trip_parent_step_timeout(self):
         with IsolatedREPL(self.root, BudgetLimits(step_timeout_seconds=0.2)) as repl:
@@ -447,7 +550,7 @@ class TestRLMRuntime(unittest.TestCase):
         self.assertEqual(result.status, "finished")
         self.assertEqual(result.budget.steps_used, 2)
         self.assertIn("## Child Query Fallback", result.result["summary"])
-        self.assertIn("budget_exceeded: max_steps=1 reached", result.result["summary"])
+        self.assertIn("budget_exceeded: [Step Budget Exceeded] max_steps=1 reached", result.result["summary"])
         self.assertIn("src/app.py", result.result["summary"])
 
     def test_run_context_accumulates_child_token_usage(self):
@@ -577,6 +680,15 @@ class TestRLMRuntime(unittest.TestCase):
         self.assertTrue(obs.finished)
         self.assertEqual(obs.result["slice"], "defa")
         self.assertEqual(obs.result["capped_len"], 2000)
+
+    def test_repl_read_text_on_directory_returns_guidance(self):
+        with IsolatedREPL(self.root, BudgetLimits()) as repl:
+            obs = repl.execute("finish(read_text('.'))", lambda prompt, context: None)
+
+        self.assertTrue(obs.finished)
+        self.assertEqual(obs.kind, "finished")
+        self.assertIn("is a directory", obs.result)
+        self.assertIn("Use list_dir('.')", obs.result)
 
     def test_repl_file_info_reports_text_metadata(self):
         (self.root / "notes.txt").write_text("one\ntwo\nthree", encoding="utf-8")
@@ -804,6 +916,8 @@ class TestRLMRuntime(unittest.TestCase):
         
         self.assertGreater(result.budget.global_total_tokens, result.budget.total_tokens)
         self.assertEqual(result.budget.total_tokens, result.budget.prompt_tokens + result.budget.response_tokens)
+        self.assertEqual(result.budget.synthesis_llm_calls, 2)
+        self.assertEqual(result.budget.worker_llm_calls, 0)
 
     def test_local_budget_exceeded_raises_error(self):
         controller, _ = self._controller(
@@ -816,6 +930,49 @@ class TestRLMRuntime(unittest.TestCase):
         result = controller.run("Goal")
         self.assertEqual(result.status, "budget_exceeded")
         self.assertIn("max_local_tokens", result.error)
+
+    def test_synthesis_budget_exceeded_raises_error(self):
+        controller, _ = self._controller(
+            [
+                "x = 1"
+            ],
+            max_steps=5,
+            max_synthesis_tokens=10,
+        )
+        result = controller.run("Goal")
+        self.assertEqual(result.status, "budget_exceeded")
+        self.assertIn("max_synthesis_tokens", result.error)
+
+    def test_worker_usage_counts_against_worker_budget_without_spending_global_tokens(self):
+        context = RunContext(limits=BudgetLimits(max_worker_tokens=20, max_total_tokens=100))
+
+        with self.assertRaises(BudgetExceededError) as raised:
+            context.record_worker_usage("a" * 80, "b" * 80)
+
+        self.assertIn("max_worker_tokens=20 reached", str(raised.exception))
+        snapshot = context.snapshot()
+        self.assertEqual(snapshot.worker_llm_calls, 0)
+        self.assertGreater(snapshot.worker_total_tokens, 20)
+        self.assertEqual(snapshot.global_total_tokens, 0)
+
+    def test_budget_exceeded_error_prefixes(self):
+        # 1. Step Limit
+        controller, _ = self._controller(["x = 1"], max_steps=1)
+        result = controller.run("Goal")
+        self.assertEqual(result.status, "budget_exceeded")
+        self.assertIn("[Step Budget Exceeded]", result.error)
+
+        # 2. Local Token
+        controller, _ = self._controller(["x = 1"], max_steps=5, max_local_tokens=10)
+        result = controller.run("Goal")
+        self.assertEqual(result.status, "budget_exceeded")
+        self.assertIn("[Local Token Budget Exceeded]", result.error)
+
+        # 3. Worker Token
+        context = RunContext(limits=BudgetLimits(max_worker_tokens=20, max_total_tokens=100))
+        with self.assertRaises(BudgetExceededError) as raised:
+            context.record_worker_usage("a" * 80, "b" * 80)
+        self.assertIn("[Worker Token Budget Exceeded]", str(raised.exception))
 
 
 if __name__ == "__main__":
