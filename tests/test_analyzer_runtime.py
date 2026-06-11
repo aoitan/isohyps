@@ -25,7 +25,10 @@ class TestRLMRuntimeAnalyzer(unittest.TestCase):
         (self.root / "README.md").write_text("# demo\n", encoding="utf-8")
         self.client = MagicMock(spec=BaseLLMClient)
         self.client.query.return_value = (
-            "finish({'summary': 'runtime summary with project components and responsibilities', "
+            "finish({'summary': '## Major directories\\n\\n- `.`: demo project root.\\n\\n"
+            "## Important files\\n\\n- `README.md`: runtime summary with project components and responsibilities.\\n\\n"
+            "## Relationships\\n\\n- `README.md` describes the root project.\\n\\n"
+            "## Uncertainties\\n\\n- No additional source files were provided in this fixture.', "
             "'documents': [{'path': 'index.md', 'title': 'Root', 'content': 'runtime summary with enough project detail for validation'}, "
             "{'path': 'README.md', 'title': 'README', 'content': 'readme details'}]})"
         )
@@ -45,7 +48,7 @@ class TestRLMRuntimeAnalyzer(unittest.TestCase):
 
         summary = analyzer.analyze(self.root)
 
-        self.assertEqual(summary, "runtime summary with project components and responsibilities")
+        self.assertIn("runtime summary with project components and responsibilities", summary)
         self.assertTrue((self.output_dir / "index.md").exists())
         self.assertTrue((self.output_dir / "README.md").exists())
         report = (self.output_dir / "analysis_report.md").read_text(encoding="utf-8")
@@ -122,7 +125,10 @@ class TestRLMRuntimeAnalyzerIntegration(unittest.TestCase):
         responses = [
             # Parent step 1: issue child query then finish with the result
             "child_result = llm_query('Analyze app.py', {'path': 'app.py'})\n"
-            "finish({'summary': f'Parent saw: {child_result}; app.py was inspected through a child query.', "
+            "finish({'summary': f'## Major directories\\n\\n- `.`: fixture project root.\\n\\n"
+            "## Important files\\n\\n- `app.py`: Parent saw: {child_result}; app.py was inspected through a child query.\\n\\n"
+            "## Relationships\\n\\n- `app.py` is the source file inspected through the child query.\\n\\n"
+            "## Uncertainties\\n\\n- No package-level relationships are present in this fixture.', "
             "'documents': [{'path': 'index.md', 'title': 'Overview', 'content': f'Parent saw: {child_result}; app.py was inspected through a child query.'}, "
             "{'path': 'app.py.md', 'title': 'app.py', 'content': f'app.py was inspected through a child query. {child_result}'}]})",
             # Child step 1: analyse and finish
@@ -162,7 +168,10 @@ class TestRLMRuntimeAnalyzerIntegration(unittest.TestCase):
         """Model returns invalid Python first; after retry it finishes normally."""
         responses = [
             "This is not python code.",
-            "finish({'summary': 'Recovered after invalid code and produced a substantive project analysis.', "
+            "finish({'summary': '## Major directories\\n\\n- `.`: fixture project root.\\n\\n"
+            "## Important files\\n\\n- `app.py`: Recovered after invalid code and produced a substantive project analysis.\\n\\n"
+            "## Relationships\\n\\n- `app.py` contains the small hello function covered by a source document.\\n\\n"
+            "## Uncertainties\\n\\n- No additional source files were provided in this fixture.', "
             "'documents': [{'path': 'index.md', 'title': 'Overview', 'content': 'Recovered after invalid code and produced a substantive project analysis.'}, "
             "{'path': 'app.py.md', 'title': 'app.py', 'content': 'app.py has a small hello function and is covered by a source document.'}]})",
         ]
@@ -219,7 +228,10 @@ class TestRLMRuntimeAnalyzerIntegration(unittest.TestCase):
     def test_docs_generation_with_valid_finish(self):
         """A valid structured finish produces index.md and analysis_report.md."""
         responses = [
-            "finish({'summary': 'Minimal project summary with enough detail to satisfy validation.', "
+            "finish({'summary': '## Major directories\\n\\n- `.`: fixture project root.\\n\\n"
+            "## Important files\\n\\n- `app.py`: Minimal project summary with enough detail to satisfy validation.\\n\\n"
+            "## Relationships\\n\\n- `app.py` is documented by the worker-generated source document.\\n\\n"
+            "## Uncertainties\\n\\n- No additional source files were provided in this fixture.', "
             "'documents': [{'path': 'index.md', 'title': 'Overview', 'content': 'Minimal project summary with enough detail to satisfy validation.'}, "
             "{'path': 'app.py.md', 'title': 'app.py', 'content': 'app.py has a small hello function and is covered by a source document.'}]})",
         ]

@@ -63,6 +63,7 @@ SAFE_BUILTINS = {
     "iter": iter,
     "len": len,
     "list": list,
+    "locals": locals,
     "map": map,
     "max": max,
     "min": min,
@@ -148,6 +149,63 @@ def _summarize_value(value: Any, limit: int) -> str:
     if isinstance(value, str) and len(value) > limit:
         return f"str(len={len(value)}) {value[:limit - 3]}..."
     rendered = _safe_repr(value, limit)
+    if len(rendered) > limit:
+        rendered = rendered[: limit - 3] + "..."
+    return f"{type(value).__name__} {rendered}"
+
+
+def _parent_context_repr(value: Any, limit: int, depth: int = 0, seen: set[int] | None = None) -> str:
+    if seen is None:
+        seen = set()
+
+    value_id = id(value)
+    if isinstance(value, (list, tuple, dict, set)):
+        if value_id in seen:
+            return "..."
+        seen.add(value_id)
+
+    string_limit = min(1200, limit)
+    if isinstance(value, str) and len(value) > string_limit:
+        return f"str(len={len(value)}) {value[:string_limit - 3]}..."
+    if depth >= 6:
+        if isinstance(value, (list, tuple, set, dict)):
+            return f"{type(value).__name__}(len={len(value)})"
+        return _cap_text(repr(value), string_limit)
+
+    def render_items(items: list[str], open_char: str, close_char: str, truncated: bool) -> str:
+        if truncated:
+            items.append("...")
+        rendered = open_char + ", ".join(items) + close_char
+        return _cap_text(rendered, limit)
+
+    if isinstance(value, list):
+        capped = value[:200]
+        items = [_parent_context_repr(item, limit, depth + 1, seen) for item in capped]
+        return render_items(items, "[", "]", len(capped) < len(value))
+    if isinstance(value, tuple):
+        capped = value[:200]
+        items = [_parent_context_repr(item, limit, depth + 1, seen) for item in capped]
+        rendered = render_items(items, "(", ")", len(capped) < len(value))
+        if len(value) == 1 and not rendered.endswith(",)"):
+            rendered = rendered[:-1] + ",)"
+        return rendered
+    if isinstance(value, set):
+        capped = list(value)[:200]
+        items = [_parent_context_repr(item, limit, depth + 1, seen) for item in capped]
+        return render_items(items, "{", "}", len(capped) < len(value))
+    if isinstance(value, dict):
+        capped = list(value.items())[:200]
+        items = [
+            f"{_parent_context_repr(key, limit, depth + 1, seen)}: {_parent_context_repr(item, limit, depth + 1, seen)}"
+            for key, item in capped
+        ]
+        return render_items(items, "{", "}", len(capped) < len(value))
+
+    return _cap_text(repr(value), string_limit)
+
+
+def _summarize_parent_context(value: Any, limit: int = 16000) -> str:
+    rendered = _parent_context_repr(value, limit)
     if len(rendered) > limit:
         rendered = rendered[: limit - 3] + "..."
     return f"{type(value).__name__} {rendered}"
@@ -674,7 +732,7 @@ class PromptBuilder:
     )
 
     def build(self, goal: str, step: int, max_steps: int, previous: str, parent_context: Any | None) -> str:
-        context_line = "(none)" if parent_context is None else _summarize_value(parent_context, 400)
+        context_line = "(none)" if parent_context is None else _summarize_parent_context(parent_context)
         return (
             f"{self.SYSTEM_PROMPT}\n"
             f"Goal: {goal}\n"
@@ -864,6 +922,7 @@ def _sandbox_worker(
     root: str,
     limits: BudgetLimits,
     artifact_files: dict[str, str] | None = None,
+    parent_context: Any | None = None,
 ) -> None:
     root_path = Path(root).resolve()
     artifact_files = {
@@ -898,6 +957,8 @@ def _sandbox_worker(
     globals_dict: dict[str, Any] = {
         "__builtins__": SAFE_BUILTINS,
         "__name__": "__main__",
+        "parent": parent_context,
+        "parent_context": parent_context,
         "repo_map": repo_map,
         "analysis_documents": [],
     }
@@ -932,6 +993,9 @@ def _sandbox_worker(
     def read_text(path: str, offset: int = 0, limit: int = 2000) -> str:
         _dbg("sandbox", f"read_text({path!r}, offset={offset}, limit={limit})")
         target = resolve_path(path)
+        if target.is_dir():
+            relative = str(target.relative_to(root_path)) if target != root_path else "."
+            return f"read_text: `{relative}` is a directory. Use list_dir('{relative}') to inspect it."
         _file_size_guard(target, "read_text")
         if offset < 0:
             raise ValueError("read_text: offset must be >= 0")
@@ -1168,6 +1232,7 @@ def _sandbox_worker(
             or name.startswith("_")
             or name == "__builtins__"
             or name in helper_names
+            or name in {"parent", "parent_context"}
             or name == "analysis_documents"
             or callable(value)
         ):
@@ -1200,7 +1265,13 @@ def _sandbox_worker(
     def snapshot_state() -> dict[str, str]:
         state: dict[str, str] = {}
         for name, value in globals_dict.items():
-            if name.startswith("_") or name == "__builtins__" or name in helper_names or name == "analysis_documents":
+            if (
+                name.startswith("_")
+                or name == "__builtins__"
+                or name in helper_names
+                or name in {"parent", "parent_context"}
+                or name == "analysis_documents"
+            ):
                 continue
             state[name] = _summarize_value(value, limits.max_state_value_chars)
             if len(state) >= limits.max_state_items:
@@ -1252,10 +1323,17 @@ def _sandbox_worker(
 
 
 class IsolatedREPL:
-    def __init__(self, root: Path, limits: BudgetLimits, artifact_files: dict[str, str] | None = None):
+    def __init__(
+        self,
+        root: Path,
+        limits: BudgetLimits,
+        artifact_files: dict[str, str] | None = None,
+        parent_context: Any | None = None,
+    ):
         self.root = root.resolve()
         self.limits = limits
         self.artifact_files = dict(artifact_files or {})
+        self.parent_context = parent_context
         self._process: multiprocessing.Process | None = None
         self._connection: Connection | None = None
 
@@ -1267,7 +1345,7 @@ class IsolatedREPL:
         parent_conn, child_conn = multiprocessing.Pipe()
         process = multiprocessing.Process(
             target=_sandbox_worker,
-            args=(child_conn, str(self.root), self.limits, self.artifact_files),
+            args=(child_conn, str(self.root), self.limits, self.artifact_files, self.parent_context),
             daemon=True,
         )
         process.start()
@@ -1426,7 +1504,12 @@ class RLMController:
                 final_state=final_state,
             )
 
-        with IsolatedREPL(self.root, self.run_context.limits, artifact_files=self.artifact_files) as repl:
+        with IsolatedREPL(
+            self.root,
+            self.run_context.limits,
+            artifact_files=self.artifact_files,
+            parent_context=parent_context,
+        ) as repl:
             while True:
                 try:
                     self.run_context.reserve_step()

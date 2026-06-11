@@ -286,17 +286,32 @@ class TestRLMRuntime(unittest.TestCase):
                 "except NameError as exc:\n"
                 "    caught = type(exc).__name__\n"
                 "state = globals()\n"
+                "local_state = locals()\n"
                 "names = dir()\n"
                 "items = list(map(str, filter(lambda item: isinstance(item, str), ['src', 1])))\n"
-                "finish({'caught': caught, 'has_state': isinstance(state, dict), 'has_names': 'state' in names, 'items': items})",
+                "finish({'caught': caught, 'has_state': isinstance(state, dict), 'has_local_state': isinstance(local_state, dict), 'has_names': 'state' in names, 'items': items})",
                 lambda prompt, context: None,
             )
 
         self.assertTrue(observation.finished)
         self.assertEqual(
             observation.result,
-            {"caught": "NameError", "has_state": True, "has_names": True, "items": ["src"]},
+            {"caught": "NameError", "has_state": True, "has_local_state": True, "has_names": True, "items": ["src"]},
         )
+
+    def test_repl_exposes_parent_context_without_snapshotting_it(self):
+        parent_context = {"path": "src/app.py", "content": "parent details"}
+
+        with IsolatedREPL(self.root, BudgetLimits(), parent_context=parent_context) as repl:
+            observation = repl.execute(
+                "finish({'path': parent['path'], 'same': parent_context is parent})",
+                lambda prompt, context: None,
+            )
+
+        self.assertTrue(observation.finished)
+        self.assertEqual(observation.result, {"path": "src/app.py", "same": True})
+        self.assertNotIn("parent", observation.state)
+        self.assertNotIn("parent_context", observation.state)
 
     def test_repl_prunes_large_file_cards_and_keeps_small_worklist_state(self):
         with IsolatedREPL(self.root, BudgetLimits()) as repl:
@@ -422,6 +437,42 @@ class TestRLMRuntime(unittest.TestCase):
         self.assertEqual(result.result["summary"], "child-summary")
         self.assertEqual(len(client.prompts), 2)
         self.assertIn("Parent context: dict {'path': 'src/app.py'}", client.prompts[1])
+
+    def test_prompt_builder_keeps_nested_parent_context_details(self):
+        parent_context = {
+            "directories": [
+                {
+                    "path": "kuroko",
+                    "role": "analysis pipeline",
+                    "files": [
+                        {
+                            "path": "kuroko/application.py",
+                            "responsibility": "coordinates project analysis",
+                        }
+                    ],
+                }
+            ],
+            "relationships": [
+                {
+                    "from": "kuroko/application.py",
+                    "to": "kuroko/reporter.py",
+                    "kind": "writes markdown report",
+                }
+            ],
+        }
+
+        prompt = PromptBuilder().build(
+            goal="Synthesize project structure.",
+            step=1,
+            max_steps=3,
+            previous="No previous observation.",
+            parent_context=parent_context,
+        )
+
+        self.assertIn("kuroko/application.py", prompt)
+        self.assertIn("coordinates project analysis", prompt)
+        self.assertIn("writes markdown report", prompt)
+        self.assertNotIn("dict(len=2)", prompt)
 
     def test_llm_query_wait_time_does_not_trip_parent_step_timeout(self):
         with IsolatedREPL(self.root, BudgetLimits(step_timeout_seconds=0.2)) as repl:
@@ -629,6 +680,15 @@ class TestRLMRuntime(unittest.TestCase):
         self.assertTrue(obs.finished)
         self.assertEqual(obs.result["slice"], "defa")
         self.assertEqual(obs.result["capped_len"], 2000)
+
+    def test_repl_read_text_on_directory_returns_guidance(self):
+        with IsolatedREPL(self.root, BudgetLimits()) as repl:
+            obs = repl.execute("finish(read_text('.'))", lambda prompt, context: None)
+
+        self.assertTrue(obs.finished)
+        self.assertEqual(obs.kind, "finished")
+        self.assertIn("is a directory", obs.result)
+        self.assertIn("Use list_dir('.')", obs.result)
 
     def test_repl_file_info_reports_text_metadata(self):
         (self.root / "notes.txt").write_text("one\ntwo\nthree", encoding="utf-8")
