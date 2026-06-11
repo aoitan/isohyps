@@ -24,14 +24,16 @@ class TestRLMRuntimeAnalyzer(unittest.TestCase):
         self.root.mkdir()
         (self.root / "README.md").write_text("# demo\n", encoding="utf-8")
         self.client = MagicMock(spec=BaseLLMClient)
-        self.client.query.return_value = (
+        self.client.query.side_effect = [
+            "finish({'summary': '## Major directories\\n\\n- `.`: demo project root.'})",
+            "finish({'summary': '## Relationships\\n\\n- README.md describes the root project.\\n\\n```mermaid\\ngraph TD;\\nREADME-->Root\\n```'})",
             "finish({'summary': '## Major directories\\n\\n- `.`: demo project root.\\n\\n"
             "## Important files\\n\\n- `README.md`: runtime summary with project components and responsibilities.\\n\\n"
-            "## Relationships\\n\\n- `README.md` describes the root project.\\n\\n"
+            "## Relationships\\n\\n- `README.md` describes the root project.\\n\\n```mermaid\\ngraph TD;\\nREADME-->Root\\n```\\n\\n"
             "## Uncertainties\\n\\n- No additional source files were provided in this fixture.', "
             "'documents': [{'path': 'index.md', 'title': 'Root', 'content': 'runtime summary with enough project detail for validation'}, "
             "{'path': 'README.md', 'title': 'README', 'content': 'readme details'}]})"
-        )
+        ]
 
     def tearDown(self):
         shutil.rmtree(self.test_dir)
@@ -123,15 +125,16 @@ class TestRLMRuntimeAnalyzerIntegration(unittest.TestCase):
     def test_child_query_integration(self):
         """Parent issues a child query; child result is reflected in the summary."""
         responses = [
-            # Parent step 1: issue child query then finish with the result
+            "finish({'summary': '## Major directories\\n\\n- `.`: fixture project root.'})",
+            "finish({'summary': '## Relationships\\n\\n- `app.py` is the main file.\\n\\n```mermaid\\ngraph TD;\\napp-->Root\\n```'})",
             "child_result = llm_query('Analyze app.py', {'path': 'app.py'})\n"
-            "finish({'summary': f'## Major directories\\n\\n- `.`: fixture project root.\\n\\n"
+            "summary = f'## Major directories\\n\\n- `.`: fixture project root.\\n\\n"
             "## Important files\\n\\n- `app.py`: Parent saw: {child_result}; app.py was inspected through a child query.\\n\\n"
-            "## Relationships\\n\\n- `app.py` is the source file inspected through the child query.\\n\\n"
-            "## Uncertainties\\n\\n- No package-level relationships are present in this fixture.', "
+            "## Relationships\\n\\n- `app.py` is the source file.\\n\\n```mermaid\\ngraph TD;\\napp-->Root\\n```\\n\\n"
+            "## Uncertainties\\n\\n- None.'\n"
+            "finish({'summary': summary, "
             "'documents': [{'path': 'index.md', 'title': 'Overview', 'content': f'Parent saw: {child_result}; app.py was inspected through a child query.'}, "
             "{'path': 'app.py.md', 'title': 'app.py', 'content': f'app.py was inspected through a child query. {child_result}'}]})",
-            # Child step 1: analyse and finish
             "finish('Child summary of app.py')",
         ]
         analyzer, _ = self._make_analyzer(responses, max_steps=5)
@@ -168,10 +171,12 @@ class TestRLMRuntimeAnalyzerIntegration(unittest.TestCase):
         """Model returns invalid Python first; after retry it finishes normally."""
         responses = [
             "This is not python code.",
+            "finish({'summary': '## Major directories\\n\\n- `.`: fixture project root.'})",
+            "finish({'summary': '## Relationships\\n\\n- `app.py` is main.\\n\\n```mermaid\\ngraph TD;\\napp-->Root\\n```'})",
             "finish({'summary': '## Major directories\\n\\n- `.`: fixture project root.\\n\\n"
             "## Important files\\n\\n- `app.py`: Recovered after invalid code and produced a substantive project analysis.\\n\\n"
-            "## Relationships\\n\\n- `app.py` contains the small hello function covered by a source document.\\n\\n"
-            "## Uncertainties\\n\\n- No additional source files were provided in this fixture.', "
+            "## Relationships\\n\\n- `app.py` contains the small hello function covered by a source document.\\n\\n```mermaid\\ngraph TD;\\napp-->Root\\n```\\n\\n"
+            "## Uncertainties\\n\\n- None.', "
             "'documents': [{'path': 'index.md', 'title': 'Overview', 'content': 'Recovered after invalid code and produced a substantive project analysis.'}, "
             "{'path': 'app.py.md', 'title': 'app.py', 'content': 'app.py has a small hello function and is covered by a source document.'}]})",
         ]
@@ -228,9 +233,11 @@ class TestRLMRuntimeAnalyzerIntegration(unittest.TestCase):
     def test_docs_generation_with_valid_finish(self):
         """A valid structured finish produces index.md and analysis_report.md."""
         responses = [
+            "finish({'summary': '## Major directories\\n\\n- `.`: fixture project root.'})",
+            "finish({'summary': '## Relationships\\n\\n- `app.py` is documented.\\n\\n```mermaid\\ngraph TD;\\napp-->Root\\n```'})",
             "finish({'summary': '## Major directories\\n\\n- `.`: fixture project root.\\n\\n"
             "## Important files\\n\\n- `app.py`: Minimal project summary with enough detail to satisfy validation.\\n\\n"
-            "## Relationships\\n\\n- `app.py` is documented by the worker-generated source document.\\n\\n"
+            "## Relationships\\n\\n- `app.py` is documented by the worker-generated source document.\\n\\n```mermaid\\ngraph TD;\\napp-->Root\\n```\\n\\n"
             "## Uncertainties\\n\\n- No additional source files were provided in this fixture.', "
             "'documents': [{'path': 'index.md', 'title': 'Overview', 'content': 'Minimal project summary with enough detail to satisfy validation.'}, "
             "{'path': 'app.py.md', 'title': 'app.py', 'content': 'app.py has a small hello function and is covered by a source document.'}]})",

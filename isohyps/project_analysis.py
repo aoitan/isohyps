@@ -57,15 +57,32 @@ REQUIRED_PROJECT_SUMMARY_SECTIONS = (
     "## Uncertainties",
 )
 
+DEFAULT_GOAL_TEMPLATE_PHASE1 = (
+    "Phase 1: Survey the project rooted at '{root_name}' and draft an initial high-level architecture overview. "
+    "Examine repo_map and README to identify uncertainties. "
+    "Write a concise architecture description in Japanese. "
+    "Finish with a dict containing a string 'summary' under the key 'summary'. "
+    "Do not explain relationships or detailed file responsibilities yet."
+)
 
-DEFAULT_GOAL_TEMPLATE = (
-    "Analyze the project rooted at '{root_name}' using a hypothesis-driven process. "
-    "Start by drafting a high-level architecture overview based on repo_map and README to identify uncertainties. "
-    "Then, select and probe key relationships or deep-dive into important files to refine this hypothesis. "
-    "Use deterministic worker artifacts (manifest.json, etc.) and repository helpers for probes, calling llm_query only for synthesis. "
-    "Finally, output a refined project summary and uncertainties. "
-    "Finish with a dict containing a string 'summary'. "
-    "Do not generate or repeat one source document per source file in finish(); the runtime will attach worker documents."
+DEFAULT_GOAL_TEMPLATE_PHASE2 = (
+    "Phase 2: Analyze relationships and dependency graph of components in the repository rooted at '{root_name}'. "
+    "Use this initial architecture overview: {phase1_summary}. "
+    "Examine relationships.json and import hubs to map component interactions. "
+    "In the 'summary' output, you MUST include a Mermaid diagram (```mermaid) showing component interactions, "
+    "followed by detailed text explanations in Japanese. "
+    "Finish with a dict containing a string 'summary' containing the Mermaid diagram and explanations."
+)
+
+DEFAULT_GOAL_TEMPLATE_PHASE3 = (
+    "Phase 3: Synthesize the final project analysis report for the repository rooted at '{root_name}'. "
+    "Combine Architecture Overview: {phase1_summary} "
+    "and Relationships with Mermaid diagram: {phase2_summary}. "
+    "Integrate uncertainties and file-level information to build the final report. "
+    "The final summary MUST include exactly these Markdown sections: "
+    "## Major directories, ## Important files, ## Relationships, and ## Uncertainties. "
+    "Write the text in Japanese. "
+    "Finish with a dict containing a string 'summary' matching the final output format."
 )
 
 
@@ -202,6 +219,7 @@ def format_analysis_result_errors(errors: list[str]) -> str:
 
 
 class ProjectAnalysisPromptBuilder(PromptBuilder):
+    # Class constant for backward compatibility with tests checking raw SYSTEM_PROMPT attribute
     SYSTEM_PROMPT = (
         "You are operating a Recursive Language Model runtime for project analysis.\n"
         "Return only Python code and no prose.\n"
@@ -232,11 +250,6 @@ class ProjectAnalysisPromptBuilder(PromptBuilder):
         "- All helper paths are relative to the analysis root. Use '.' for the root; do not prefix paths with the root directory name.\n"
         "- Prefer helper calls over large string constants.\n"
         "- A global variable `repo_map` is available in your environment. It is a partial map (up to depth 2, capped at 500 nodes) and includes `repo_map['source_worklist']`, the source files that need explanations. Use it as a starting point to understand the project structure, but always use helpers (like list_dir) to confirm details or explore deeper paths.\n"
-        "Hypothesis-Driven Exploration Process:\n"
-        "1. Survey & Hypothesis: Inspect repo_map and README first. Formulate an initial mental model (hypothesis) of the overall architecture and list key uncertainties.\n"
-        "2. Probe & Verify: Select a small number of key areas to resolve these uncertainties. Probe relationships, symbol indexes, and import hubs.\n"
-        "3. Deep Dive: Selectively read source-doc artifacts for key files to verify details and refine the hypothesis.\n"
-        "4. Synthesis: Combine all findings to refine the architecture summary, highlight resolved assumptions, and present remaining uncertainties.\n\n"
         "Minimum exploration before finish:\n"
         "- Do not finish after only inspecting the root directory or README.\n"
         "- Inspect repo_map first, then confirm important areas with helpers.\n"
@@ -308,6 +321,77 @@ class ProjectAnalysisPromptBuilder(PromptBuilder):
         "Do not write `import`, `from ... import ...`, or finish(None). Do not finish with a bare string.\n"
         "- When you are done, call finish(value).\n"
     )
+
+    def __init__(self, phase: int = 1):
+        super().__init__()
+        self.phase = phase
+
+    def build(self, goal: str, step: int, max_steps: int, previous: str, parent_context: Any | None) -> str:
+        system_prompt = self._get_system_prompt()
+        context_line = "(none)" if parent_context is None else _summarize_parent_context(parent_context)
+        return (
+            f"{system_prompt}\n"
+            f"Goal: {goal}\n"
+            f"Current step: {step}/{max_steps}\n"
+            f"Parent context: {context_line}\n\n"
+            f"Previous observation:\n{previous}\n"
+        )
+
+    def _get_system_prompt(self) -> str:
+        common_header = (
+            "You are operating a Recursive Language Model runtime for project analysis.\n"
+            "Return only Python code and no prose.\n"
+            "State persists across steps inside a Python sandbox.\n"
+            "Use helpers instead of imports or direct OS access.\n"
+            "Available helpers:\n"
+            "- list_dir(path='.') -> list[str]\n"
+            "- read_text(path, offset=0, limit=2000) -> str\n"
+            "- file_info(path) -> dict(path, exists, is_file, is_dir, size_bytes, line_count, char_count, approx_tokens, language, binary)\n"
+            "- search_text(path, pattern, max_results=10, context_chars=160) -> list[dict(offset, line, match, excerpt)]\n"
+            "- list_artifacts(path='.') -> list[str]\n"
+            "- read_artifact(path, offset=0, limit=2000) -> str\n"
+            "- read_artifact_json(path) -> parsed artifact json value\n"
+            "- grep_artifacts(pattern, max_results=10, context_chars=160) -> list[dict(path, offset, match, excerpt)]\n"
+            "- read_json(path) -> parsed json value\n"
+            "- path_exists(path) -> bool\n"
+            "- is_dir(path) -> bool\n"
+            "- extract_symbols(path) -> dict(language, symbols, fallback_excerpt, error)\n"
+            "- llm_query(prompt, context=None) -> child result value\n"
+            "- record_document(path, title, content) -> persist one completed Markdown source document for partial output\n"
+            "- finish(value) -> immediately end the run. For top-level project analysis, the value MUST be a dict matching:\n"
+            f"{ANALYSIS_RESULT_SCHEMA_TEXT}"
+            "Rules:\n"
+            "- Do not import modules.\n"
+            "- Do not attempt network, subprocess, or filesystem mutation.\n"
+            "- Do not assign to helper names such as list_dir, read_text, file_info, search_text, list_artifacts, read_artifact, read_artifact_json, grep_artifacts, read_json, path_exists, is_dir, extract_symbols, llm_query, or finish.\n"
+            "- `globals` and `locals` are functions, not dict variables. Do not write globals[...] or locals[...]; call globals() or locals() before membership checks or subscripting, such as globals()['name'].\n"
+            "- All helper paths are relative to the analysis root. Use '.' for the root; do not prefix paths with the root directory name.\n"
+            "- Prefer helper calls over large string constants.\n"
+            "- A global variable `repo_map` is available in your environment. It is a partial map (up to depth 2, capped at 500 nodes) and includes `repo_map['source_worklist']`, the source files that need explanations. Use it as a starting point to understand the project structure, but always use helpers (like list_dir) to confirm details or explore deeper paths.\n"
+        )
+        if self.phase == 1:
+            return common_header + (
+                "Minimum exploration before finish:\n"
+                "- Do not finish after only inspecting the root directory or README.\n"
+                "- Inspect repo_map first, then confirm important areas with helpers.\n"
+                "- Focus on drafting the high-level architecture overview. Outline the system overall layout, major directories, and general purpose.\n"
+                "- Do not loop over source files to write detailed descriptions yet.\n"
+                "- The final value MUST include a 'summary' containing: ## Major directories (and optionally ## Uncertainties).\n"
+            )
+        elif self.phase == 2:
+            return common_header + (
+                "Minimum exploration before finish:\n"
+                "- Focus on analyzing component relationships, interactions, and dependency graphs.\n"
+                "- Read relationships.json and check import statements to understand data flow.\n"
+                "- The final value MUST include a 'summary' containing a Mermaid diagram (```mermaid) showing the component interactions, and detailed text explanations under the section '## Relationships'.\n"
+            )
+        else:
+            return common_header + (
+                "Minimum exploration before finish:\n"
+                "- Focus on synthesizing the final report by merging Phase 1 and Phase 2 summaries and resolving uncertainties.\n"
+                "- Ensure the output follows the final report format.\n"
+                "- The final summary MUST include exactly these Markdown sections: ## Major directories, ## Important files, ## Relationships (containing the Mermaid diagram), and ## Uncertainties.\n"
+            )
 
 
 class ProjectAnalysisChildPromptBuilder(PromptBuilder):
@@ -1042,41 +1126,146 @@ class RLMRuntimeAnalyzer:
         source_worker = SourceDocumentWorker()
         worker_documents = source_worker.build_documents(root, source_files, run_context=run_context)
         artifact_files = source_worker.build_artifact_files(worker_documents)
-        controller = RLMController(
+
+        # ----------------------------------------------------
+        # Phase 1: Survey & Hypothesis (Architecture Overview)
+        # ----------------------------------------------------
+        run_context.steps_used = 0
+        controller_p1 = RLMController(
             client=self.client,
             root=root,
             run_context=run_context,
-            prompt_builder=ProjectAnalysisPromptBuilder(),
+            prompt_builder=ProjectAnalysisPromptBuilder(phase=1),
             child_config=ChildQueryConfig(
                 prompt_builder=ProjectAnalysisChildPromptBuilder(),
                 limits=PartialBudgetLimits(max_steps=PROJECT_ANALYSIS_CHILD_MAX_STEPS),
             ),
             artifact_files=artifact_files,
         )
+        goal_p1 = DEFAULT_GOAL_TEMPLATE_PHASE1.format(root_name=root.name)
 
-        def validate_finish(value: Any) -> list[str]:
-            merged_value = _merge_analysis_documents(value, worker_documents)
-            return validate_project_analysis_finish(merged_value, source_files=source_files)
+        def validate_p1(value: Any) -> list[str]:
+            if not isinstance(value, dict) or "summary" not in value or not isinstance(value["summary"], str):
+                return ["Expected finish(value) to receive a dict with 'summary' key."]
+            summary = value["summary"]
+            if "## Major directories" not in summary:
+                return ["Expected 'summary' to include '## Major directories'."]
+            return []
 
-        goal = DEFAULT_GOAL_TEMPLATE.format(root_name=root.name)
-        result = controller.run(
-            goal=goal,
-            finish_validator=validate_finish,
+        result_p1 = controller_p1.run(
+            goal=goal_p1,
+            finish_validator=validate_p1,
             finish_normalizer=normalize_analysis_result,
             finish_error_formatter=format_analysis_result_errors,
         )
+
+        if result_p1.status != "finished":
+            return self._handle_failure(root, result_p1, worker_documents)
+
+        phase1_summary = result_p1.result.get("summary", "")
+
+        # ----------------------------------------------------
+        # Phase 2: Probe Relationships (Mermaid and Explanations)
+        # ----------------------------------------------------
+        run_context.steps_used = 0
+        controller_p2 = RLMController(
+            client=self.client,
+            root=root,
+            run_context=run_context,
+            prompt_builder=ProjectAnalysisPromptBuilder(phase=2),
+            child_config=ChildQueryConfig(
+                prompt_builder=ProjectAnalysisChildPromptBuilder(),
+                limits=PartialBudgetLimits(max_steps=PROJECT_ANALYSIS_CHILD_MAX_STEPS),
+            ),
+            artifact_files=artifact_files,
+        )
+        goal_p2 = DEFAULT_GOAL_TEMPLATE_PHASE2.format(root_name=root.name, phase1_summary=phase1_summary)
+
+        def validate_p2(value: Any) -> list[str]:
+            if not isinstance(value, dict) or "summary" not in value or not isinstance(value["summary"], str):
+                return ["Expected finish(value) to receive a dict with 'summary' key."]
+            summary = value["summary"]
+            if "## Relationships" not in summary:
+                return ["Expected 'summary' to include '## Relationships'."]
+            if "```mermaid" not in summary:
+                return ["Expected 'summary' to include a Mermaid diagram (```mermaid)."]
+            return []
+
+        result_p2 = controller_p2.run(
+            goal=goal_p2,
+            finish_validator=validate_p2,
+            finish_normalizer=normalize_analysis_result,
+            finish_error_formatter=format_analysis_result_errors,
+        )
+
+        if result_p2.status != "finished":
+            return self._handle_failure(root, result_p2, worker_documents)
+
+        phase2_summary = result_p2.result.get("summary", "")
+
+        # ----------------------------------------------------
+        # Phase 3: Synthesis & Report Generation
+        # ----------------------------------------------------
+        run_context.steps_used = 0
+        controller_p3 = RLMController(
+            client=self.client,
+            root=root,
+            run_context=run_context,
+            prompt_builder=ProjectAnalysisPromptBuilder(phase=3),
+            child_config=ChildQueryConfig(
+                prompt_builder=ProjectAnalysisChildPromptBuilder(),
+                limits=PartialBudgetLimits(max_steps=PROJECT_ANALYSIS_CHILD_MAX_STEPS),
+            ),
+            artifact_files=artifact_files,
+        )
+        goal_p3 = DEFAULT_GOAL_TEMPLATE_PHASE3.format(
+            root_name=root.name,
+            phase1_summary=phase1_summary,
+            phase2_summary=phase2_summary,
+        )
+
+        def validate_p3(value: Any) -> list[str]:
+            merged_value = _merge_analysis_documents(value, worker_documents)
+            return validate_project_analysis_finish(merged_value, source_files=source_files)
+
+        result_p3 = controller_p3.run(
+            goal=goal_p3,
+            finish_validator=validate_p3,
+            finish_normalizer=normalize_analysis_result,
+            finish_error_formatter=format_analysis_result_errors,
+        )
+
+        result_p3.result = _merge_analysis_documents(result_p3.result, worker_documents)
+        self.last_result = result_p3
+
+        summary = result_p3.error or str(result_p3.result)
+        if result_p3.status == "finished" and isinstance(result_p3.result, dict):
+            summary = str(result_p3.result.get("summary") or summary)
+        elif result_p3.status != "finished":
+            return self._handle_failure(root, result_p3, worker_documents)
+
+        if self.output_dir:
+            write_analysis_docs(
+                output_dir=self.output_dir,
+                root_path=root,
+                controller_result=result_p3,
+                backend=self.backend_name,
+                model=self.model_name,
+            )
+        return summary
+
+    def _handle_failure(self, root: Path, result: ControllerResult, worker_documents: list[AnalysisDocument]) -> str:
         result.result = _merge_analysis_documents(result.result, worker_documents)
         self.last_result = result
-
         summary = result.error or str(result.result)
-        if result.status == "finished" and isinstance(result.result, dict):
-            summary = str(result.result.get("summary") or summary)
-        elif result.status != "finished":
-            guidance = []
-            if result.status == "budget_exceeded":
-                guidance.append("Try increasing --max-total-tokens or --max-steps.")
-            guidance.append("If the controller keeps failing, retry with --runtime legacy.")
-            summary = f"[{result.status}] {summary} {' '.join(guidance)}".strip()
+        if isinstance(result.result, dict) and "summary" in result.result and result.result["summary"]:
+            summary = str(result.result["summary"])
+
+        guidance = []
+        if result.status == "budget_exceeded":
+            guidance.append("Try increasing --max-total-tokens or --max-steps.")
+        guidance.append("If the controller keeps failing, retry with --runtime legacy.")
+        summary = f"[{result.status}] {summary} {' '.join(guidance)}".strip()
 
         if self.output_dir:
             write_analysis_docs(

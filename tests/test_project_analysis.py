@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 from analyzer import BaseLLMClient
 from isohyps.project_analysis import (
     AnalysisDocBuilder,
-    DEFAULT_GOAL_TEMPLATE,
+    DEFAULT_GOAL_TEMPLATE_PHASE1,
     PROJECT_ANALYSIS_CHILD_MAX_STEPS,
     ProjectAnalysisChildPromptBuilder,
     ProjectAnalysisPromptBuilder,
@@ -162,12 +162,10 @@ class TestProjectAnalysisContract(unittest.TestCase):
         self.assertIn("'content': str", prompt)
 
     def test_default_goal_keeps_file_card_state_compact(self):
-        goal = DEFAULT_GOAL_TEMPLATE
-        self.assertIn("hypothesis-driven process", goal)
+        goal = DEFAULT_GOAL_TEMPLATE_PHASE1
+        self.assertIn("Phase 1: Survey the project rooted at", goal)
         self.assertIn("identify uncertainties", goal)
-        self.assertIn("probe key relationships or deep-dive", goal)
-        self.assertIn("deterministic worker artifacts", goal)
-        self.assertIn("Do not generate or repeat one source document per source file", goal)
+        self.assertIn("concise architecture description", goal)
 
     def test_project_analysis_prompt_contains_minimum_exploration_rules(self):
         prompt = ProjectAnalysisPromptBuilder.SYSTEM_PROMPT
@@ -351,11 +349,15 @@ class TestRLMRuntimeAnalyzer(unittest.TestCase):
         self.summary_text = _summary_with_required_sections(
             "runtime summary with project components and responsibilities"
         )
-        self.client.query.return_value = (
+        self.summary_text_p1 = "## Major directories\n\n- `isohyps`: runtime implementation."
+        self.summary_text_p2 = "## Relationships\n\n```mermaid\ngraph TD\nA --> B\n```\nSome relations."
+        self.client.query.side_effect = [
+            f"finish({{'summary': {self.summary_text_p1!r}}})",
+            f"finish({{'summary': {self.summary_text_p2!r}}})",
             f"finish({{'summary': {self.summary_text!r}, "
             "'documents': [{'path': 'index.md', 'title': 'Root', 'content': 'runtime summary with enough project detail for validation'}, "
             "{'path': 'README.md', 'title': 'README', 'content': 'readme details'}]})"
-        )
+        ]
 
     def tearDown(self):
         shutil.rmtree(self.test_dir)
@@ -459,6 +461,8 @@ class TestRLMRuntimeAnalyzerIntegration(unittest.TestCase):
 
     def test_child_query_integration(self):
         responses = [
+            "finish({'summary': '## Major directories\\n\\n- `.`: fixture project root.'})",
+            "finish({'summary': '## Relationships\\n\\n- `app.py` is the main file.\\n\\n```mermaid\\ngraph TD;\\napp-->Root\\n```'})",
             "child_result = llm_query('Analyze app.py', {'path': 'app.py'})\n"
             "summary = f'Parent saw: {child_result}; app.py was inspected through a child query.' + "
             f"{REQUIRED_SUMMARY_SECTIONS!r}\n"
@@ -501,7 +505,11 @@ class TestRLMRuntimeAnalyzerIntegration(unittest.TestCase):
             "Controller synthesized project-level responsibilities from selected artifacts."
         )
         analyzer, _ = self._make_analyzer(
-            [f"finish({{'summary': {summary_text!r}}})"],
+            [
+                "finish({'summary': '## Major directories\\n\\n- `.`: fixture project root.'})",
+                "finish({'summary': '## Relationships\\n\\n- `app.py` is main.\\n\\n```mermaid\\ngraph TD;\\napp-->Root\\n```'})",
+                f"finish({{'summary': {summary_text!r}}})",
+            ],
             max_steps=1,
         )
 
@@ -521,6 +529,8 @@ class TestRLMRuntimeAnalyzerIntegration(unittest.TestCase):
     def test_controller_reads_worker_artifacts_for_synthesis(self):
         analyzer, _ = self._make_analyzer(
             [
+                "finish({'summary': '## Major directories\\n\\n- `.`: fixture project root.'})",
+                "finish({'summary': '## Relationships\\n\\n- `app.py` is main.\\n\\n```mermaid\\ngraph TD;\\napp-->Root\\n```'})",
                 "roots = list_artifacts('.')\n"
                 "manifest = read_artifact_json('manifest.json')\n"
                 "hit = grep_artifacts('deterministic worker')[0]\n"
@@ -558,6 +568,8 @@ class TestRLMRuntimeAnalyzerIntegration(unittest.TestCase):
     def test_recorded_source_documents_satisfy_summary_only_finish(self):
         summary_text = _summary_with_required_sections("Finished with recorded source documents attached by the runtime.")
         responses = [
+            "finish({'summary': '## Major directories\\n\\n- `.`: fixture project root.'})",
+            "finish({'summary': '## Relationships\\n\\n- `app.py` is main.\\n\\n```mermaid\\ngraph TD;\\napp-->Root\\n```'})",
             "record_document('app.py.md', 'app.py', 'app.py defines hello and is covered by a recorded source document.')\n"
             f"finish({{'summary': {summary_text!r}}})",
         ]
@@ -576,6 +588,8 @@ class TestRLMRuntimeAnalyzerIntegration(unittest.TestCase):
         analyzer, client = self._make_analyzer(
             [
                 "This is not python code.",
+                "finish({'summary': '## Major directories\\n\\n- `.`: fixture project root.'})",
+                "finish({'summary': '## Relationships\\n\\n- `app.py` is main.\\n\\n```mermaid\\ngraph TD;\\napp-->Root\\n```'})",
                 "summary = 'Recovered after invalid code and produced a substantive project analysis.' + "
                 f"{REQUIRED_SUMMARY_SECTIONS!r}\n"
                 "finish({'summary': summary, "
