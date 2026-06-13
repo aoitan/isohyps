@@ -107,9 +107,20 @@ def extract_file_metadata(path: Path, root: Path, previous_meta: dict[str, Any] 
     is_test_file = abs_path.stem.startswith("test_") or abs_path.stem.endswith("_test")
     is_helper_file = any(w in abs_path.stem.lower() for w in ("helper", "util", "fixture", "mock", "stub"))
 
+    # よくある設定ファイル・デプロイファイル等のリスト
+    config_names = {
+        "pyproject.toml", "requirements.txt", "package.json", "Makefile", "setup.py", 
+        "uv.lock", "Cargo.toml", "CMakeLists.txt", "go.mod", "go.sum", ".gitignore", 
+        "pnpm-lock.yaml", "yarn.lock", "Dockerfile", "docker-compose.yml", "compose.yml", 
+        "compose.yaml", ".dockerignore", ".editorconfig", "conftest.py", "__init__.py"
+    }
+
+    is_github_asset = any(p == ".github" for p in parent_parts)
+    is_config_extension = abs_path.suffix.lower() in (".yaml", ".yml", ".json", ".toml", ".xml", ".ini", ".cfg")
+
     if is_test_dir or (is_test_file and not is_helper_file):
         kind = "test"
-    elif abs_path.name in ("pyproject.toml", "requirements.txt", "package.json", "Makefile", "setup.py", "uv.lock", "Cargo.toml", "CMakeLists.txt", "go.mod", "go.sum", ".gitignore", "pnpm-lock.yaml", "yarn.lock"):
+    elif abs_path.name in config_names or is_github_asset or is_config_extension:
         kind = "config"
     elif any(p in ("docs", "doc", "wiki") for p in parent_parts) or abs_path.suffix.lower() in (".md", ".rst", ".txt", ".pdf") or abs_path.name == "LICENSE":
         kind = "doc"
@@ -465,6 +476,154 @@ def detect_attention_points(
     return attention
 
 
+
+def resolve_module_to_path(module_name: str, src_files: list[str], current_file: str) -> str | None:
+    # 1. 相対インポートの解決
+    if module_name.startswith("."):
+        dots_count = 0
+        for char in module_name:
+            if char == ".":
+                dots_count += 1
+            else:
+                break
+        
+        curr_parts = current_file.split("/")
+        if len(curr_parts) > dots_count:
+            base_dir_parts = curr_parts[:-dots_count]
+            rem_mod = module_name[dots_count:]
+            if rem_mod:
+                resolved_parts = base_dir_parts + rem_mod.split(".")
+            else:
+                resolved_parts = base_dir_parts
+            
+            possible_rel_path = "/".join(resolved_parts)
+            for src in src_files:
+                src_no_ext = src.rsplit(".", 1)[0]
+                if src_no_ext == possible_rel_path:
+                    return src
+                if src_no_ext + "/__init__" == possible_rel_path:
+                    return src
+        return None
+
+    # 2. 絶対インポートの解決
+    for src in src_files:
+        src_no_ext = src.rsplit(".", 1)[0]
+        dotted_src = src_no_ext.replace("/", ".")
+        if dotted_src == module_name:
+            return src
+        if src_no_ext.endswith("/__init__"):
+            package_dotted = src_no_ext[:-9].replace("/", ".")
+            if package_dotted == module_name:
+                return src
+        # パッケージの階層構造（サブモジュールやクラスなどのインポート）に対応
+        if module_name.startswith(dotted_src + "."):
+            return src
+
+    return None
+
+
+def build_dependency_graph(files_meta: list[dict[str, Any]], symbols_list: list[dict[str, Any]]) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    # kind == "source" かつ language != "unknown" の通常ソースファイルのみを対象とする
+    files = [m["path"] for m in files_meta if m["kind"] == "source" and m["language"] != "unknown"]
+    symbols_by_path = {sym["path"]: sym for sym in symbols_list}
+    
+    forward_graph = {f: [] for f in files}
+    backward_graph = {f: [] for f in files}
+    
+    for f in files:
+        if f not in symbols_by_path:
+            continue
+        sym_info = symbols_by_path[f]
+        imports = sym_info.get("imports", [])
+        
+        for imp in imports:
+            mod_name = imp["module"]
+            resolved_path = resolve_module_to_path(mod_name, files, f)
+            if resolved_path and resolved_path != f:
+                if resolved_path not in forward_graph[f]:
+                    forward_graph[f].append(resolved_path)
+                if f not in backward_graph[resolved_path]:
+                    backward_graph[resolved_path].append(f)
+                    
+    return forward_graph, backward_graph
+
+
+def topological_sort(graph: dict[str, list[str]]) -> list[str]:
+    # 入次数を計算
+    in_degree = {u: 0 for u in graph}
+    for u in graph:
+        for v in graph[u]:
+            in_degree[v] = in_degree.get(v, 0) + 1
+            
+    # 入次数0のノードをキューに追加 (決定論的な順序を保つためソート)
+    queue = sorted([u for u in graph if in_degree[u] == 0])
+    order = []
+    
+    while queue:
+        u = queue.pop(0)
+        order.append(u)
+        
+        for v in sorted(graph.get(u, [])):
+            in_degree[v] -= 1
+            if in_degree[v] == 0:
+                queue.append(v)
+                queue.sort() # キューの中身を常にソートして決定論的な取り出し順を保つ
+                
+    # 循環参照などによりソートしきれなかったノードを決定論的順序で追加 (無限ループ防止ガード)
+    remaining = sorted([u for u in graph if u not in order])
+    if remaining:
+        order.extend(remaining)
+        
+    return order
+
+
+def generate_mermaid_graph(forward_graph: dict[str, list[str]]) -> str:
+    # 描画制限: ノード数が 50 を超える場合は描画をスキップして警告
+    total_nodes = len(forward_graph)
+    if total_nodes > 50:
+        return (
+            "```text\n"
+            "Dependency graph is too large to display as a Mermaid diagram.\n"
+            f"Total files: {total_nodes} (limit: 50)\n"
+            "```"
+        )
+        
+    lines = ["```mermaid", "graph TD"]
+    
+    # 依存関係（エッジ）があるノード、または依存されているノードのみを描画対象とする
+    active_nodes = set()
+    for u, vs in forward_graph.items():
+        if vs:
+            active_nodes.add(u)
+            for v in vs:
+                active_nodes.add(v)
+                
+    if not active_nodes:
+        return "*(No internal module dependencies detected)*"
+        
+    # ノードの定義 (IDとラベル)
+    node_ids = {}
+    for i, node in enumerate(sorted(list(active_nodes))):
+        node_ids[node] = f"node_{i}"
+        label = node
+        parts = Path(node).parts
+        if len(parts) > 1:
+            label = f"{parts[-2]}/{parts[-1]}"
+        lines.append(f"  {node_ids[node]}[\"{label}\"]")
+        
+    # エッジの定義
+    for u in sorted(forward_graph.keys()):
+        if u not in node_ids:
+            continue
+        for v in sorted(forward_graph[u]):
+            if v not in node_ids:
+                continue
+            lines.append(f"  {node_ids[u]} --> {node_ids[v]}")
+            
+    lines.append("```")
+    return "\n".join(lines)
+
+
 def parse_gitignore(root: Path) -> list[str]:
     gitignore_path = root / ".gitignore"
     if not gitignore_path.exists():
@@ -725,6 +884,8 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
         
     analysis_report += (
         f"### Extra Docs Without Matching Source\n\n"
+        f"- (none)\n\n"
+        f"### Weak Or Failed Docs\n\n"
         f"- (none)\n\n"
         f"## Step History\n\n"
         f"| Step | Kind | Status | Summary |\n"
