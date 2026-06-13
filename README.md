@@ -37,7 +37,7 @@ Python 3.10以降と [uv](https://docs.astral.sh/uv/) が必要です。
 
 ```bash
 # リポジトリのクローン（またはディレクトリへ移動）
-cd isohyps
+cd isohype
 
 # ロックファイルに基づいて依存ライブラリを同期
 uv sync
