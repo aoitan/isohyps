@@ -4,6 +4,7 @@ import os
 import ast
 import re
 import json
+import fnmatch
 import hashlib
 import subprocess
 from pathlib import Path, PurePosixPath
@@ -435,6 +436,56 @@ def detect_attention_points(
     return attention
 
 
+def parse_gitignore(root: Path) -> list[str]:
+    gitignore_path = root / ".gitignore"
+    if not gitignore_path.exists():
+        return []
+    patterns = []
+    with open(gitignore_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            # 空行、コメント、および否定パターンは簡易除外では処理しないため無視リストから除外
+            if not line or line.startswith("#") or line.startswith("!"):
+                continue
+            patterns.append(line)
+    return patterns
+
+
+def should_ignore(path: Path, root: Path, gitignore_patterns: list[str]) -> bool:
+    try:
+        rel_path = path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return True
+    rel_path_str = rel_path.as_posix()
+    
+    # ハードコードされた無視ディレクトリ
+    ignore_dirs = {".git", "__pycache__", "venv", ".venv", ".env", "node_modules", ".vscode", ".idea", "dist", "build"}
+    # 明示的に無視したい一時・キャッシュディレクトリ
+    extra_ignore_dirs = {".pytest_cache", ".serena", ".kelpie"}
+    
+    for part in rel_path.parts:
+        if part in ignore_dirs or part in extra_ignore_dirs or part.endswith(".egg-info"):
+            return True
+
+    # .gitignore パターンマッチ
+    for pattern in gitignore_patterns:
+        # ディレクトリ制限の処理
+        if pattern.endswith("/"):
+            p = pattern.rstrip("/")
+            if any(fnmatch.fnmatch(part, p) for part in rel_path.parts):
+                return True
+        else:
+            # 任意のファイル・ディレクトリ名にマッチ
+            if fnmatch.fnmatch(rel_path_str, pattern) or any(fnmatch.fnmatch(part, pattern) for part in rel_path.parts):
+                return True
+            # ルートからの絶対的な指定
+            if pattern.startswith("/"):
+                p = pattern.lstrip("/")
+                if fnmatch.fnmatch(rel_path_str, p):
+                    return True
+    return False
+
+
 def generate_machine_report(
     root: Path,
     files_meta: list[dict[str, Any]],
@@ -519,14 +570,16 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
         except Exception:
             pass
 
+    # .gitignore パターンの取得
+    gitignore_patterns = parse_gitignore(root)
+
     # ファイルの走査
-    ignore_list = {".git", "__pycache__", "venv", ".venv", ".env", "node_modules", ".vscode", ".idea", "dist", "build"}
     all_files = []
+    ignored_count = 0
     for p in sorted(root.rglob("*")):
         if p.is_file() and not p.is_symlink():
-            # 無視ディレクトリのチェック
-            rel_parts = p.relative_to(root).parts
-            if any(part in ignore_list for part in rel_parts):
+            if should_ignore(p, root, gitignore_patterns):
+                ignored_count += 1
                 continue
             all_files.append(p)
 
@@ -565,5 +618,54 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
     report_path = output_dir / "machine_report.md"
     report_content = generate_machine_report(root, files_meta, repo_map, attention)
     report_path.write_text(report_content, encoding="utf-8")
+
+    # analysis_report.md の自動合成
+    analysis_report = (
+        f"# Project Analysis Report: {root.name}\n\n"
+        f"**Root Directory:** `{root}`  \n"
+        f"**Backend:** none (machine scan only)  \n"
+        f"**Runtime:** controller  \n"
+        f"**Status:** success  \n"
+        f"**Total Files Scanned:** {len(all_files)}  \n"
+        f"**Total Steps Used:** 0  \n"
+        f"**Total Tokens Used:** 0  \n\n"
+        f"## Executive Summary\n"
+        f"This report summarizes the static machine scan of the project. No LLM resources were utilized.\n\n"
+        f"## Machine Analysis Status\n"
+        f"- **Source Coverage:** 0%\n"
+        f"- **Attention Points Detected:** {len(attention)} items\n"
+        f"- **Active Files Count:** {len(all_files)}\n"
+        f"- **Ignored Files Count:** {ignored_count}\n\n"
+        f"Refer to [machine_report.md](./machine_report.md) for the detailed inventory and symbol details.\n"
+    )
+    (output_dir / "analysis_report.md").write_text(analysis_report, encoding="utf-8")
+
+    # index.md の自動合成
+    changed_files = [m["path"] for m in files_meta if m["status"] in ("changed", "added")]
+    index_content = (
+        f"# Directory: {root.name}\n\n"
+        f"Welcome to the static analysis index for `{root.name}`.\n\n"
+        f"## Project Summary\n"
+        f"- **Total Source Files:** {len(all_files)}\n"
+        f"- **Status:** Static Scan Complete\n\n"
+        f"## Stale or Newly Added Files (Need Explanation)\n"
+        f"These files are either new or modified, and their corresponding documentation (if any) may be stale.\n"
+    )
+    if changed_files:
+        for cf in changed_files:
+            cf_status = next((m["status"] for m in files_meta if m["path"] == cf), "added")
+            index_content += f"- [ ] `{cf}` (Status: {cf_status})\n"
+    else:
+        index_content += "- No modified or added files detected. All files are unchanged.\n"
+        
+    index_content += "\n## High Priority Files to Inspect (Attention Points)\nThese files have warnings or high complexity:\n"
+    if attention:
+        for att in attention:
+            index_content += f"- {att}\n"
+    else:
+        index_content += "- No critical attention points.\n"
+        
+    index_content += f"\n## Directory Structure Overview\nRefer to [machine_report.md](./machine_report.md) for the full inventory.\n"
+    (output_dir / "index.md").write_text(index_content, encoding="utf-8")
 
     return result

@@ -204,5 +204,82 @@ class TestMachineAnalysis(unittest.TestCase):
         self.assertIn("## Repo Map Summary", report_content)
         self.assertIn("## Attention Points", report_content)
 
+    def test_gitignore_filtering(self):
+        # .gitignore ファイルの作成
+        gitignore_file = self.test_dir / ".gitignore"
+        gitignore_file.write_text(
+            "# ignore python caches\n"
+            "__pycache__/\n"
+            "*.pyc\n"
+            "# ignore build artifacts\n"
+            "dist/\n"
+            "build/\n"
+            "# ignore test temp directory\n"
+            "temp_to_ignore/\n"
+            "# neglect complex negation pattern for safety\n"
+            "!src/keep_me.py\n",
+            encoding="utf-8"
+        )
+        
+        # 除外されるべきフォルダとファイルの作成
+        ignored_dir = self.test_dir / "temp_to_ignore"
+        ignored_dir.mkdir()
+        ignored_file = ignored_dir / "should_be_ignored.py"
+        ignored_file.write_text("print('ignored')", encoding="utf-8")
+        
+        # 除外されるべきキャッシュフォルダの作成
+        pytest_cache_dir = self.test_dir / ".pytest_cache"
+        pytest_cache_dir.mkdir()
+        pytest_cache_file = pytest_cache_dir / "nodeids"
+        pytest_cache_file.write_text("nodeid_data", encoding="utf-8")
+        
+        serena_dir = self.test_dir / ".serena"
+        serena_dir.mkdir()
+        serena_file = serena_dir / "document_symbols.pkl"
+        serena_file.write_text("pickle_data", encoding="utf-8")
+
+        egg_info_dir = self.test_dir / "test_project.egg-info"
+        egg_info_dir.mkdir()
+        egg_info_file = egg_info_dir / "PKG-INFO"
+        egg_info_file.write_text("pkg_info_data", encoding="utf-8")
+        
+        # 無視されない通常ファイル
+        kept_file = self.src_dir / "keep_me.py"
+        kept_file.write_text("print('keep')", encoding="utf-8")
+        
+        result = analyze_machine_level(self.test_dir, self.output_dir)
+        files_paths = [f["path"] for f in result["files"]]
+        
+        # 無視されるべきファイルが含まれていないことを確認
+        self.assertNotIn("temp_to_ignore/should_be_ignored.py", files_paths)
+        self.assertNotIn(".pytest_cache/nodeids", files_paths)
+        self.assertNotIn(".serena/document_symbols.pkl", files_paths)
+        self.assertNotIn("test_project.egg-info/PKG-INFO", files_paths)
+        
+        # 通常ファイルが維持されていることを確認
+        self.assertIn("src/keep_me.py", files_paths)
+
+    def test_machine_synthesized_reports(self):
+        analyze_machine_level(self.test_dir, self.output_dir)
+        
+        index_path = self.output_dir / "index.md"
+        report_path = self.output_dir / "analysis_report.md"
+        
+        self.assertTrue(index_path.exists())
+        self.assertTrue(report_path.exists())
+        
+        # analysis_report.md の検証
+        report_content = report_path.read_text(encoding="utf-8")
+        self.assertIn("Status:** success", report_content)
+        self.assertIn("Source Coverage:** 0%", report_content)
+        self.assertIn("Backend:** none (machine scan only)", report_content)
+        
+        # index.md の検証
+        index_content = index_path.read_text(encoding="utf-8")
+        self.assertIn("Directory: " + self.test_dir.name, index_content)
+        self.assertIn("Stale or Newly Added Files", index_content)
+        self.assertIn("High Priority Files to Inspect", index_content)
+
 if __name__ == "__main__":
     unittest.main()
+
