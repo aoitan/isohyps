@@ -102,11 +102,16 @@ def extract_file_metadata(path: Path, root: Path, previous_meta: dict[str, Any] 
     # ファイル種別の判定 (kind)
     kind = "source"
     parts = Path(rel_path).parts
-    if any(p == "tests" or p == "test" or p.startswith("test_") for p in parts) or abs_path.stem.startswith("test_") or abs_path.stem.endswith("_test"):
+    parent_parts = parts[:-1]
+    is_test_dir = any(p in ("tests", "test") or p.startswith("test_") for p in parent_parts)
+    is_test_file = abs_path.stem.startswith("test_") or abs_path.stem.endswith("_test")
+    is_helper_file = any(w in abs_path.stem.lower() for w in ("helper", "util", "fixture", "mock", "stub"))
+
+    if is_test_dir or (is_test_file and not is_helper_file):
         kind = "test"
     elif abs_path.name in ("pyproject.toml", "requirements.txt", "package.json", "Makefile", "setup.py", "uv.lock", "Cargo.toml", "CMakeLists.txt", "go.mod", "go.sum", ".gitignore", "pnpm-lock.yaml", "yarn.lock"):
         kind = "config"
-    elif any(p in ("docs", "doc", "wiki") for p in parts) or abs_path.suffix.lower() in (".md", ".rst", ".txt", ".pdf") or abs_path.name == "LICENSE":
+    elif any(p in ("docs", "doc", "wiki") for p in parent_parts) or abs_path.suffix.lower() in (".md", ".rst", ".txt", ".pdf") or abs_path.name == "LICENSE":
         kind = "doc"
     elif is_probably_binary(abs_path):
         kind = "other"
@@ -648,8 +653,13 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
     stale_docs = []
     valid_docs = []
     
-    # 対象ファイル： kind が source または test であり、バイナリやエラーでないもの
-    coverage_targets = [m for m in files_meta if m["kind"] in ("source", "test") and m["hash"] not in ("binary_skipped", "error")]
+    # 対象ファイル： kind が source であり、かつ言語が判明しており（unknown でない）、バイナリやエラーでないもの
+    coverage_targets = [
+        m for m in files_meta 
+        if m["kind"] == "source" 
+        and m["language"] != "unknown" 
+        and m["hash"] not in ("binary_skipped", "error")
+    ]
     
     for meta in coverage_targets:
         rel_path = meta["path"]
@@ -681,29 +691,50 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
     documented_count = total_targets - len(missing_docs)
     coverage_percent = (documented_count / total_targets * 100) if total_targets > 0 else 100.0
 
-    # analysis_report.md の自動合成
+    # analysis_report.md の自動合成 (コントローラー互換フォーマット)
+    percent_str = f"{coverage_percent:.1f}%"
     analysis_report = (
         f"# Project Analysis Report: {root.name}\n\n"
         f"**Root Directory:** `{root}`  \n"
         f"**Backend:** none (machine scan only)  \n"
         f"**Runtime:** controller  \n"
-        f"**Status:** success  \n"
-        f"**Total Files Scanned:** {len(all_files)}  \n"
-        f"**Total Steps Used:** 0  \n"
-        f"**Total Tokens Used:** 0  \n\n"
-        f"## Executive Summary\n"
+        f"**Status:** finished  \n"
+        f"**Steps Used:** 0  \n"
+        f"**Approx Tokens:** 0  \n"
+        f"**Worker Budget:** 0 tokens, 0 LLM calls  \n"
+        f"**Synthesis RLM Budget:** 0 tokens, 0 LLM calls  \n"
+        f"**Global Budget:** 0 tokens, 0 LLM calls  \n\n"
+        f"## Executive Summary\n\n"
         f"This report summarizes the static machine scan of the project. No LLM resources were utilized.\n\n"
-        f"## Machine Analysis Status\n"
-        f"- **Source Coverage:** {coverage_percent:.1f}%\n"
-        f"- **Attention Points Detected:** {len(attention)} items\n"
-        f"- **Active Files Count:** {len(all_files)}\n"
-        f"- **Ignored Files Count:** {ignored_count}\n\n"
-        f"Refer to [machine_report.md](./machine_report.md) for the detailed inventory and symbol details.\n"
+        f"## Source Coverage\n\n"
+        f"- Source files discovered: {total_targets}\n"
+        f"- Source files with matching docs: {documented_count}\n"
+        f"- Source files missing matching docs: {len(missing_docs)}\n"
+        f"- Extra docs without matching source: 0\n"
+        f"- Weak or failed docs: 0\n"
+        f"- Fallback docs generated: 0\n"
+        f"- Coverage: {percent_str}\n\n"
+        f"### Fallback Generated Source Docs\n\n"
+        f"- (none)\n\n"
+        f"### Missing Source Docs\n\n"
+    )
+    if missing_docs:
+        analysis_report += "\n".join(f"- `{path}`" for path in sorted(missing_docs)) + "\n\n"
+    else:
+        analysis_report += "- (none)\n\n"
+        
+    analysis_report += (
+        f"### Extra Docs Without Matching Source\n\n"
+        f"- (none)\n\n"
+        f"## Step History\n\n"
+        f"| Step | Kind | Status | Summary |\n"
+        f"| :--- | :--- | :--- | :--- |\n"
+        f"| 1 | machine_scan | OK | Static machine scan completed successfully. |\n"
     )
     (output_dir / "analysis_report.md").write_text(analysis_report, encoding="utf-8")
 
     # index.md の自動合成
-    changed_files = [m["path"] for m in files_meta if m["status"] in ("changed", "added")]
+    changed_files = [m["path"] for m in files_meta if m["status"] in ("changed", "added") and m["kind"] == "source" and m["language"] != "unknown"]
     # 解説が必要なファイル（新規・変更されたファイル、解説欠損、陳腐化ドキュメント）
     needs_explanation = set(changed_files) | set(missing_docs) | set(stale_docs)
     

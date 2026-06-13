@@ -106,6 +106,24 @@ class TestMachineAnalysis(unittest.TestCase):
         meta_toml = extract_file_metadata(self.toml_file, self.test_dir)
         self.assertEqual(meta_toml["kind"], "config")
 
+        # 通常ソースだが「test」を含むファイル名の境界値テスト
+        helpers_file = self.src_dir / "test_helpers.py"
+        helpers_file.write_text("def helper(): pass", encoding="utf-8")
+        meta_helpers = extract_file_metadata(helpers_file, self.test_dir)
+        self.assertEqual(meta_helpers["kind"], "source")
+
+        tester_file = self.src_dir / "auth_tester.py"
+        tester_file.write_text("class AuthTester: pass", encoding="utf-8")
+        meta_tester = extract_file_metadata(tester_file, self.test_dir)
+        self.assertEqual(meta_tester["kind"], "source")
+
+        # 独自パッケージフォルダ配下のテストヘルパーの境界値テスト
+        kuroko_helpers = self.test_dir / "kuroko/test_utils.py"
+        kuroko_helpers.parent.mkdir(parents=True, exist_ok=True)
+        kuroko_helpers.write_text("def helper(): pass", encoding="utf-8")
+        meta_kuroko_helpers = extract_file_metadata(kuroko_helpers, self.test_dir)
+        self.assertEqual(meta_kuroko_helpers["kind"], "source")
+
     def test_extract_file_symbols(self):
         # シンボル抽出テスト
         symbols_info = extract_file_symbols(self.runner_file, self.test_dir)
@@ -278,14 +296,22 @@ class TestMachineAnalysis(unittest.TestCase):
         self.assertTrue(report_path.exists())
         
         report_content = report_path.read_text(encoding="utf-8")
-        self.assertIn("Status:** success", report_content)
-        self.assertIn("Source Coverage:** 0.0%", report_content)
+        # コントローラー互換フォーマットの検証
+        self.assertIn("Status:** finished", report_content)
+        self.assertIn("Steps Used:** 0", report_content)
+        self.assertIn("Approx Tokens:** 0", report_content)
+        self.assertIn("## Source Coverage", report_content)
+        self.assertIn("Source files discovered:", report_content)
+        self.assertIn("Source files missing matching docs:", report_content)
         
         index_content = index_path.read_text(encoding="utf-8")
         self.assertIn("Directory: " + self.test_dir.name, index_content)
         self.assertIn("Stale or Newly Added Files", index_content)
-        # ドキュメントがないため、すべてのソースファイルが Stale/Missing（要説明）として検出されること
+        # 通常のソースファイルは要説明として検出されること
         self.assertIn("src/runner.py", index_content)
+        # テストファイルや設定ファイルは要説明に入っていないこと
+        self.assertNotIn("tests/test_runner.py", index_content)
+        self.assertNotIn("pyproject.toml", index_content)
 
     def test_coverage_and_stale_detection(self):
         # 2回目：ダミー解説ドキュメントを配置してカバレッジやStaleを検証するテスト
@@ -315,14 +341,16 @@ class TestMachineAnalysis(unittest.TestCase):
         
         report_content = report_path.read_text(encoding="utf-8")
         # runner.py と config.py にドキュメントが存在するため、
-        # ドキュメントありは 2 ファイルなのでカバレッジが 0% より大きくなること
-        self.assertNotIn("Source Coverage:** 0.0%", report_content)
+        # カバレッジが 0% より大きくなること
+        self.assertNotIn("Coverage: 0.0%", report_content)
         
         index_content = index_path.read_text(encoding="utf-8")
         # config.py は stale としてリストされること
         self.assertTrue(any("config.py" in line and "stale" in line for line in index_content.splitlines()))
-        # runner.py は valid なので、git modified などの別の理由がない限り index.md の「要説明」から除外されるか、あるいは valid として表示されないこと
+        # runner.py は valid なので、git modified などの別の理由がない限り index.md の「要説明」から除外されること
         self.assertFalse(any("src/runner.py" in line and "missing" in line for line in index_content.splitlines()))
+        # テストファイルは missing doc と判定されないため、リストされないこと
+        self.assertNotIn("tests/test_runner.py", index_content)
 
 if __name__ == "__main__":
     unittest.main()
