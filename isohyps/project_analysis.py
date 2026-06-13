@@ -21,7 +21,7 @@ from isohyps.rlm_runtime import (
 )
 
 
-PROJECT_ANALYSIS_CHILD_MAX_STEPS = 3
+PROJECT_ANALYSIS_CHILD_MAX_STEPS = 5
 
 
 class AnalysisDocumentDict(TypedDict, total=False):
@@ -72,6 +72,10 @@ DEFAULT_GOAL_TEMPLATE_PHASE2 = (
     "Examine relationships.json and import hubs to map component interactions. "
     "In the 'summary' output, you MUST include a Mermaid diagram (```mermaid) showing component interactions, "
     "followed by detailed text explanations in Japanese. "
+    "Build the Phase 2 summary with this Python shape: "
+    "summary_lines = ['## Relationships', '', '```mermaid', 'graph TD', '  CLI --> Runtime', '  Runtime --> Workers', '```', '', '- Explain the real observed relationships.']; "
+    "summary = '\\n'.join(summary_lines); finish({{'summary': summary}}). "
+    "Replace the example nodes with observed components. Do not use triple-quoted strings or f-strings for this summary. "
     "Finish with a dict containing a string 'summary' containing the Mermaid diagram and explanations."
 )
 
@@ -79,7 +83,10 @@ DEFAULT_GOAL_TEMPLATE_PHASE3 = (
     "Phase 3: Synthesize the final project analysis report for the repository rooted at '{root_name}'. "
     "Combine Architecture Overview: {phase1_summary} "
     "and Relationships with Mermaid diagram: {phase2_summary}. "
-    "Integrate uncertainties and file-level information to build the final report. "
+    "Before synthesis, inspect the artifact environment with list_artifacts('.'), read_artifact_json('manifest.json'), "
+    "read_artifact_json('relationships.json'), and selected read_artifact('source-docs/...') snippets for important files. "
+    "Use those artifact observations as the source of file-level information; do not rely only on Phase 1 or Phase 2 text. "
+    "Integrate uncertainties and file-level artifact information to build the final report. "
     "The final summary MUST include exactly these Markdown sections: "
     "## Major directories, ## Important files, ## Relationships, and ## Uncertainties. "
     "Write the text in Japanese. "
@@ -161,6 +168,8 @@ def validate_project_analysis_finish(value: Any, source_files: list[str] | None 
         errors.append(
             "Expected 'summary' to include required Markdown sections: " + ", ".join(missing_sections) + "."
         )
+    if "## Relationships" in summary_lines and "```mermaid" not in lowered_summary:
+        errors.append("Expected 'summary' Relationships section to include a Mermaid diagram (```mermaid).")
     for shallow_phrase in (
         "initial exploration",
         "exploration of the root directory",
@@ -170,6 +179,35 @@ def validate_project_analysis_finish(value: Any, source_files: list[str] | None 
         if shallow_phrase in lowered_summary:
             errors.append(
                 "Summary appears to describe an initial/root-only exploration. Continue inspecting important directories before finish()."
+            )
+            break
+    for failed_report_phrase in (
+        "## child query fallback",
+        "[directory name]",
+        "[file path]",
+        "[role]",
+        "[description]",
+        "[uncertainty 1]",
+        "graph td\n  a --> b",
+        "budget_exceeded",
+        "execution_error",
+        "invalid_code",
+        "model_error",
+        "this section was not separated in the model output",
+        "予算制限により中断",
+        "予算制限により中断された",
+        "フォールバック情報",
+        "具体的なプロジェクトの構造に関する情報は含まれていません",
+        "コンテキスト内にディレクトリの情報は見当たりません",
+        "解析失敗のため詳細不明",
+        "明示的な依存関係のグラフは生成されませんでした",
+        "定義された関係性は存在しません",
+        "解析が中断されたため",
+    ):
+        if failed_report_phrase in lowered_summary:
+            errors.append(
+                "Summary appears to contain child-query fallback, execution failure, or placeholder text. "
+                "Regenerate a substantive project analysis before finish()."
             )
             break
 
@@ -206,6 +244,16 @@ def normalize_analysis_result(value: Any) -> Any:
             normalized["summary"] = nested_summary
             if "documents" not in normalized and isinstance(summary.get("documents"), list):
                 normalized["documents"] = summary["documents"]
+    summary = normalized.get("summary")
+    if isinstance(summary, str) and len(summary.strip()) >= 40:
+        summary_lines = {line.strip() for line in summary.splitlines()}
+        missing_sections = [section for section in REQUIRED_PROJECT_SUMMARY_SECTIONS if section not in summary_lines]
+        if missing_sections:
+            additions = [
+                f"{section}\n\n- This section was not separated in the model output; review the surrounding summary for available evidence."
+                for section in missing_sections
+            ]
+            normalized["summary"] = summary.rstrip() + "\n\n" + "\n\n".join(additions)
     return normalized
 
 
@@ -225,6 +273,11 @@ class ProjectAnalysisPromptBuilder(PromptBuilder):
     SYSTEM_PROMPT = (
         "You are operating a Recursive Language Model runtime for project analysis.\n"
         "Return only Python code and no prose.\n"
+        "CRITICAL SYNTAX RULES:\n"
+        "- Do not use triple-quoted strings (`\"\"\"` or `'''`) anywhere in generated code.\n"
+        "- Do not use f-strings anywhere in generated code.\n"
+        "- Build multi-line Markdown as a list of ordinary quoted strings, then join it with '\\n'.\n"
+        "- Example: summary = '\\n'.join(['## Major directories', '', '- `src/`: application code'])\n"
         "State persists across steps inside a Python sandbox.\n"
         "Use helpers instead of imports or direct OS access.\n"
         "Available helpers:\n"
@@ -248,7 +301,9 @@ class ProjectAnalysisPromptBuilder(PromptBuilder):
         "- Do not import modules.\n"
         "- Do not attempt network, subprocess, or filesystem mutation.\n"
         "- Do not assign to helper names such as list_dir, read_text, file_info, search_text, list_artifacts, read_artifact, read_artifact_json, grep_artifacts, read_json, path_exists, is_dir, extract_symbols, llm_query, or finish.\n"
+        "- Do not call unavailable helpers such as is_file(path). To test whether a path is a file, call info = file_info(path) and read info['is_file'].\n"
         "- `globals` and `locals` are functions, not dict variables. Do not write globals[...] or locals[...]; call globals() or locals() before membership checks or subscripting, such as globals()['name'].\n"
+        "- Avoid triple-quoted strings and f-strings in generated controller code. Build Markdown with ordinary quoted strings joined by '\\n' so the code remains syntactically valid.\n"
         "- All helper paths are relative to the analysis root. Use '.' for the root; do not prefix paths with the root directory name.\n"
         "- Prefer helper calls over large string constants.\n"
         "- A global variable `repo_map` is available in your environment. It is a partial map (up to depth 2, capped at 500 nodes) and includes `repo_map['source_worklist']`, the source files that need explanations. Use it as a starting point to understand the project structure, but always use helpers (like list_dir) to confirm details or explore deeper paths.\n"
@@ -256,24 +311,26 @@ class ProjectAnalysisPromptBuilder(PromptBuilder):
         "- Do not finish after only inspecting the root directory or README.\n"
         "- Inspect repo_map first, then confirm important areas with helpers.\n"
         "- Treat `repo_map['source_worklist']` as compact coverage context, not as a per-file documentation queue.\n"
-        "- File-level source documents are pre-generated by deterministic workers outside the controller as artifacts. Start with list_artifacts('.'), read_artifact_json('manifest.json'), and read_artifact_json('relationships.json'), then selectively read source-doc artifacts needed for synthesis. Use read_artifact() only for Markdown snippets. Do not loop over every source file to write source documents.\n"
+        "- File-level source documents are pre-generated by source-document workers outside the controller as artifacts. Start with list_artifacts('.'), read_artifact_json('manifest.json'), and read_artifact_json('relationships.json'), then selectively read source-doc artifacts needed for synthesis. Use read_artifact() only for Markdown snippets. Do not loop over every source file to write source documents.\n"
         "- Treat artifact paths such as `manifest.json`, `relationships.json`, and `source-docs/` as evidence indexes, not as project components to report under Major directories or Important files.\n"
         "- Do not rely on large artifact JSON objects persisting across steps. Re-read artifacts when needed, or keep only compact derived samples in state.\n"
         "- Select a small important path set only for project-level synthesis. Prefer entrypoints, CLI files, application/controller/runtime modules, import hubs, large or symbol-rich source files, and files explicitly named or implied by the user goal.\n"
         "- Deprioritize tests, __init__.py, generated/cache/build files, snapshots, fixtures, and simple config/data files unless the user goal targets them directly.\n"
-        "- Keep the child-query count controlled: call llm_query only for synthesis questions, not for every source file.\n"
+        "- For final project synthesis, do not call llm_query. Build the report from artifact observations and compact helper results in the sandbox.\n"
         "- The final value MUST include a substantive project-level summary. It may omit documents because worker source documents are attached by the runtime.\n"
-        "- Before finish, inspect at least two important non-root directories with list_dir(), file_info(), read_text(), extract_symbols(), or llm_query().\n"
+        "- Before finish, inspect at least two important non-root directories with list_dir(), file_info(), read_text(), or extract_symbols().\n"
         "- Prioritize code, test, document, and configuration areas when present.\n"
-        "- Use llm_query for focused subproblems, such as summarizing a large directory or a cluster of files.\n"
         "- The final summary should describe observed components and responsibilities, not just say exploration started.\n"
         "- Include project-specific top-level source directories from `repo_map['source_worklist']` in `observed_dirs`, even when their repo_map node category is `unknown`, so project packages are not replaced by artifact metadata directories.\n"
         "- When artifact_documents or source_doc_snippets contain concrete paths, the `## Important files` section MUST name those observed paths and their roles. Do not say concrete file paths are unavailable when the manifest or snippets list them.\n"
+        "- The final summary MUST start with one or two Japanese prose sentences with no Markdown heading. This leading paragraph is the Executive Summary body.\n"
         "- The final summary MUST include these Markdown sections: `## Major directories`, `## Important files`, `## Relationships`, and `## Uncertainties`.\n"
-        "- Before calling finish(), check that summary contains each required heading exactly once. If any heading is missing, build a replacement Markdown string with all required headings instead of finishing invalid output.\n"
+        "- Before calling finish(), make a best-effort check that summary contains each required heading exactly once. If the generated summary is incomplete, revise the Markdown locally; do not call llm_query to repair it and do not raise your own AssertionError for summary heading validation because the host validator performs final validation.\n"
         "Invalid controller-code examples:\n"
         "import os\n"
         "from pathlib import Path\n"
+        "is_file('src/app.py')\n"
+        "summary = f'''## Major directories\n"
         "finish({'summary': 'Initial Survey Complete.'})\n"
         "finish('## Major directories\\n\\n- Only a bare string result.')\n"
         "Valid controller-code example:\n"
@@ -313,21 +370,31 @@ class ProjectAnalysisPromptBuilder(PromptBuilder):
         "details = []\n"
         "for path in important_paths:\n"
         "    details.append({'path': path, 'info': file_info(path), 'symbols': extract_symbols(path)})\n"
-        "summary = llm_query(\n"
-        "    'Write a concise Japanese Markdown project index from the selected artifact context. Include exactly these sections: ## Major directories, ## Important files, ## Relationships, and ## Uncertainties. Summarize lists, dicts, JSON, and search hits into readable prose and bullets. Do not paste raw Python repr, raw JSON fragments, Artifact signals, Manifest snippet, Step History, or execution errors into the report.',\n"
-        "    {\n"
-        "        'artifact_roots': artifact_roots,\n"
-        "        'artifact_documents': artifact_docs[:50],\n"
-        "        'relationship_sample': relation_sample,\n"
-        "        'source_doc_snippets': source_doc_snippets,\n"
-        "        'observed_dirs': observed_dirs,\n"
-        "        'important_file_details': details,\n"
-        "        'coverage_note': 'Worker-generated source documents are attached outside controller state.',\n"
-        "    },\n"
-        ")\n"
+        "summary_lines = ['このレポートは worker が生成したファイル解析 artifact と関係 artifact をもとに、主要な構造と不確実性を統合したものです。', 'RLM controller は必要な artifact だけを読み、全文を state に保持せずに最終要約を作成します。', '', '## Major directories']\n"
+        "for observed in observed_dirs:\n"
+        "    summary_lines.append('- `' + observed['path'] + '`: ' + str(len(observed['items'])) + ' entries observed.')\n"
+        "summary_lines.extend(['', '## Important files'])\n"
+        "for detail in details:\n"
+        "    info = detail.get('info', {})\n"
+        "    symbols = detail.get('symbols', {}).get('symbols', [])\n"
+        "    role = 'symbols=' + str(len(symbols)) + ', lines=' + str(info.get('line_count'))\n"
+        "    summary_lines.append('- `' + detail['path'] + '`: ' + role)\n"
+        "for snippet in source_doc_snippets:\n"
+        "    summary_lines.append('- Artifact `' + snippet['artifact_path'] + '` informs `' + snippet['path'] + '`.')\n"
+        "summary_lines.extend(['', '## Relationships'])\n"
+        "if relation_sample:\n"
+        "    for relation in relation_sample[:10]:\n"
+        "        source = str(relation.get('source') or relation.get('from') or relation.get('importer') or 'unknown')\n"
+        "        target = str(relation.get('target') or relation.get('to') or relation.get('imported') or 'unknown')\n"
+        "        summary_lines.append('- `' + source + '` -> `' + target + '`')\n"
+        "else:\n"
+        "    summary_lines.append('- relationships.json に明示的な関係が少ないため、重要ファイルと import hub を追加確認する必要があります。')\n"
+        "summary_lines.extend(['', '## Uncertainties', '- worker artifact の要約粒度に依存するため、重要ファイルの責務説明は source-doc artifact の品質確認が必要です。'])\n"
+        "summary = '\\n'.join(summary_lines)\n"
         "required_headings = ['## Major directories', '## Important files', '## Relationships', '## Uncertainties']\n"
-        "if not isinstance(summary, str) or any(summary.count(heading) != 1 for heading in required_headings):\n"
-        "    summary = '## Major directories\\n\\n- Describe observed source directories.\\n\\n## Important files\\n\\n- Describe selected important source files.\\n\\n## Relationships\\n\\n- Describe observed dependencies and interactions.\\n\\n## Uncertainties\\n\\n- List concrete unknowns or evidence gaps.'\n"
+        "has_required_headings = isinstance(summary, str) and all(summary.count(heading) == 1 for heading in required_headings)\n"
+        "if not has_required_headings:\n"
+        "    summary = 'worker artifact をもとに主要構造を統合しました。\\n\\n## Major directories\\n\\n- artifact と repo_map から確認した主要ディレクトリを記録します。\\n\\n## Important files\\n\\n- 選択した重要ファイルと artifact の対応を記録します。\\n\\n## Relationships\\n\\n- relationships.json から確認した依存関係を記録します。\\n\\n## Uncertainties\\n\\n- 追加確認が必要な点を記録します。'\n"
         "finish({'summary': summary})\n"
         "Do not write `import`, `from ... import ...`, or finish(None). Do not finish with a bare string.\n"
         "- When you are done, call finish(value).\n"
@@ -362,11 +429,25 @@ class ProjectAnalysisPromptBuilder(PromptBuilder):
                 "- Focus on analyzing component relationships, interactions, and dependency graphs.\n"
                 "- Read relationships.json and check import statements to understand data flow.\n"
                 "- The final value MUST include a 'summary' containing a Mermaid diagram (```mermaid) showing the component interactions, and detailed text explanations under the section '## Relationships'.\n"
+                "Phase 2 valid controller-code example:\n"
+                "relationships = read_artifact_json('relationships.json').get('relationships', [])\n"
+                "relationship_sample = relationships[:15]\n"
+                "del relationships\n"
+                "summary_lines = ['## Relationships', '', '```mermaid', 'graph TD']\n"
+                "for relation in relationship_sample[:8]:\n"
+                "    source = relation.get('source') or relation.get('from') or relation.get('importer') or 'ComponentA'\n"
+                "    target = relation.get('target') or relation.get('to') or relation.get('imported') or 'ComponentB'\n"
+                "    summary_lines.append('  ' + str(source).replace('/', '_').replace('.', '_') + ' --> ' + str(target).replace('/', '_').replace('.', '_'))\n"
+                "summary_lines.extend(['```', '', '- relationships.json と import 情報から主要コンポーネント間の依存を要約する。'])\n"
+                "summary = '\\n'.join(summary_lines)\n"
+                "finish({'summary': summary})\n"
             )
         else:
             return self.SYSTEM_PROMPT + (
                 "\nPhase 3 Specific Guidelines:\n"
                 "- Focus on synthesizing the final report by merging Phase 1 and Phase 2 summaries and resolving uncertainties.\n"
+                "- Before final synthesis, read manifest.json, relationships.json, and selected source-doc artifacts so the report names concrete directories, important files, and observed relationships.\n"
+                "- If Phase 1 or Phase 2 text is generic, prefer concrete evidence from artifact_documents, relationship_sample, and source_doc_snippets.\n"
                 "- Ensure the output follows the final report format.\n"
                 "- The final summary MUST include exactly these Markdown sections: ## Major directories, ## Important files, ## Relationships (containing the Mermaid diagram), and ## Uncertainties.\n"
             )
@@ -903,7 +984,18 @@ def write_analysis_docs(
 
 
 class SourceDocumentWorker:
-    """Build deterministic per-source Markdown documents outside the controller."""
+    """Build per-source Markdown documents outside the controller."""
+
+    REQUIRED_SECTIONS = (
+        "## Responsibility",
+        "## Main Functions / Classes",
+        "## Inputs and Outputs",
+        "## Dependencies",
+        "## Caveats",
+    )
+
+    def __init__(self, client: Any | None = None):
+        self.client = client
 
     def build_documents(
         self,
@@ -959,7 +1051,112 @@ class SourceDocumentWorker:
         dependency_lines = self._dependency_lines(content, language)
         symbol_lines = self._symbol_lines(symbols)
 
-        markdown = "\n".join(
+        markdown = self._build_llm_markdown(
+            source_path=source_path,
+            language=language,
+            line_count=line_count,
+            symbol_lines=symbol_lines,
+            dependency_lines=dependency_lines,
+            excerpt=excerpt,
+        )
+        if markdown is None:
+            markdown = self._build_deterministic_markdown(
+                source_path=source_path,
+                language=language,
+                line_count=line_count,
+                symbol_lines=symbol_lines,
+                dependency_lines=dependency_lines,
+                excerpt=excerpt,
+            )
+            if run_context is not None:
+                run_context.record_worker_usage(content, markdown)
+        elif run_context is not None:
+            worker_prompt = self._llm_prompt(
+                source_path,
+                language,
+                line_count,
+                symbol_lines,
+                dependency_lines,
+                excerpt,
+            )
+            run_context.record_worker_usage(worker_prompt, markdown, llm_calls=1)
+        return AnalysisDocument(path=f"{source_path}.md", title=f"Analysis of {source_path}", content=markdown)
+
+    def _build_llm_markdown(
+        self,
+        source_path: str,
+        language: str,
+        line_count: int,
+        symbol_lines: list[str],
+        dependency_lines: list[str],
+        excerpt: str,
+    ) -> str | None:
+        if self.client is None:
+            return None
+
+        prompt = self._llm_prompt(source_path, language, line_count, symbol_lines, dependency_lines, excerpt)
+        try:
+            response = self.client.query(prompt)
+        except Exception:
+            return None
+        markdown = response.strip()
+        if not self._is_usable_llm_markdown(markdown):
+            return None
+        return markdown
+
+    def _llm_prompt(
+        self,
+        source_path: str,
+        language: str,
+        line_count: int,
+        symbol_lines: list[str],
+        dependency_lines: list[str],
+        excerpt: str,
+    ) -> str:
+        symbols = "\n".join(symbol_lines or ["- (none detected)"])
+        dependencies = "\n".join(dependency_lines or ["- (none detected)"])
+        return "\n".join(
+            [
+                "You are a normal LLM worker generating one bounded source-file analysis artifact.",
+                "Return Markdown only. Do not mention the RLM controller.",
+                "Write Japanese explanations grounded only in the provided metadata and excerpt.",
+                "Include exactly these sections: ## Responsibility, ## Main Functions / Classes, ## Inputs and Outputs, ## Dependencies, ## Caveats.",
+                "",
+                f"Path: {source_path}",
+                f"Language: {language}",
+                f"Lines: {line_count}",
+                "",
+                "Detected symbols:",
+                symbols,
+                "",
+                "Detected dependencies:",
+                dependencies,
+                "",
+                "Bounded source excerpt:",
+                "```",
+                excerpt[:4000],
+                "```",
+            ]
+        )
+
+    def _is_usable_llm_markdown(self, markdown: str) -> bool:
+        if len(markdown.strip()) < 120:
+            return False
+        lowered = markdown.lower()
+        if "```python" in lowered and "finish(" in lowered:
+            return False
+        return all(section in markdown for section in self.REQUIRED_SECTIONS)
+
+    def _build_deterministic_markdown(
+        self,
+        source_path: str,
+        language: str,
+        line_count: int,
+        symbol_lines: list[str],
+        dependency_lines: list[str],
+        excerpt: str,
+    ) -> str:
+        return "\n".join(
             [
                 f"# Analysis of {source_path}",
                 "",
@@ -994,9 +1191,6 @@ class SourceDocumentWorker:
                 "",
             ]
         )
-        if run_context is not None:
-            run_context.record_worker_usage(content, markdown)
-        return AnalysisDocument(path=f"{source_path}.md", title=f"Analysis of {source_path}", content=markdown)
 
     def _symbol_lines(self, symbols: Any) -> list[str]:
         if not isinstance(symbols, list):
@@ -1063,7 +1257,6 @@ class SourceDocumentWorker:
             return statement.removeprefix("#include").strip()
         return statement
 
-
 class RLMRuntimeAnalyzer:
     def __init__(
         self,
@@ -1076,6 +1269,7 @@ class RLMRuntimeAnalyzer:
         max_total_tokens: int = 90000,
         backend_name: str = "unknown",
         model_name: str = "unknown",
+        phase: str = "file",
     ):
         self.client = client
         self.max_depth = max_depth
@@ -1086,12 +1280,21 @@ class RLMRuntimeAnalyzer:
         self.max_total_tokens = max_total_tokens
         self.backend_name = backend_name
         self.model_name = model_name
+        self.phase = phase
         self.last_result = None
         if self.output_dir:
             self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def analyze(self, path: Path) -> str:
         root = path.resolve()
+        
+        # 0. Machine Analysis Phase (LLMなしの静的解析)
+        if self.phase == "machine":
+            from isohyps.machine_analysis import analyze_machine_level
+            output_path_resolved = self.output_dir or (root / ".isohyps-output-validation")
+            analyze_machine_level(root, output_path_resolved)
+            report_path = output_path_resolved / "machine_report.md"
+            return report_path.read_text(encoding="utf-8")
         limits = BudgetLimits(
             max_steps=self.max_steps,
             max_depth=self.max_depth,
@@ -1101,7 +1304,7 @@ class RLMRuntimeAnalyzer:
         )
         run_context = RunContext(limits=limits)
         source_files = AnalysisDocBuilder(self.output_dir or (root / ".isohyps-output-validation"))._collect_source_files(root)
-        source_worker = SourceDocumentWorker()
+        source_worker = SourceDocumentWorker(client=self.client)
         worker_documents = source_worker.build_documents(root, source_files, run_context=run_context)
         artifact_files = source_worker.build_artifact_files(worker_documents)
 
@@ -1142,6 +1345,17 @@ class RLMRuntimeAnalyzer:
 
         phase1_summary = result_p1.result.get("summary", "")
 
+        if self.phase == "abstract":
+            if self.output_dir:
+                write_analysis_docs(
+                    output_dir=self.output_dir,
+                    root_path=root,
+                    controller_result=result_p1,
+                    backend=self.backend_name,
+                    model=self.model_name,
+                )
+            return phase1_summary
+
         # ----------------------------------------------------
         # Phase 2: Probe Relationships (Mermaid and Explanations)
         # ----------------------------------------------------
@@ -1180,6 +1394,17 @@ class RLMRuntimeAnalyzer:
             return self._handle_failure(root, result_p2, worker_documents)
 
         phase2_summary = result_p2.result.get("summary", "")
+
+        if self.phase == "relation":
+            if self.output_dir:
+                write_analysis_docs(
+                    output_dir=self.output_dir,
+                    root_path=root,
+                    controller_result=result_p2,
+                    backend=self.backend_name,
+                    model=self.model_name,
+                )
+            return phase2_summary
 
         # ----------------------------------------------------
         # Phase 3: Synthesis & Report Generation

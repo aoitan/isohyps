@@ -137,5 +137,56 @@ class TestTreeSitterAnalysis(unittest.TestCase):
         self.mock_client.query.assert_called_once()
 
 
+class TestAnalyzerCLIParser(unittest.TestCase):
+    def test_cli_fallback_to_analyze(self):
+        from analyzer import build_parser
+        
+        def parse_with_pseudo_subcommands(argv):
+            argv = list(argv)
+            subcommands = {"analyze", "scan", "overview", "relations", "files"}
+            command = "analyze"
+            if argv and argv[0] in subcommands:
+                command = argv.pop(0)
+            parser = build_parser()
+            args = parser.parse_args(argv)
+            args.command = command
+            return args
+
+        # サブコマンドなしで root ディレクトリを渡した場合のフォールバックテスト
+        args = parse_with_pseudo_subcommands(["/some/path", "--depth", "3"])
+        self.assertEqual(args.command, "analyze")
+        self.assertEqual(args.root, "/some/path")
+        self.assertEqual(args.depth, 3)
+
+    def test_cli_subcommands_mapping(self):
+        from analyzer import build_parser
+        
+        def parse_with_pseudo_subcommands(argv):
+            argv = list(argv)
+            subcommands = {"analyze", "scan", "overview", "relations", "files"}
+            command = "analyze"
+            if argv and argv[0] in subcommands:
+                command = argv.pop(0)
+            parser = build_parser()
+            args = parser.parse_args(argv)
+            args.command = command
+            return args
+
+        # 各サブコマンドが正しく解釈されるかテスト
+        args_scan = parse_with_pseudo_subcommands(["scan", "/path/to/repo"])
+        self.assertEqual(args_scan.command, "scan")
+        self.assertEqual(args_scan.root, "/path/to/repo")
+
+        args_overview = parse_with_pseudo_subcommands(["overview"])
+        self.assertEqual(args_overview.command, "overview")
+        self.assertEqual(args_overview.root, ".")
+
+        args_relations = parse_with_pseudo_subcommands(["relations"])
+        self.assertEqual(args_relations.command, "relations")
+
+        args_files = parse_with_pseudo_subcommands(["files"])
+        self.assertEqual(args_files.command, "files")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -9,11 +9,10 @@ dependencies = [
     "ollama",
     "python-dotenv",
 ]
-
 [project.optional-dependencies]
 symbols = [
-    "tree-sitter>=0.21.0,<0.22; python_version < '3.12'",
-    "tree-sitter-languages; python_version < '3.12'",
+    "tree-sitter>=0.21.0,<0.22; python_full_version < '3.12'",
+    "tree-sitter-languages; python_full_version < '3.12'",
 ]
 
 [dependency-groups]
