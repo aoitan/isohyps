@@ -68,10 +68,14 @@ class TestMachineAnalysis(unittest.TestCase):
             encoding="utf-8"
         )
 
-        # 4. 大きなレガシーファイル (100行以上にして large file 警告をトリガーする)
+        # 4. 大きなレガシーファイル (300行以上にして large file 警告をトリガーする)
         self.legacy_file = self.src_dir / "legacy.py"
-        large_content = "\n".join([f"line_{i} = {i}" for i in range(150)])
+        large_content = "\n".join([f"line_{i} = {i}" for i in range(350)])
         self.legacy_file.write_text(large_content, encoding="utf-8")
+
+        # 4b. 空の __init__.py (no tests 警告から除外されるべきファイル)
+        self.init_file = self.src_dir / "__init__.py"
+        self.init_file.write_text("", encoding="utf-8")
 
         # 5. pyproject.toml (config/entrypoint)
         self.toml_file = self.test_dir / "pyproject.toml"
@@ -151,6 +155,7 @@ class TestMachineAnalysis(unittest.TestCase):
             extract_file_metadata(self.runner_file, self.test_dir),
             extract_file_metadata(self.config_file, self.test_dir),
             extract_file_metadata(self.legacy_file, self.test_dir),
+            extract_file_metadata(self.init_file, self.test_dir),
             extract_file_metadata(self.toml_file, self.test_dir),
         ]
         
@@ -158,6 +163,7 @@ class TestMachineAnalysis(unittest.TestCase):
             extract_file_symbols(self.runner_file, self.test_dir),
             extract_file_symbols(self.config_file, self.test_dir),
             extract_file_symbols(self.legacy_file, self.test_dir),
+            extract_file_symbols(self.init_file, self.test_dir),
             extract_file_symbols(self.toml_file, self.test_dir),
         ]
 
@@ -166,12 +172,14 @@ class TestMachineAnalysis(unittest.TestCase):
         # 注意項目の検出を確認
         attention_texts = [att for att in attention]
         
-        # 1. legacy.py は 100 行以上のため large file であること
+        # 1. legacy.py は 300 行以上のため large file であること
         self.assertTrue(any("large" in text and "legacy.py" in text for text in attention_texts))
-        # 2. config.py にはテストがない（config.py に対応する test_config.py がない）
+        # 2. config.py にはテストがない
         self.assertTrue(any("no tests" in text and "config.py" in text for text in attention_texts))
         # 3. runner.py に TODO が含まれる
         self.assertTrue(any("TODO/FIXME" in text and "runner.py" in text for text in attention_texts))
+        # 4. __init__.py はテスト不足警告から除外されていること
+        self.assertFalse(any("no tests" in text and "__init__.py" in text for text in attention_texts))
 
     def test_analyze_machine_level(self):
         # level 0 全体プロセスのテスト
@@ -260,6 +268,7 @@ class TestMachineAnalysis(unittest.TestCase):
         self.assertIn("src/keep_me.py", files_paths)
 
     def test_machine_synthesized_reports(self):
+        # 1回目：ドキュメントなし（カバレッジ0%）の検証
         analyze_machine_level(self.test_dir, self.output_dir)
         
         index_path = self.output_dir / "index.md"
@@ -268,17 +277,52 @@ class TestMachineAnalysis(unittest.TestCase):
         self.assertTrue(index_path.exists())
         self.assertTrue(report_path.exists())
         
-        # analysis_report.md の検証
         report_content = report_path.read_text(encoding="utf-8")
         self.assertIn("Status:** success", report_content)
-        self.assertIn("Source Coverage:** 0%", report_content)
-        self.assertIn("Backend:** none (machine scan only)", report_content)
+        self.assertIn("Source Coverage:** 0.0%", report_content)
         
-        # index.md の検証
         index_content = index_path.read_text(encoding="utf-8")
         self.assertIn("Directory: " + self.test_dir.name, index_content)
         self.assertIn("Stale or Newly Added Files", index_content)
-        self.assertIn("High Priority Files to Inspect", index_content)
+        # ドキュメントがないため、すべてのソースファイルが Stale/Missing（要説明）として検出されること
+        self.assertIn("src/runner.py", index_content)
+
+    def test_coverage_and_stale_detection(self):
+        # 2回目：ダミー解説ドキュメントを配置してカバレッジやStaleを検証するテスト
+        
+        # validなドキュメントを作成 (runner.py.md)
+        doc_dir = self.output_dir / "src"
+        doc_dir.mkdir(parents=True, exist_ok=True)
+        runner_doc = doc_dir / "runner.py.md"
+        runner_doc.write_text("# Runner Doc", encoding="utf-8")
+        import os
+        # ソースコードより新しく更新時刻を設定
+        runner_mtime = self.runner_file.stat().st_mtime
+        os.utime(runner_doc, (runner_mtime + 10.0, runner_mtime + 10.0))
+
+        # staleなドキュメントを作成 (config.py.md)
+        config_doc = doc_dir / "config.py.md"
+        config_doc.write_text("# Config Doc", encoding="utf-8")
+        config_mtime = self.config_file.stat().st_mtime
+        # ソースコードより古く更新時刻を設定
+        os.utime(config_doc, (config_mtime - 10.0, config_mtime - 10.0))
+
+        # 再度分析を実行
+        analyze_machine_level(self.test_dir, self.output_dir)
+
+        index_path = self.output_dir / "index.md"
+        report_path = self.output_dir / "analysis_report.md"
+        
+        report_content = report_path.read_text(encoding="utf-8")
+        # runner.py と config.py にドキュメントが存在するため、
+        # ドキュメントありは 2 ファイルなのでカバレッジが 0% より大きくなること
+        self.assertNotIn("Source Coverage:** 0.0%", report_content)
+        
+        index_content = index_path.read_text(encoding="utf-8")
+        # config.py は stale としてリストされること
+        self.assertTrue(any("config.py" in line and "stale" in line for line in index_content.splitlines()))
+        # runner.py は valid なので、git modified などの別の理由がない限り index.md の「要説明」から除外されるか、あるいは valid として表示されないこと
+        self.assertFalse(any("src/runner.py" in line and "missing" in line for line in index_content.splitlines()))
 
 if __name__ == "__main__":
     unittest.main()

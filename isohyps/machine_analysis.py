@@ -130,6 +130,14 @@ def extract_file_metadata(path: Path, root: Path, previous_meta: dict[str, Any] 
         else:
             status = "added"
 
+    todo_count = 0
+    if kind == "source" and not is_probably_binary(abs_path):
+        try:
+            content = abs_path.read_text(encoding="utf-8", errors="ignore")
+            todo_count = len(re.findall(r'(?:TODO|FIXME)[:\s]+(.*)', content, re.IGNORECASE))
+        except Exception:
+            pass
+
     return {
         "path": rel_path,
         "hash": file_hash,
@@ -139,6 +147,7 @@ def extract_file_metadata(path: Path, root: Path, previous_meta: dict[str, Any] 
         "kind": kind,
         "last_seen_commit": last_commit,
         "status": status,
+        "todo_count": todo_count,
     }
 
 
@@ -364,7 +373,8 @@ def build_repo_map_summary(root: Path, files_meta: list[dict[str, Any]]) -> dict
 def detect_attention_points(
     root: Path,
     files_meta: list[dict[str, Any]],
-    symbols_list: list[dict[str, Any]]
+    symbols_list: list[dict[str, Any]],
+    previous_meta: dict[str, Any] | None = None
 ) -> list[str]:
     attention = []
     
@@ -390,19 +400,21 @@ def detect_attention_points(
                     if other_mod_name == mod.split(".")[-1]:
                         fan_in[other_path] = fan_in.get(other_path, 0) + 1
 
-    # 1. 巨大ファイルの検出 (Large files: 例: 100行以上)
+    # 1. 巨大ファイルの検出 (Large files: しきい値300行)
     for path, meta in meta_by_path.items():
         if meta["kind"] == "source":
             try:
                 line_count = len((root / path).read_text(encoding="utf-8", errors="ignore").splitlines())
-                if line_count > 100:
+                if line_count > 300:
                     attention.append(f"file is large: {path}, {line_count} lines")
             except Exception:
                 pass
 
-    # 2. テストの有無の判定 (no tests found)
+    # 2. テストの有無の判定 (no tests found - __init__.py とサイズ50B未満の極小ファイルを除外)
     for path, meta in meta_by_path.items():
         if meta["kind"] == "source" and meta["language"] == "python":
+            if Path(path).name == "__init__.py" or meta["size"] < 50:
+                continue
             stem = Path(path).stem
             test_exists = False
             for test_path in symbols_by_path.keys():
@@ -413,14 +425,26 @@ def detect_attention_points(
             if not test_exists:
                 attention.append(f"no tests found for {path}")
 
-    # 3. TODO/FIXME の検出
+    # 3. TODO/FIXME の検出 (過去のメタデータがあれば増加分だけを報告)
     for path, meta in meta_by_path.items():
         if meta["kind"] == "source" and not is_probably_binary(root / path):
             try:
                 content = (root / path).read_text(encoding="utf-8", errors="ignore")
                 matches = re.findall(r'(?:TODO|FIXME)[:\s]+(.*)', content, re.IGNORECASE)
                 if matches:
-                    attention.append(f"TODO/FIXME count increased in {path}: {len(matches)} items")
+                    prev_count = 0
+                    has_previous = False
+                    if previous_meta and path in previous_meta:
+                        prev_todo = previous_meta[path].get("todo_count")
+                        if prev_todo is not None:
+                            prev_count = prev_todo
+                            has_previous = True
+                            
+                    if has_previous:
+                        if len(matches) > prev_count:
+                            attention.append(f"TODO/FIXME count increased in {path}: {len(matches)} items")
+                    else:
+                        attention.append(f"TODO/FIXME count increased in {path}: {len(matches)} items")
             except Exception:
                 pass
 
@@ -597,7 +621,7 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
     repo_map = build_repo_map_summary(root, files_meta)
 
     # アテンションポイント検出
-    attention = detect_attention_points(root, files_meta, symbols_list)
+    attention = detect_attention_points(root, files_meta, symbols_list, previous_meta)
 
     # 最終データの統合
     result = {
@@ -619,6 +643,44 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
     report_content = generate_machine_report(root, files_meta, repo_map, attention)
     report_path.write_text(report_content, encoding="utf-8")
 
+    # ドキュメントの存在有無・更新チェックとカバレッジの算出
+    missing_docs = []
+    stale_docs = []
+    valid_docs = []
+    
+    # 対象ファイル： kind が source または test であり、バイナリやエラーでないもの
+    coverage_targets = [m for m in files_meta if m["kind"] in ("source", "test") and m["hash"] not in ("binary_skipped", "error")]
+    
+    for meta in coverage_targets:
+        rel_path = meta["path"]
+        doc_candidates = [
+            output_dir / f"{rel_path}.md",
+            output_dir / Path(rel_path).with_suffix(".md")
+        ]
+        
+        found_doc = None
+        for candidate in doc_candidates:
+            if candidate.exists() and candidate.is_file():
+                found_doc = candidate
+                break
+                
+        if not found_doc:
+            missing_docs.append(rel_path)
+        else:
+            source_mtime = meta["mtime"]
+            doc_mtime = found_doc.stat().st_mtime
+            is_unchanged = (meta["status"] == "unchanged")
+            
+            # ソースコード更新日時がドキュメント更新日時 + 2.0秒より新しく、かつ内容に変更がある場合を stale と判定
+            if source_mtime > doc_mtime + 2.0 and not is_unchanged:
+                stale_docs.append(rel_path)
+            else:
+                valid_docs.append(rel_path)
+                
+    total_targets = len(coverage_targets)
+    documented_count = total_targets - len(missing_docs)
+    coverage_percent = (documented_count / total_targets * 100) if total_targets > 0 else 100.0
+
     # analysis_report.md の自動合成
     analysis_report = (
         f"# Project Analysis Report: {root.name}\n\n"
@@ -632,7 +694,7 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
         f"## Executive Summary\n"
         f"This report summarizes the static machine scan of the project. No LLM resources were utilized.\n\n"
         f"## Machine Analysis Status\n"
-        f"- **Source Coverage:** 0%\n"
+        f"- **Source Coverage:** {coverage_percent:.1f}%\n"
         f"- **Attention Points Detected:** {len(attention)} items\n"
         f"- **Active Files Count:** {len(all_files)}\n"
         f"- **Ignored Files Count:** {ignored_count}\n\n"
@@ -642,6 +704,9 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
 
     # index.md の自動合成
     changed_files = [m["path"] for m in files_meta if m["status"] in ("changed", "added")]
+    # 解説が必要なファイル（新規・変更されたファイル、解説欠損、陳腐化ドキュメント）
+    needs_explanation = set(changed_files) | set(missing_docs) | set(stale_docs)
+    
     index_content = (
         f"# Directory: {root.name}\n\n"
         f"Welcome to the static analysis index for `{root.name}`.\n\n"
@@ -651,10 +716,20 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
         f"## Stale or Newly Added Files (Need Explanation)\n"
         f"These files are either new or modified, and their corresponding documentation (if any) may be stale.\n"
     )
-    if changed_files:
-        for cf in changed_files:
-            cf_status = next((m["status"] for m in files_meta if m["path"] == cf), "added")
-            index_content += f"- [ ] `{cf}` (Status: {cf_status})\n"
+    if needs_explanation:
+        for cf in sorted(list(needs_explanation)):
+            reasons = []
+            if cf in missing_docs:
+                reasons.append("missing doc")
+            elif cf in stale_docs:
+                reasons.append("stale doc")
+            
+            m_status = next((m["status"] for m in files_meta if m["path"] == cf), None)
+            if m_status in ("changed", "added"):
+                reasons.append(f"source {m_status}")
+                
+            reason_str = f" ({', '.join(reasons)})" if reasons else ""
+            index_content += f"- [ ] `{cf}`{reason_str}\n"
     else:
         index_content += "- No modified or added files detected. All files are unchanged.\n"
         
