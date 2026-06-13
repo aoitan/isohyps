@@ -678,13 +678,20 @@ def generate_machine_report(
     root: Path,
     files_meta: list[dict[str, Any]],
     repo_map: dict[str, Any],
-    attention: list[str]
+    attention: list[str],
+    forward_graph: dict[str, list[str]]
 ) -> str:
+    mermaid_diag = generate_mermaid_graph(forward_graph)
+
     lines = [
         "# Project Machine Analysis Report",
         "",
         f"**Root Directory:** `{root.resolve()}`",
         f"**Total Files Discovered:** {len(files_meta)}",
+        "",
+        "## Dependency Graph Map",
+        "",
+        mermaid_diag,
         "",
         "## Repo Map Summary",
         "",
@@ -787,12 +794,18 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
     # アテンションポイント検出
     attention = detect_attention_points(root, files_meta, symbols_list, previous_meta)
 
+    # 依存関係グラフの構築とトポロジカルソート
+    forward_graph, backward_graph = build_dependency_graph(files_meta, symbols_list)
+    dependency_order = topological_sort(backward_graph)
+
     # 最終データの統合
     result = {
         "files": files_meta,
         "symbols": symbols_list,
         "repo_map": repo_map,
         "attention": attention,
+        "dependency_graph": forward_graph,
+        "dependency_order": dependency_order,
     }
 
     # 機械向け JSON 書き出し
@@ -804,7 +817,7 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
 
     # 人間向け Markdown 書き出し
     report_path = output_dir / "machine_report.md"
-    report_content = generate_machine_report(root, files_meta, repo_map, attention)
+    report_content = generate_machine_report(root, files_meta, repo_map, attention, forward_graph)
     report_path.write_text(report_content, encoding="utf-8")
 
     # ドキュメントの存在有無・更新チェックとカバレッジの算出
@@ -899,6 +912,16 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
     # 解説が必要なファイル（新規・変更されたファイル、解説欠損、陳腐化ドキュメント）
     needs_explanation = set(changed_files) | set(missing_docs) | set(stale_docs)
     
+    # トポロジカルソート順（Bottom-up）で並べ替え
+    sorted_needs_explanation = []
+    for f in dependency_order:
+        if f in needs_explanation:
+            sorted_needs_explanation.append(f)
+    # ソート順に含まれなかったものを決定論的に末尾に追加
+    for f in sorted(list(needs_explanation)):
+        if f not in sorted_needs_explanation:
+            sorted_needs_explanation.append(f)
+            
     index_content = (
         f"# Directory: {root.name}\n\n"
         f"Welcome to the static analysis index for `{root.name}`.\n\n"
@@ -908,8 +931,8 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
         f"## Stale or Newly Added Files (Need Explanation)\n"
         f"These files are either new or modified, and their corresponding documentation (if any) may be stale.\n"
     )
-    if needs_explanation:
-        for cf in sorted(list(needs_explanation)):
+    if sorted_needs_explanation:
+        for cf in sorted_needs_explanation:
             reasons = []
             if cf in missing_docs:
                 reasons.append("missing doc")
