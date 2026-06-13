@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
-# テスト対象はまだ存在しないため、テスト実行時に ImportError になることを期待します
+# 機械解析（Level 0）モジュールの各機能を検証します
 from isohyps.machine_analysis import (
     analyze_machine_level,
     extract_file_metadata,

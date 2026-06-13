@@ -106,6 +106,16 @@ class TestCodeResponseValidator(unittest.TestCase):
         self.assertEqual(validated_walrus.kind, "invalid_code")
         self.assertIn("Assigning to helper names is not allowed", validated_walrus.error)
 
+    def test_rejects_definition_overwriting_helpers(self):
+        validator = CodeResponseValidator()
+        validated_func = validator.normalize("def finish(x):\n    pass\nfinish('ok')")
+        self.assertEqual(validated_func.kind, "invalid_code")
+        self.assertIn("Defining functions or classes matching helper names is not allowed", validated_func.error)
+
+        validated_class = validator.normalize("class list_dir:\n    pass\nfinish('ok')")
+        self.assertEqual(validated_class.kind, "invalid_code")
+        self.assertIn("Defining functions or classes matching helper names is not allowed", validated_class.error)
+
 
 class TestRLMRuntime(unittest.TestCase):
     def setUp(self):

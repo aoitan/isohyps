@@ -621,9 +621,11 @@ class TestPackagingDependencies(unittest.TestCase):
         ]
         self.assertEqual(
             tree_sitter_dependencies,
-            ["tree-sitter>=0.21.0,<0.22", "tree-sitter-languages"],
+            [
+                "tree-sitter>=0.21.0,<0.22; python_full_version < '3.12'",
+                "tree-sitter-languages; python_full_version < '3.12'",
+            ],
         )
-        self.assertTrue(all("python_version" not in dependency for dependency in tree_sitter_dependencies))
 
 
 class TestRLMRuntimeAnalyzer(unittest.TestCase):

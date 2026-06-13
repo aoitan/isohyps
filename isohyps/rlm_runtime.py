@@ -699,6 +699,9 @@ class CodeResponseValidator:
                     return f"globals and locals are functions, not dict variables. Do not write {node.value.id}[...]; call {node.value.id}() first."
             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id in reserved_helpers:
                 return f"Assigning to helper names is not allowed. '{node.id}' is a reserved helper."
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if node.name in reserved_helpers:
+                    return f"Defining functions or classes matching helper names is not allowed. '{node.name}' is a reserved helper."
         return None
 
     def normalize(self, response: str) -> ValidatedCode:
