@@ -725,6 +725,37 @@ class TestRLMRuntimeAnalyzer(unittest.TestCase):
         self.assertIsInstance(child_config.prompt_builder, ProjectAnalysisChildPromptBuilder)
         self.assertEqual(child_config.limits.max_steps, PROJECT_ANALYSIS_CHILD_MAX_STEPS)
 
+    def test_runtime_analyzer_machine_phase(self):
+        analyzer = RLMRuntimeAnalyzer(
+            self.client,
+            output_dir=self.output_dir,
+            phase="machine",
+        )
+        summary = analyzer.analyze(self.root)
+        self.assertIn("# Project Machine Analysis Report", summary)
+        self.assertIn("## Repo Map Summary", summary)
+        self.client.query.assert_not_called()
+
+    def test_runtime_analyzer_abstract_phase(self):
+        analyzer = RLMRuntimeAnalyzer(
+            self.client,
+            output_dir=self.output_dir,
+            phase="abstract",
+        )
+        summary = analyzer.analyze(self.root)
+        self.assertIn("isohyps`: runtime implementation", summary)
+        self.assertEqual(self.client.query.call_count, 1)
+
+    def test_runtime_analyzer_relation_phase(self):
+        analyzer = RLMRuntimeAnalyzer(
+            self.client,
+            output_dir=self.output_dir,
+            phase="relation",
+        )
+        summary = analyzer.analyze(self.root)
+        self.assertIn("Some relations", summary)
+        self.assertEqual(self.client.query.call_count, 2)
+
 
 class TestRLMRuntimeAnalyzerIntegration(unittest.TestCase):
     def setUp(self):

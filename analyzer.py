@@ -231,12 +231,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", default="analysis_docs", help="Output directory for structured documentation")
     parser.add_argument("--ollama-url", help="Base URL for Ollama API (e.g. http://192.168.1.10:11434)")
     parser.add_argument("--num-ctx", type=int, default=8192, help="Context size (num_ctx) for Ollama")
+    parser.add_argument("--phase", choices=["machine", "abstract", "relation", "file"], default="file", help="Phase to stop analysis")
     return parser
 
 
-def main():
+def main(argv: list[str] | None = None):
+    if argv is None:
+        argv = sys.argv[1:]
+    else:
+        argv = list(argv)
+
+    # 疑似サブコマンドのフォールバック判定
+    subcommands = {"analyze", "scan", "overview", "relations", "files"}
+    command = "analyze"
+    if argv and argv[0] in subcommands:
+        command = argv.pop(0)
+
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    args.command = command
 
     if args.runtime == "legacy":
         warnings.warn(
@@ -249,16 +262,32 @@ def main():
     root_path = Path(args.root).resolve()
     output_path = Path(args.out).resolve()
     
-    if args.backend == "gemini":
-        model = args.model if args.model else "gemini-1.5-flash"
-        try:
-            client = GeminiClient(model_name=model)
-        except ValueError as e:
-            print(f"Error: {e}")
-            return
+    # legacy runtime では backend の初期化をスキップして機械解析を可能にするため
+    # 指定フェーズが machine の場合は LLM クライアントをダミーにするか初期化しない
+    selected_phase = args.phase
+    phase_mapping = {
+        "scan": "machine",
+        "overview": "abstract",
+        "relations": "relation",
+        "files": "file",
+        "analyze": args.phase,
+    }
+    selected_phase = phase_mapping.get(args.command, "file")
+
+    client = None
+    if selected_phase != "machine":
+        if args.backend == "gemini":
+            model = args.model if args.model else "gemini-1.5-flash"
+            try:
+                client = GeminiClient(model_name=model)
+            except ValueError as e:
+                print(f"Error: {e}")
+                return 2
+        else:
+            model = args.model if args.model else "llama3"
+            client = OllamaClient(model_name=model, base_url=args.ollama_url, num_ctx=args.num_ctx)
     else:
-        model = args.model if args.model else "llama3"
-        client = OllamaClient(model_name=model, base_url=args.ollama_url, num_ctx=args.num_ctx)
+        model = "none"
 
     # 出力先ディレクトリを指定して初期化
     if args.runtime == "controller":
@@ -272,19 +301,28 @@ def main():
             max_total_tokens=args.max_total_tokens,
             backend_name=args.backend,
             model_name=model,
+            phase=selected_phase,
         )
     else:
+        # legacy は phase 非対応の警告
+        if selected_phase != "file":
+            print("Warning: legacy runtime does not support multi-phase execution. Running full legacy analysis.", file=sys.stderr)
         analyzer = RLMAnalyzer(client, max_depth=args.depth, output_dir=output_path, warn=False)
 
     print(f"Starting RLM analysis from: {root_path}")
     print(f"Runtime: {args.runtime}")
-    print(f"Backend: {args.backend}, Model: {model}")
-    if args.runtime == "controller":
+    if selected_phase != "machine":
+        print(f"Backend: {args.backend}, Model: {model}")
+    else:
+        print("Backend: none (machine scan only)")
+    print(f"Phase: {selected_phase}")
+    
+    if args.runtime == "controller" and selected_phase != "machine":
         print(
             "Agentic controller runtime is active "
             f"(depth={args.depth}, max_steps={args.max_steps}, token_budget={args.max_total_tokens}, llm_timeout={args.llm_timeout}s)."
         )
-    if args.backend == "ollama":
+    if args.backend == "ollama" and selected_phase != "machine":
         print(f"Ollama URL: {args.ollama_url if args.ollama_url else 'local'}")
         print(f"Context Size: {args.num_ctx}")
     print(f"Output directory: {output_path}")
@@ -304,10 +342,14 @@ def main():
             f.write(final_summary)
     else:
         report_path = output_path / "analysis_report.md"
+        # machine フェーズの場合は report は machine_report.md に書き出されているため
+        if selected_phase == "machine":
+            report_path = output_path / "machine_report.md"
 
     print(f"\nAnalysis complete.")
     print(f"Structured docs: {output_path}")
     print(f"Full report:     {report_path}")
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

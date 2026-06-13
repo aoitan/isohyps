@@ -1257,7 +1257,6 @@ class SourceDocumentWorker:
             return statement.removeprefix("#include").strip()
         return statement
 
-
 class RLMRuntimeAnalyzer:
     def __init__(
         self,
@@ -1270,6 +1269,7 @@ class RLMRuntimeAnalyzer:
         max_total_tokens: int = 90000,
         backend_name: str = "unknown",
         model_name: str = "unknown",
+        phase: str = "file",
     ):
         self.client = client
         self.max_depth = max_depth
@@ -1280,12 +1280,21 @@ class RLMRuntimeAnalyzer:
         self.max_total_tokens = max_total_tokens
         self.backend_name = backend_name
         self.model_name = model_name
+        self.phase = phase
         self.last_result = None
         if self.output_dir:
             self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def analyze(self, path: Path) -> str:
         root = path.resolve()
+        
+        # 0. Machine Analysis Phase (LLMなしの静的解析)
+        if self.phase == "machine":
+            from isohyps.machine_analysis import analyze_machine_level
+            output_path_resolved = self.output_dir or (root / ".isohyps-output-validation")
+            analyze_machine_level(root, output_path_resolved)
+            report_path = output_path_resolved / "machine_report.md"
+            return report_path.read_text(encoding="utf-8")
         limits = BudgetLimits(
             max_steps=self.max_steps,
             max_depth=self.max_depth,
@@ -1336,6 +1345,17 @@ class RLMRuntimeAnalyzer:
 
         phase1_summary = result_p1.result.get("summary", "")
 
+        if self.phase == "abstract":
+            if self.output_dir:
+                write_analysis_docs(
+                    output_dir=self.output_dir,
+                    root_path=root,
+                    controller_result=result_p1,
+                    backend=self.backend_name,
+                    model=self.model_name,
+                )
+            return phase1_summary
+
         # ----------------------------------------------------
         # Phase 2: Probe Relationships (Mermaid and Explanations)
         # ----------------------------------------------------
@@ -1374,6 +1394,17 @@ class RLMRuntimeAnalyzer:
             return self._handle_failure(root, result_p2, worker_documents)
 
         phase2_summary = result_p2.result.get("summary", "")
+
+        if self.phase == "relation":
+            if self.output_dir:
+                write_analysis_docs(
+                    output_dir=self.output_dir,
+                    root_path=root,
+                    controller_result=result_p2,
+                    backend=self.backend_name,
+                    model=self.model_name,
+                )
+            return phase2_summary
 
         # ----------------------------------------------------
         # Phase 3: Synthesis & Report Generation
