@@ -82,6 +82,30 @@ class TestCodeResponseValidator(unittest.TestCase):
         self.assertEqual(validated.kind, "code")
         self.assertEqual(validated.code, "finish('ok')")
 
+    def test_rejects_subscript_access_on_globals_and_locals(self):
+        validator = CodeResponseValidator()
+        validated_globals = validator.normalize("globals['pending'] = []")
+        self.assertEqual(validated_globals.kind, "invalid_code")
+        self.assertIn("globals and locals are functions", validated_globals.error)
+
+        validated_locals = validator.normalize("x = locals()['val']\nlocals['pending'] = []")
+        self.assertEqual(validated_locals.kind, "invalid_code")
+        self.assertIn("globals and locals are functions", validated_locals.error)
+
+    def test_rejects_assignment_to_helpers(self):
+        validator = CodeResponseValidator()
+        validated_assign = validator.normalize("list_dir = None\nfinish('ok')")
+        self.assertEqual(validated_assign.kind, "invalid_code")
+        self.assertIn("Assigning to helper names is not allowed", validated_assign.error)
+
+        validated_ann = validator.normalize("read_text: Any = None\nfinish('ok')")
+        self.assertEqual(validated_ann.kind, "invalid_code")
+        self.assertIn("Assigning to helper names is not allowed", validated_ann.error)
+
+        validated_walrus = validator.normalize("if (finish := lambda x: x)('ok'):\n    pass")
+        self.assertEqual(validated_walrus.kind, "invalid_code")
+        self.assertIn("Assigning to helper names is not allowed", validated_walrus.error)
+
 
 class TestRLMRuntime(unittest.TestCase):
     def setUp(self):

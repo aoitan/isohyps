@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 from typing import Any
 
@@ -112,6 +113,33 @@ def read_text_excerpt(path: Path, limit: int = 5000) -> str:
     return path.read_text(encoding="utf-8", errors="ignore")[:limit]
 
 
+def _extract_python_symbols_with_ast(
+    code: str,
+    max_symbols: int,
+    max_lines_per_symbol: int,
+) -> list[str]:
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
+
+    lines = code.splitlines()
+    symbol_nodes = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.AsyncFunctionDef, ast.ClassDef, ast.FunctionDef))
+    ]
+    symbol_nodes.sort(key=lambda node: (node.lineno, node.col_offset))
+
+    snippets: list[str] = []
+    for node in symbol_nodes[:max_symbols]:
+        start = max(node.lineno - 1, 0)
+        end_lineno = getattr(node, "end_lineno", node.lineno)
+        end = min(end_lineno - 1, start + max_lines_per_symbol - 1)
+        snippets.append("\n".join(lines[start : end + 1]))
+    return snippets
+
+
 def extract_symbols(
     path: Path,
     lang: str | None = None,
@@ -145,10 +173,10 @@ def extract_symbols(
     if not query_str:
         return result
 
+    code = path.read_text(encoding="utf-8", errors="ignore")
     try:
         from tree_sitter_languages import get_language, get_parser
 
-        code = path.read_text(encoding="utf-8", errors="ignore")
         parser = get_parser(language_name)
         tree = parser.parse(code.encode("utf-8"))
         language = get_language(language_name)
@@ -172,5 +200,7 @@ def extract_symbols(
         result["symbols"] = snippets
     except Exception as exc:
         result["error"] = str(exc)
+        if language_name == "python":
+            result["symbols"] = _extract_python_symbols_with_ast(code, max_symbols, max_lines_per_symbol)
 
     return result

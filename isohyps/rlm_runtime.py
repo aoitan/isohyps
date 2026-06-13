@@ -674,9 +674,31 @@ class CodeResponseValidator:
         return code
 
     def _reject_disallowed_syntax(self, parsed: ast.AST) -> str | None:
+        reserved_helpers = {
+            "list_dir",
+            "read_text",
+            "file_info",
+            "search_text",
+            "list_artifacts",
+            "read_artifact",
+            "read_artifact_json",
+            "grep_artifacts",
+            "extract_symbols",
+            "llm_query",
+            "finish",
+            "path_exists",
+            "is_dir",
+            "read_json",
+            "record_document",
+        }
         for node in ast.walk(parsed):
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 return "Import statements are not allowed. Use sandbox helpers instead."
+            if isinstance(node, ast.Subscript):
+                if isinstance(node.value, ast.Name) and node.value.id in {"globals", "locals"}:
+                    return f"globals and locals are functions, not dict variables. Do not write {node.value.id}[...]; call {node.value.id}() first."
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id in reserved_helpers:
+                return f"Assigning to helper names is not allowed. '{node.id}' is a reserved helper."
         return None
 
     def normalize(self, response: str) -> ValidatedCode:

@@ -16,6 +16,34 @@ from analyzer import RLMRuntimeAnalyzer, BaseLLMClient, build_parser
 from tests.test_utils import ScriptedClient
 
 
+WORKER_LLM_DOCUMENT = "\n".join(
+    [
+        "# Analysis of app.py",
+        "",
+        "## Responsibility",
+        "",
+        "`app.py` は fixture の Python ソースで、hello 関数の責務を説明する worker LLM artifact です。",
+        "",
+        "## Main Functions / Classes",
+        "",
+        "- `hello`: fixture の関数。",
+        "",
+        "## Inputs and Outputs",
+        "",
+        "- Inputs: なし。",
+        "- Outputs: なし。",
+        "",
+        "## Dependencies",
+        "",
+        "- (none detected)",
+        "",
+        "## Caveats",
+        "",
+        "- fixture 用の短い LLM worker 出力です。",
+    ]
+)
+
+
 class TestRLMRuntimeAnalyzer(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()
@@ -110,7 +138,7 @@ class TestRLMRuntimeAnalyzerIntegration(unittest.TestCase):
         shutil.rmtree(self.test_dir)
 
     def _make_analyzer(self, responses, max_steps=5, step_timeout_seconds=15.0):
-        client = ScriptedClient(responses)
+        client = ScriptedClient([WORKER_LLM_DOCUMENT, *responses])
         return RLMRuntimeAnalyzer(
             client,
             output_dir=self.output_dir,
@@ -186,7 +214,7 @@ class TestRLMRuntimeAnalyzerIntegration(unittest.TestCase):
 
         self.assertIn("Recovered after invalid code", summary)
         # Second prompt must contain feedback about the invalid code
-        self.assertIn("invalid_code", client.prompts[1])
+        self.assertIn("invalid_code", client.prompts[2])
 
     def test_step_timeout_is_reported(self):
         """A timed out sandbox step is surfaced to later controller prompts and reports."""
@@ -203,7 +231,7 @@ class TestRLMRuntimeAnalyzerIntegration(unittest.TestCase):
         summary = analyzer.analyze(self.root)
 
         self.assertIn("budget_exceeded", summary)
-        self.assertIn("timed out", client.prompts[1])
+        self.assertIn("timed out", client.prompts[2])
         report = (self.output_dir / "analysis_report.md").read_text(encoding="utf-8")
         self.assertIn("timed out", report)
 
