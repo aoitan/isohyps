@@ -68,10 +68,14 @@ class TestMachineAnalysis(unittest.TestCase):
             encoding="utf-8"
         )
 
-        # 4. 大きなレガシーファイル (100行以上にして large file 警告をトリガーする)
+        # 4. 大きなレガシーファイル (300行以上にして large file 警告をトリガーする)
         self.legacy_file = self.src_dir / "legacy.py"
-        large_content = "\n".join([f"line_{i} = {i}" for i in range(150)])
+        large_content = "\n".join([f"line_{i} = {i}" for i in range(350)])
         self.legacy_file.write_text(large_content, encoding="utf-8")
+
+        # 4b. 空の __init__.py (no tests 警告から除外されるべきファイル)
+        self.init_file = self.src_dir / "__init__.py"
+        self.init_file.write_text("", encoding="utf-8")
 
         # 5. pyproject.toml (config/entrypoint)
         self.toml_file = self.test_dir / "pyproject.toml"
@@ -82,6 +86,21 @@ class TestMachineAnalysis(unittest.TestCase):
             "test-cli = 'src.runner:main'\n",
             encoding="utf-8"
         )
+
+        # 6. 境界値・設定ファイル群 (ノイズ削減テスト用)
+        self.conftest_file = self.src_dir / "conftest.py"
+        self.conftest_file.write_text("# Test fixtures", encoding="utf-8")
+
+        self.dockerfile_file = self.test_dir / "Dockerfile"
+        self.dockerfile_file.write_text("FROM python:3.9", encoding="utf-8")
+
+        self.github_dir = self.test_dir / ".github/workflows"
+        self.github_dir.mkdir(parents=True, exist_ok=True)
+        self.workflow_file = self.github_dir / "deploy.yml"
+        self.workflow_file.write_text("name: deploy", encoding="utf-8")
+
+        self.yaml_config_file = self.src_dir / "settings.yaml"
+        self.yaml_config_file.write_text("debug: false", encoding="utf-8")
 
     def tearDown(self):
         shutil.rmtree(self.test_dir)
@@ -101,6 +120,37 @@ class TestMachineAnalysis(unittest.TestCase):
 
         meta_toml = extract_file_metadata(self.toml_file, self.test_dir)
         self.assertEqual(meta_toml["kind"], "config")
+
+        # 通常ソースだが「test」を含むファイル名の境界値テスト
+        helpers_file = self.src_dir / "test_helpers.py"
+        helpers_file.write_text("def helper(): pass", encoding="utf-8")
+        meta_helpers = extract_file_metadata(helpers_file, self.test_dir)
+        self.assertEqual(meta_helpers["kind"], "source")
+
+        tester_file = self.src_dir / "auth_tester.py"
+        tester_file.write_text("class AuthTester: pass", encoding="utf-8")
+        meta_tester = extract_file_metadata(tester_file, self.test_dir)
+        self.assertEqual(meta_tester["kind"], "source")
+
+        # 独自パッケージフォルダ配下のテストヘルパーの境界値テスト
+        kuroko_helpers = self.test_dir / "kuroko/test_utils.py"
+        kuroko_helpers.parent.mkdir(parents=True, exist_ok=True)
+        kuroko_helpers.write_text("def helper(): pass", encoding="utf-8")
+        meta_kuroko_helpers = extract_file_metadata(kuroko_helpers, self.test_dir)
+        self.assertEqual(meta_kuroko_helpers["kind"], "source")
+
+        # 新しい設定・境界ファイルの判定テスト
+        meta_conftest = extract_file_metadata(self.conftest_file, self.test_dir)
+        self.assertEqual(meta_conftest["kind"], "config")
+
+        meta_docker = extract_file_metadata(self.dockerfile_file, self.test_dir)
+        self.assertEqual(meta_docker["kind"], "config")
+
+        meta_workflow = extract_file_metadata(self.workflow_file, self.test_dir)
+        self.assertEqual(meta_workflow["kind"], "config")
+
+        meta_yaml = extract_file_metadata(self.yaml_config_file, self.test_dir)
+        self.assertEqual(meta_yaml["kind"], "config")
 
     def test_extract_file_symbols(self):
         # シンボル抽出テスト
@@ -151,6 +201,7 @@ class TestMachineAnalysis(unittest.TestCase):
             extract_file_metadata(self.runner_file, self.test_dir),
             extract_file_metadata(self.config_file, self.test_dir),
             extract_file_metadata(self.legacy_file, self.test_dir),
+            extract_file_metadata(self.init_file, self.test_dir),
             extract_file_metadata(self.toml_file, self.test_dir),
         ]
         
@@ -158,6 +209,7 @@ class TestMachineAnalysis(unittest.TestCase):
             extract_file_symbols(self.runner_file, self.test_dir),
             extract_file_symbols(self.config_file, self.test_dir),
             extract_file_symbols(self.legacy_file, self.test_dir),
+            extract_file_symbols(self.init_file, self.test_dir),
             extract_file_symbols(self.toml_file, self.test_dir),
         ]
 
@@ -166,12 +218,14 @@ class TestMachineAnalysis(unittest.TestCase):
         # 注意項目の検出を確認
         attention_texts = [att for att in attention]
         
-        # 1. legacy.py は 100 行以上のため large file であること
+        # 1. legacy.py は 300 行以上のため large file であること
         self.assertTrue(any("large" in text and "legacy.py" in text for text in attention_texts))
-        # 2. config.py にはテストがない（config.py に対応する test_config.py がない）
+        # 2. config.py にはテストがない
         self.assertTrue(any("no tests" in text and "config.py" in text for text in attention_texts))
         # 3. runner.py に TODO が含まれる
         self.assertTrue(any("TODO/FIXME" in text and "runner.py" in text for text in attention_texts))
+        # 4. __init__.py はテスト不足警告から除外されていること
+        self.assertFalse(any("no tests" in text and "__init__.py" in text for text in attention_texts))
 
     def test_analyze_machine_level(self):
         # level 0 全体プロセスのテスト
@@ -204,5 +258,223 @@ class TestMachineAnalysis(unittest.TestCase):
         self.assertIn("## Repo Map Summary", report_content)
         self.assertIn("## Attention Points", report_content)
 
+    def test_gitignore_filtering(self):
+        # .gitignore ファイルの作成
+        gitignore_file = self.test_dir / ".gitignore"
+        gitignore_file.write_text(
+            "# ignore python caches\n"
+            "__pycache__/\n"
+            "*.pyc\n"
+            "# ignore build artifacts\n"
+            "dist/\n"
+            "build/\n"
+            "# ignore test temp directory\n"
+            "temp_to_ignore/\n"
+            "# neglect complex negation pattern for safety\n"
+            "!src/keep_me.py\n",
+            encoding="utf-8"
+        )
+        
+        # 除外されるべきフォルダとファイルの作成
+        ignored_dir = self.test_dir / "temp_to_ignore"
+        ignored_dir.mkdir()
+        ignored_file = ignored_dir / "should_be_ignored.py"
+        ignored_file.write_text("print('ignored')", encoding="utf-8")
+        
+        # 除外されるべきキャッシュフォルダの作成
+        pytest_cache_dir = self.test_dir / ".pytest_cache"
+        pytest_cache_dir.mkdir()
+        pytest_cache_file = pytest_cache_dir / "nodeids"
+        pytest_cache_file.write_text("nodeid_data", encoding="utf-8")
+        
+        serena_dir = self.test_dir / ".serena"
+        serena_dir.mkdir()
+        serena_file = serena_dir / "document_symbols.pkl"
+        serena_file.write_text("pickle_data", encoding="utf-8")
+
+        egg_info_dir = self.test_dir / "test_project.egg-info"
+        egg_info_dir.mkdir()
+        egg_info_file = egg_info_dir / "PKG-INFO"
+        egg_info_file.write_text("pkg_info_data", encoding="utf-8")
+        
+        # 無視されない通常ファイル
+        kept_file = self.src_dir / "keep_me.py"
+        kept_file.write_text("print('keep')", encoding="utf-8")
+        
+        result = analyze_machine_level(self.test_dir, self.output_dir)
+        files_paths = [f["path"] for f in result["files"]]
+        
+        # 無視されるべきファイルが含まれていないことを確認
+        self.assertNotIn("temp_to_ignore/should_be_ignored.py", files_paths)
+        self.assertNotIn(".pytest_cache/nodeids", files_paths)
+        self.assertNotIn(".serena/document_symbols.pkl", files_paths)
+        self.assertNotIn("test_project.egg-info/PKG-INFO", files_paths)
+        
+        # 通常ファイルが維持されていることを確認
+        self.assertIn("src/keep_me.py", files_paths)
+
+    def test_machine_synthesized_reports(self):
+        # 1回目：ドキュメントなし（カバレッジ0%）の検証
+        analyze_machine_level(self.test_dir, self.output_dir)
+        
+        index_path = self.output_dir / "index.md"
+        report_path = self.output_dir / "analysis_report.md"
+        
+        self.assertTrue(index_path.exists())
+        self.assertTrue(report_path.exists())
+        
+        report_content = report_path.read_text(encoding="utf-8")
+        # コントローラー互換フォーマットの検証
+        self.assertIn("Status:** finished  \n", report_content)
+        self.assertIn("Steps Used:** 0  \n", report_content)
+        self.assertIn("Approx Tokens:** 0  \n", report_content)
+        self.assertIn("## Source Coverage", report_content)
+        self.assertIn("Source files discovered:", report_content)
+        self.assertIn("Source files missing matching docs:", report_content)
+        
+        # 詳細な行末スペースとセクションの完全同期テスト
+        self.assertIn("Root Directory:** `" + str(self.test_dir.resolve()) + "`  \n", report_content)
+        self.assertIn("### Weak Or Failed Docs\n\n- (none)", report_content)
+        self.assertIn("### Extra Docs Without Matching Source\n\n- (none)", report_content)
+        
+        index_content = index_path.read_text(encoding="utf-8")
+        self.assertIn("Directory: " + self.test_dir.name, index_content)
+        self.assertIn("Stale or Newly Added Files", index_content)
+        # 通常のソースファイルは要説明として検出されること
+        self.assertIn("src/runner.py", index_content)
+        # テストファイルや設定ファイルは要説明に入っていないこと
+        self.assertNotIn("tests/test_runner.py", index_content)
+        self.assertNotIn("pyproject.toml", index_content)
+        
+        # 境界・ノイズ設定ファイルが除外されていることの検証
+        self.assertNotIn("conftest.py", index_content)
+        self.assertNotIn("Dockerfile", index_content)
+        self.assertNotIn("deploy.yml", index_content)
+        self.assertNotIn("settings.yaml", index_content)
+
+    def test_coverage_and_stale_detection(self):
+        # 2回目：ダミー解説ドキュメントを配置してカバレッジやStaleを検証するテスト
+        
+        # validなドキュメントを作成 (runner.py.md)
+        doc_dir = self.output_dir / "src"
+        doc_dir.mkdir(parents=True, exist_ok=True)
+        runner_doc = doc_dir / "runner.py.md"
+        runner_doc.write_text("# Runner Doc", encoding="utf-8")
+        import os
+        # ソースコードより新しく更新時刻を設定
+        runner_mtime = self.runner_file.stat().st_mtime
+        os.utime(runner_doc, (runner_mtime + 10.0, runner_mtime + 10.0))
+
+        # staleなドキュメントを作成 (config.py.md)
+        config_doc = doc_dir / "config.py.md"
+        config_doc.write_text("# Config Doc", encoding="utf-8")
+        config_mtime = self.config_file.stat().st_mtime
+        # ソースコードより古く更新時刻を設定
+        os.utime(config_doc, (config_mtime - 10.0, config_mtime - 10.0))
+
+        # 再度分析を実行
+        analyze_machine_level(self.test_dir, self.output_dir)
+
+        index_path = self.output_dir / "index.md"
+        report_path = self.output_dir / "analysis_report.md"
+        
+        report_content = report_path.read_text(encoding="utf-8")
+        # runner.py と config.py にドキュメントが存在するため、
+        # カバレッジが 0% より大きくなること
+        self.assertNotIn("Coverage: 0.0%", report_content)
+        
+        index_content = index_path.read_text(encoding="utf-8")
+        # config.py は stale としてリストされること
+        self.assertTrue(any("config.py" in line and "stale" in line for line in index_content.splitlines()))
+        # runner.py は valid なので、git modified などの別の理由がない限り index.md の「要説明」から除外されること
+        self.assertFalse(any("src/runner.py" in line and "missing" in line for line in index_content.splitlines()))
+        # テストファイルは missing doc と判定されないため、リストされないこと
+        self.assertNotIn("tests/test_runner.py", index_content)
+
+    def test_dependency_graph_building(self):
+        # 依存関係抽出と Mermaid グラフ生成、トポロジカルソートの統合検証テスト
+        # setUp にて runner.py が src.config に依存している
+        result = analyze_machine_level(self.test_dir, self.output_dir)
+        
+        # 1. JSON の出力内容に symbols と imports があり、逆引き解決されていることの検証
+        json_path = self.output_dir / "machine_analysis.json"
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            self.assertIn("dependency_graph", data)
+            dep_graph = data["dependency_graph"]
+            # runner.py -> config.py の依存関係
+            self.assertIn("src/config.py", dep_graph.get("src/runner.py", []))
+
+        # 2. machine_report.md に Mermaid グラフが出力されていることの検証
+        report_path = self.output_dir / "machine_report.md"
+        report_content = report_path.read_text(encoding="utf-8")
+        self.assertIn("## Dependency Graph Map", report_content)
+        self.assertIn("graph TD", report_content)
+        # エスケープされたノード名が定義されていること
+        self.assertIn("src/runner.py", report_content)
+        self.assertIn("src/config.py", report_content)
+
+        # 3. index.md の Stale or Newly Added Files がボトムアップ推奨読解順（config.py が runner.py より先）に並んでいることの検証
+        index_path = self.output_dir / "index.md"
+        index_content = index_path.read_text(encoding="utf-8")
+        lines = index_content.splitlines()
+        
+        runner_idx = -1
+        config_idx = -1
+        for i, line in enumerate(lines):
+            if "src/runner.py" in line:
+                runner_idx = i
+            elif "src/config.py" in line:
+                config_idx = i
+                
+        self.assertTrue(config_idx != -1 and runner_idx != -1)
+        # config.py は runner.py の依存先なので、先に読むべき（インデックスの上位）
+        self.assertTrue(config_idx < runner_idx, f"Expected config.py (idx {config_idx}) to be before runner.py (idx {runner_idx})")
+
+    def test_dependency_cycles_and_determinism(self):
+        # 循環参照が存在する場合のハング防止、および決定論的なアルファベット順ソートの検証テスト
+        
+        # 相互参照するダミーファイルを作成
+        cycle_a = self.src_dir / "cycle_a.py"
+        cycle_a.write_text("from src.cycle_b import B\nclass A: pass", encoding="utf-8")
+        cycle_b = self.src_dir / "cycle_b.py"
+        cycle_b.write_text("from src.cycle_a import A\nclass B: pass", encoding="utf-8")
+        
+        # 無限ループせずに正常終了すること
+        result = analyze_machine_level(self.test_dir, self.output_dir)
+        
+        # JSON内の dependency_graph に循環が記録、あるいは安全に処理されていること
+        json_path = self.output_dir / "machine_analysis.json"
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            self.assertIn("dependency_graph", data)
+            
+        # index.md が一意に出力されていることの確認
+        index_path = self.output_dir / "index.md"
+        index_content = index_path.read_text(encoding="utf-8")
+        self.assertIn("src/cycle_a.py", index_content)
+        self.assertIn("src/cycle_b.py", index_content)
+
+    def test_mermaid_limit_guard(self):
+        # 大規模プロジェクト時の Mermaid ノード数制限ガードの検証テスト
+        # 制限（50件）を超えるように55個のダミーソースファイルを作成
+        for i in range(55):
+            dummy_file = self.src_dir / f"dummy_{i:02d}.py"
+            # 決定論的な依存関係を少し作っておく
+            if i > 0:
+                dummy_file.write_text(f"from src.dummy_{i-1:02d} import X", encoding="utf-8")
+            else:
+                dummy_file.write_text("pass", encoding="utf-8")
+                
+        analyze_machine_level(self.test_dir, self.output_dir)
+        
+        report_path = self.output_dir / "machine_report.md"
+        report_content = report_path.read_text(encoding="utf-8")
+        
+        # Mermaid グラフがスキップされ、注意警告文になっていること
+        self.assertIn("Dependency graph is too large to display as a Mermaid diagram", report_content)
+        self.assertNotIn("graph TD", report_content)
+
 if __name__ == "__main__":
     unittest.main()
+

@@ -4,6 +4,7 @@ import os
 import ast
 import re
 import json
+import fnmatch
 import hashlib
 import subprocess
 from pathlib import Path, PurePosixPath
@@ -101,11 +102,27 @@ def extract_file_metadata(path: Path, root: Path, previous_meta: dict[str, Any] 
     # ファイル種別の判定 (kind)
     kind = "source"
     parts = Path(rel_path).parts
-    if any(p == "tests" or p == "test" or p.startswith("test_") for p in parts) or abs_path.stem.startswith("test_") or abs_path.stem.endswith("_test"):
+    parent_parts = parts[:-1]
+    is_test_dir = any(p in ("tests", "test") or p.startswith("test_") for p in parent_parts)
+    is_test_file = abs_path.stem.startswith("test_") or abs_path.stem.endswith("_test")
+    is_helper_file = any(w in abs_path.stem.lower() for w in ("helper", "util", "fixture", "mock", "stub"))
+
+    # よくある設定ファイル・デプロイファイル等のリスト
+    config_names = {
+        "pyproject.toml", "requirements.txt", "package.json", "Makefile", "setup.py", 
+        "uv.lock", "Cargo.toml", "CMakeLists.txt", "go.mod", "go.sum", ".gitignore", 
+        "pnpm-lock.yaml", "yarn.lock", "Dockerfile", "docker-compose.yml", "compose.yml", 
+        "compose.yaml", ".dockerignore", ".editorconfig", "conftest.py", "__init__.py"
+    }
+
+    is_github_asset = any(p == ".github" for p in parent_parts)
+    is_config_extension = abs_path.suffix.lower() in (".yaml", ".yml", ".json", ".toml", ".xml", ".ini", ".cfg")
+
+    if is_test_dir or (is_test_file and not is_helper_file):
         kind = "test"
-    elif abs_path.name in ("pyproject.toml", "requirements.txt", "package.json", "Makefile", "setup.py", "uv.lock", "Cargo.toml", "CMakeLists.txt", "go.mod", "go.sum", ".gitignore", "pnpm-lock.yaml", "yarn.lock"):
+    elif abs_path.name in config_names or is_github_asset or is_config_extension:
         kind = "config"
-    elif any(p in ("docs", "doc", "wiki") for p in parts) or abs_path.suffix.lower() in (".md", ".rst", ".txt", ".pdf") or abs_path.name == "LICENSE":
+    elif any(p in ("docs", "doc", "wiki") for p in parent_parts) or abs_path.suffix.lower() in (".md", ".rst", ".txt", ".pdf") or abs_path.name == "LICENSE":
         kind = "doc"
     elif is_probably_binary(abs_path):
         kind = "other"
@@ -129,6 +146,14 @@ def extract_file_metadata(path: Path, root: Path, previous_meta: dict[str, Any] 
         else:
             status = "added"
 
+    todo_count = 0
+    if kind == "source" and not is_probably_binary(abs_path):
+        try:
+            content = abs_path.read_text(encoding="utf-8", errors="ignore")
+            todo_count = len(re.findall(r'(?:TODO|FIXME)[:\s]+(.*)', content, re.IGNORECASE))
+        except Exception:
+            pass
+
     return {
         "path": rel_path,
         "hash": file_hash,
@@ -138,6 +163,7 @@ def extract_file_metadata(path: Path, root: Path, previous_meta: dict[str, Any] 
         "kind": kind,
         "last_seen_commit": last_commit,
         "status": status,
+        "todo_count": todo_count,
     }
 
 
@@ -363,7 +389,8 @@ def build_repo_map_summary(root: Path, files_meta: list[dict[str, Any]]) -> dict
 def detect_attention_points(
     root: Path,
     files_meta: list[dict[str, Any]],
-    symbols_list: list[dict[str, Any]]
+    symbols_list: list[dict[str, Any]],
+    previous_meta: dict[str, Any] | None = None
 ) -> list[str]:
     attention = []
     
@@ -389,19 +416,21 @@ def detect_attention_points(
                     if other_mod_name == mod.split(".")[-1]:
                         fan_in[other_path] = fan_in.get(other_path, 0) + 1
 
-    # 1. 巨大ファイルの検出 (Large files: 例: 100行以上)
+    # 1. 巨大ファイルの検出 (Large files: しきい値300行)
     for path, meta in meta_by_path.items():
         if meta["kind"] == "source":
             try:
                 line_count = len((root / path).read_text(encoding="utf-8", errors="ignore").splitlines())
-                if line_count > 100:
+                if line_count > 300:
                     attention.append(f"file is large: {path}, {line_count} lines")
             except Exception:
                 pass
 
-    # 2. テストの有無の判定 (no tests found)
+    # 2. テストの有無の判定 (no tests found - __init__.py とサイズ50B未満の極小ファイルを除外)
     for path, meta in meta_by_path.items():
         if meta["kind"] == "source" and meta["language"] == "python":
+            if Path(path).name == "__init__.py" or meta["size"] < 50:
+                continue
             stem = Path(path).stem
             test_exists = False
             for test_path in symbols_by_path.keys():
@@ -412,14 +441,26 @@ def detect_attention_points(
             if not test_exists:
                 attention.append(f"no tests found for {path}")
 
-    # 3. TODO/FIXME の検出
+    # 3. TODO/FIXME の検出 (過去のメタデータがあれば増加分だけを報告)
     for path, meta in meta_by_path.items():
         if meta["kind"] == "source" and not is_probably_binary(root / path):
             try:
                 content = (root / path).read_text(encoding="utf-8", errors="ignore")
                 matches = re.findall(r'(?:TODO|FIXME)[:\s]+(.*)', content, re.IGNORECASE)
                 if matches:
-                    attention.append(f"TODO/FIXME count increased in {path}: {len(matches)} items")
+                    prev_count = 0
+                    has_previous = False
+                    if previous_meta and path in previous_meta:
+                        prev_todo = previous_meta[path].get("todo_count")
+                        if prev_todo is not None:
+                            prev_count = prev_todo
+                            has_previous = True
+                            
+                    if has_previous:
+                        if len(matches) > prev_count:
+                            attention.append(f"TODO/FIXME count increased in {path}: {len(matches)} items")
+                    else:
+                        attention.append(f"TODO/FIXME count increased in {path}: {len(matches)} items")
             except Exception:
                 pass
 
@@ -435,17 +476,222 @@ def detect_attention_points(
     return attention
 
 
+
+def resolve_module_to_path(module_name: str, src_files: list[str], current_file: str) -> str | None:
+    # 1. 相対インポートの解決
+    if module_name.startswith("."):
+        dots_count = 0
+        for char in module_name:
+            if char == ".":
+                dots_count += 1
+            else:
+                break
+        
+        curr_parts = current_file.split("/")
+        if len(curr_parts) > dots_count:
+            base_dir_parts = curr_parts[:-dots_count]
+            rem_mod = module_name[dots_count:]
+            if rem_mod:
+                resolved_parts = base_dir_parts + rem_mod.split(".")
+            else:
+                resolved_parts = base_dir_parts
+            
+            possible_rel_path = "/".join(resolved_parts)
+            for src in src_files:
+                src_no_ext = src.rsplit(".", 1)[0]
+                if src_no_ext == possible_rel_path:
+                    return src
+                if src_no_ext + "/__init__" == possible_rel_path:
+                    return src
+        return None
+
+    # 2. 絶対インポートの解決
+    for src in src_files:
+        src_no_ext = src.rsplit(".", 1)[0]
+        dotted_src = src_no_ext.replace("/", ".")
+        if dotted_src == module_name:
+            return src
+        if src_no_ext.endswith("/__init__"):
+            package_dotted = src_no_ext[:-9].replace("/", ".")
+            if package_dotted == module_name:
+                return src
+        # パッケージの階層構造（サブモジュールやクラスなどのインポート）に対応
+        if module_name.startswith(dotted_src + "."):
+            return src
+
+    return None
+
+
+def build_dependency_graph(files_meta: list[dict[str, Any]], symbols_list: list[dict[str, Any]]) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    # kind == "source" かつ language != "unknown" の通常ソースファイルのみを対象とする
+    files = [m["path"] for m in files_meta if m["kind"] == "source" and m["language"] != "unknown"]
+    symbols_by_path = {sym["path"]: sym for sym in symbols_list}
+    
+    forward_graph = {f: [] for f in files}
+    backward_graph = {f: [] for f in files}
+    
+    for f in files:
+        if f not in symbols_by_path:
+            continue
+        sym_info = symbols_by_path[f]
+        imports = sym_info.get("imports", [])
+        
+        for imp in imports:
+            mod_name = imp["module"]
+            resolved_path = resolve_module_to_path(mod_name, files, f)
+            if resolved_path and resolved_path != f:
+                if resolved_path not in forward_graph[f]:
+                    forward_graph[f].append(resolved_path)
+                if f not in backward_graph[resolved_path]:
+                    backward_graph[resolved_path].append(f)
+                    
+    return forward_graph, backward_graph
+
+
+def topological_sort(graph: dict[str, list[str]]) -> list[str]:
+    # 入次数を計算
+    in_degree = {u: 0 for u in graph}
+    for u in graph:
+        for v in graph[u]:
+            in_degree[v] = in_degree.get(v, 0) + 1
+            
+    # 入次数0のノードをキューに追加 (決定論的な順序を保つためソート)
+    queue = sorted([u for u in graph if in_degree[u] == 0])
+    order = []
+    
+    while queue:
+        u = queue.pop(0)
+        order.append(u)
+        
+        for v in sorted(graph.get(u, [])):
+            in_degree[v] -= 1
+            if in_degree[v] == 0:
+                queue.append(v)
+                queue.sort() # キューの中身を常にソートして決定論的な取り出し順を保つ
+                
+    # 循環参照などによりソートしきれなかったノードを決定論的順序で追加 (無限ループ防止ガード)
+    remaining = sorted([u for u in graph if u not in order])
+    if remaining:
+        order.extend(remaining)
+        
+    return order
+
+
+def generate_mermaid_graph(forward_graph: dict[str, list[str]]) -> str:
+    # 描画制限: ノード数が 50 を超える場合は描画をスキップして警告
+    total_nodes = len(forward_graph)
+    if total_nodes > 50:
+        return (
+            "```text\n"
+            "Dependency graph is too large to display as a Mermaid diagram.\n"
+            f"Total files: {total_nodes} (limit: 50)\n"
+            "```"
+        )
+        
+    lines = ["```mermaid", "graph TD"]
+    
+    # 依存関係（エッジ）があるノード、または依存されているノードのみを描画対象とする
+    active_nodes = set()
+    for u, vs in forward_graph.items():
+        if vs:
+            active_nodes.add(u)
+            for v in vs:
+                active_nodes.add(v)
+                
+    if not active_nodes:
+        return "*(No internal module dependencies detected)*"
+        
+    # ノードの定義 (IDとラベル)
+    node_ids = {}
+    for i, node in enumerate(sorted(list(active_nodes))):
+        node_ids[node] = f"node_{i}"
+        label = node
+        parts = Path(node).parts
+        if len(parts) > 1:
+            label = f"{parts[-2]}/{parts[-1]}"
+        lines.append(f"  {node_ids[node]}[\"{label}\"]")
+        
+    # エッジの定義
+    for u in sorted(forward_graph.keys()):
+        if u not in node_ids:
+            continue
+        for v in sorted(forward_graph[u]):
+            if v not in node_ids:
+                continue
+            lines.append(f"  {node_ids[u]} --> {node_ids[v]}")
+            
+    lines.append("```")
+    return "\n".join(lines)
+
+
+def parse_gitignore(root: Path) -> list[str]:
+    gitignore_path = root / ".gitignore"
+    if not gitignore_path.exists():
+        return []
+    patterns = []
+    with open(gitignore_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            # 空行、コメント、および否定パターンは簡易除外では処理しないため無視リストから除外
+            if not line or line.startswith("#") or line.startswith("!"):
+                continue
+            patterns.append(line)
+    return patterns
+
+
+def should_ignore(path: Path, root: Path, gitignore_patterns: list[str]) -> bool:
+    try:
+        rel_path = path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return True
+    rel_path_str = rel_path.as_posix()
+    
+    # ハードコードされた無視ディレクトリ
+    ignore_dirs = {".git", "__pycache__", "venv", ".venv", ".env", "node_modules", ".vscode", ".idea", "dist", "build"}
+    # 明示的に無視したい一時・キャッシュディレクトリ
+    extra_ignore_dirs = {".pytest_cache", ".serena", ".kelpie"}
+    
+    for part in rel_path.parts:
+        if part in ignore_dirs or part in extra_ignore_dirs or part.endswith(".egg-info"):
+            return True
+
+    # .gitignore パターンマッチ
+    for pattern in gitignore_patterns:
+        # ディレクトリ制限の処理
+        if pattern.endswith("/"):
+            p = pattern.rstrip("/")
+            if any(fnmatch.fnmatch(part, p) for part in rel_path.parts):
+                return True
+        else:
+            # 任意のファイル・ディレクトリ名にマッチ
+            if fnmatch.fnmatch(rel_path_str, pattern) or any(fnmatch.fnmatch(part, pattern) for part in rel_path.parts):
+                return True
+            # ルートからの絶対的な指定
+            if pattern.startswith("/"):
+                p = pattern.lstrip("/")
+                if fnmatch.fnmatch(rel_path_str, p):
+                    return True
+    return False
+
+
 def generate_machine_report(
     root: Path,
     files_meta: list[dict[str, Any]],
     repo_map: dict[str, Any],
-    attention: list[str]
+    attention: list[str],
+    forward_graph: dict[str, list[str]]
 ) -> str:
+    mermaid_diag = generate_mermaid_graph(forward_graph)
+
     lines = [
         "# Project Machine Analysis Report",
         "",
         f"**Root Directory:** `{root.resolve()}`",
         f"**Total Files Discovered:** {len(files_meta)}",
+        "",
+        "## Dependency Graph Map",
+        "",
+        mermaid_diag,
         "",
         "## Repo Map Summary",
         "",
@@ -519,14 +765,16 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
         except Exception:
             pass
 
+    # .gitignore パターンの取得
+    gitignore_patterns = parse_gitignore(root)
+
     # ファイルの走査
-    ignore_list = {".git", "__pycache__", "venv", ".venv", ".env", "node_modules", ".vscode", ".idea", "dist", "build"}
     all_files = []
+    ignored_count = 0
     for p in sorted(root.rglob("*")):
         if p.is_file() and not p.is_symlink():
-            # 無視ディレクトリのチェック
-            rel_parts = p.relative_to(root).parts
-            if any(part in ignore_list for part in rel_parts):
+            if should_ignore(p, root, gitignore_patterns):
+                ignored_count += 1
                 continue
             all_files.append(p)
 
@@ -544,7 +792,11 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
     repo_map = build_repo_map_summary(root, files_meta)
 
     # アテンションポイント検出
-    attention = detect_attention_points(root, files_meta, symbols_list)
+    attention = detect_attention_points(root, files_meta, symbols_list, previous_meta)
+
+    # 依存関係グラフの構築とトポロジカルソート
+    forward_graph, backward_graph = build_dependency_graph(files_meta, symbols_list)
+    dependency_order = topological_sort(backward_graph)
 
     # 最終データの統合
     result = {
@@ -552,6 +804,8 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
         "symbols": symbols_list,
         "repo_map": repo_map,
         "attention": attention,
+        "dependency_graph": forward_graph,
+        "dependency_order": dependency_order,
     }
 
     # 機械向け JSON 書き出し
@@ -563,7 +817,145 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
 
     # 人間向け Markdown 書き出し
     report_path = output_dir / "machine_report.md"
-    report_content = generate_machine_report(root, files_meta, repo_map, attention)
+    report_content = generate_machine_report(root, files_meta, repo_map, attention, forward_graph)
     report_path.write_text(report_content, encoding="utf-8")
+
+    # ドキュメントの存在有無・更新チェックとカバレッジの算出
+    missing_docs = []
+    stale_docs = []
+    valid_docs = []
+    
+    # 対象ファイル： kind が source であり、かつ言語が判明しており（unknown でない）、バイナリやエラーでないもの
+    coverage_targets = [
+        m for m in files_meta 
+        if m["kind"] == "source" 
+        and m["language"] != "unknown" 
+        and m["hash"] not in ("binary_skipped", "error")
+    ]
+    
+    for meta in coverage_targets:
+        rel_path = meta["path"]
+        doc_candidates = [
+            output_dir / f"{rel_path}.md",
+            output_dir / Path(rel_path).with_suffix(".md")
+        ]
+        
+        found_doc = None
+        for candidate in doc_candidates:
+            if candidate.exists() and candidate.is_file():
+                found_doc = candidate
+                break
+                
+        if not found_doc:
+            missing_docs.append(rel_path)
+        else:
+            source_mtime = meta["mtime"]
+            doc_mtime = found_doc.stat().st_mtime
+            is_unchanged = (meta["status"] == "unchanged")
+            
+            # ソースコード更新日時がドキュメント更新日時 + 2.0秒より新しく、かつ内容に変更がある場合を stale と判定
+            if source_mtime > doc_mtime + 2.0 and not is_unchanged:
+                stale_docs.append(rel_path)
+            else:
+                valid_docs.append(rel_path)
+                
+    total_targets = len(coverage_targets)
+    documented_count = total_targets - len(missing_docs)
+    coverage_percent = (documented_count / total_targets * 100) if total_targets > 0 else 100.0
+
+    # analysis_report.md の自動合成 (コントローラー互換フォーマット)
+    percent_str = f"{coverage_percent:.1f}%"
+    analysis_report = (
+        f"# Project Analysis Report: {root.name}\n\n"
+        f"**Root Directory:** `{root}`  \n"
+        f"**Backend:** none (machine scan only)  \n"
+        f"**Runtime:** controller  \n"
+        f"**Status:** finished  \n"
+        f"**Steps Used:** 0  \n"
+        f"**Approx Tokens:** 0  \n"
+        f"**Worker Budget:** 0 tokens, 0 LLM calls  \n"
+        f"**Synthesis RLM Budget:** 0 tokens, 0 LLM calls  \n"
+        f"**Global Budget:** 0 tokens, 0 LLM calls  \n\n"
+        f"## Executive Summary\n\n"
+        f"This report summarizes the static machine scan of the project. No LLM resources were utilized.\n\n"
+        f"## Source Coverage\n\n"
+        f"- Source files discovered: {total_targets}\n"
+        f"- Source files with matching docs: {documented_count}\n"
+        f"- Source files missing matching docs: {len(missing_docs)}\n"
+        f"- Extra docs without matching source: 0\n"
+        f"- Weak or failed docs: 0\n"
+        f"- Fallback docs generated: 0\n"
+        f"- Coverage: {percent_str}\n\n"
+        f"### Fallback Generated Source Docs\n\n"
+        f"- (none)\n\n"
+        f"### Missing Source Docs\n\n"
+    )
+    if missing_docs:
+        analysis_report += "\n".join(f"- `{path}`" for path in sorted(missing_docs)) + "\n\n"
+    else:
+        analysis_report += "- (none)\n\n"
+        
+    analysis_report += (
+        f"### Extra Docs Without Matching Source\n\n"
+        f"- (none)\n\n"
+        f"### Weak Or Failed Docs\n\n"
+        f"- (none)\n\n"
+        f"## Step History\n\n"
+        f"| Step | Kind | Status | Summary |\n"
+        f"| :--- | :--- | :--- | :--- |\n"
+        f"| 1 | machine_scan | OK | Static machine scan completed successfully. |\n"
+    )
+    (output_dir / "analysis_report.md").write_text(analysis_report, encoding="utf-8")
+
+    # index.md の自動合成
+    changed_files = [m["path"] for m in files_meta if m["status"] in ("changed", "added") and m["kind"] == "source" and m["language"] != "unknown"]
+    # 解説が必要なファイル（新規・変更されたファイル、解説欠損、陳腐化ドキュメント）
+    needs_explanation = set(changed_files) | set(missing_docs) | set(stale_docs)
+    
+    # トポロジカルソート順（Bottom-up）で並べ替え
+    sorted_needs_explanation = []
+    for f in dependency_order:
+        if f in needs_explanation:
+            sorted_needs_explanation.append(f)
+    # ソート順に含まれなかったものを決定論的に末尾に追加
+    for f in sorted(list(needs_explanation)):
+        if f not in sorted_needs_explanation:
+            sorted_needs_explanation.append(f)
+            
+    index_content = (
+        f"# Directory: {root.name}\n\n"
+        f"Welcome to the static analysis index for `{root.name}`.\n\n"
+        f"## Project Summary\n"
+        f"- **Total Source Files:** {len(all_files)}\n"
+        f"- **Status:** Static Scan Complete\n\n"
+        f"## Stale or Newly Added Files (Need Explanation)\n"
+        f"These files are either new or modified, and their corresponding documentation (if any) may be stale.\n"
+    )
+    if sorted_needs_explanation:
+        for cf in sorted_needs_explanation:
+            reasons = []
+            if cf in missing_docs:
+                reasons.append("missing doc")
+            elif cf in stale_docs:
+                reasons.append("stale doc")
+            
+            m_status = next((m["status"] for m in files_meta if m["path"] == cf), None)
+            if m_status in ("changed", "added"):
+                reasons.append(f"source {m_status}")
+                
+            reason_str = f" ({', '.join(reasons)})" if reasons else ""
+            index_content += f"- [ ] `{cf}`{reason_str}\n"
+    else:
+        index_content += "- No modified or added files detected. All files are unchanged.\n"
+        
+    index_content += "\n## High Priority Files to Inspect (Attention Points)\nThese files have warnings or high complexity:\n"
+    if attention:
+        for att in attention:
+            index_content += f"- {att}\n"
+    else:
+        index_content += "- No critical attention points.\n"
+        
+    index_content += f"\n## Directory Structure Overview\nRefer to [machine_report.md](./machine_report.md) for the full inventory.\n"
+    (output_dir / "index.md").write_text(index_content, encoding="utf-8")
 
     return result
