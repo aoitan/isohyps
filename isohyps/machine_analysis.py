@@ -37,6 +37,16 @@ def simple_yaml_dump(data: Any, indent_level: int = 0) -> str:
         return f"{spacing}{data}"
 
 
+def _build_coverage_targets(files_meta: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        meta
+        for meta in files_meta
+        if meta["kind"] == "source"
+        and meta["language"] != "unknown"
+        and meta["hash"] not in ("binary_skipped", "error")
+    ]
+
+
 def get_git_commit_hash(path: Path) -> str | None:
     try:
         res = subprocess.run(
@@ -232,6 +242,8 @@ def extract_file_symbols(path: Path, root: Path) -> dict[str, Any]:
         "symbols": [],
         "imports": [],
         "exports": [],
+        "classes": [],
+        "functions": [],
     }
 
     if is_probably_binary(abs_path):
@@ -248,6 +260,8 @@ def extract_file_symbols(path: Path, root: Path) -> dict[str, Any]:
         result["symbols"] = symbols
         result["imports"] = imports
         result["exports"] = exports
+        result["classes"] = [s["name"] for s in symbols if s.get("kind") == "class"]
+        result["functions"] = [s["name"] for s in symbols if s.get("kind") == "function"]
         return result
 
     # Python 以外は、tree_sitter があれば試み、なければ簡易的な正規表現
@@ -319,6 +333,9 @@ def extract_file_symbols(path: Path, root: Path) -> dict[str, Any]:
             module_name = import_match.group(1)
             is_internal = module_name.startswith((".", "/")) or any(p in module_name for p in ("src", "isohyps"))
             result["imports"].append({"module": module_name, "internal": is_internal})
+
+    result["classes"] = [s["name"] for s in result.get("symbols", []) if s.get("kind") == "class"]
+    result["functions"] = [s["name"] for s in result.get("symbols", []) if s.get("kind") == "function"]
 
     return result
 
@@ -398,24 +415,6 @@ def detect_attention_points(
     meta_by_path = {meta["path"]: meta for meta in files_meta}
     symbols_by_path = {sym["path"]: sym for sym in symbols_list}
 
-    # インポートの集計 (fan-in / fan-out)
-    fan_in = {}  # モジュールがインポートされている回数
-    fan_out = {} # 各ファイルがインポートしている内部モジュールの数
-
-    for path, sym in symbols_by_path.items():
-        fan_out[path] = 0
-        for imp in sym["imports"]:
-            mod = imp["module"]
-            is_internal = imp["internal"]
-            
-            if is_internal:
-                fan_out[path] += 1
-                # インポート元のモジュール名を簡易判定
-                for other_path in meta_by_path.keys():
-                    other_mod_name = Path(other_path).stem
-                    if other_mod_name == mod.split(".")[-1]:
-                        fan_in[other_path] = fan_in.get(other_path, 0) + 1
-
     # 1. 巨大ファイルの検出 (Large files: しきい値300行)
     for path, meta in meta_by_path.items():
         if meta["kind"] == "source":
@@ -464,14 +463,14 @@ def detect_attention_points(
             except Exception:
                 pass
 
-    # 4. high fan-in / fan-out
-    for path, count in fan_in.items():
-        if count >= 10:
-            attention.append(f"high fan-in: {path} imported by {count} files")
-            
-    for path, count in fan_out.items():
-        if count >= 15:
-            attention.append(f"high fan-out: {path} imports {count} internal modules")
+    # 4. high fan-in / fan-out (ファイルの厳密な依存関係メトリクスに基づく)
+    for path, meta in meta_by_path.items():
+        fi_count = meta.get("fan_in", 0)
+        fo_count = meta.get("fan_out", 0)
+        if fi_count >= 5:
+            attention.append(f"high fan-in: {path} imported by {fi_count} files")
+        if fo_count >= 15:
+            attention.append(f"high fan-out: {path} imports {fo_count} internal modules")
 
     return attention
 
@@ -788,51 +787,56 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
     for f in all_files:
         symbols_list.append(extract_file_symbols(f, root))
 
+    # シンボルとアウトライン情報を files_meta にマージ
+    symbols_by_path = {sym["path"]: sym for sym in symbols_list}
+    for meta in files_meta:
+        rel_path = meta["path"]
+        sym_info = symbols_by_path.get(rel_path, {})
+        classes = sym_info.get("classes", [])
+        functions = sym_info.get("functions", [])
+        meta["classes"] = classes
+        meta["functions"] = functions
+
+        # 公開・内部シンボルの分類
+        public_symbols = []
+        internal_symbols = []
+        for sym in classes + functions:
+            if sym.startswith('_'):
+                internal_symbols.append(sym)
+            else:
+                public_symbols.append(sym)
+        meta["public_symbols"] = public_symbols
+        meta["internal_symbols"] = internal_symbols
+
+    # Gitステータスの取得とマッピング
+    git_status_map = get_git_status_info(root)
+    for meta in files_meta:
+        rel_path = meta["path"]
+        meta["git_status"] = git_status_map.get(rel_path, None)
+
     # repo_map サマリー作成
     repo_map = build_repo_map_summary(root, files_meta)
-
-    # アテンションポイント検出
-    attention = detect_attention_points(root, files_meta, symbols_list, previous_meta)
 
     # 依存関係グラフの構築とトポロジカルソート
     forward_graph, backward_graph = build_dependency_graph(files_meta, symbols_list)
     dependency_order = topological_sort(backward_graph)
 
-    # 最終データの統合
-    result = {
-        "files": files_meta,
-        "symbols": symbols_list,
-        "repo_map": repo_map,
-        "attention": attention,
-        "dependency_graph": forward_graph,
-        "dependency_order": dependency_order,
-    }
+    # ファンイン・ファンアウトメトリクスの算出
+    for meta in files_meta:
+        rel_path = meta["path"]
+        meta["fan_in"] = len(backward_graph.get(rel_path, []))
+        meta["fan_out"] = len(forward_graph.get(rel_path, []))
 
-    # 機械向け JSON 書き出し
-    json_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    # アテンションポイント検出
+    attention = detect_attention_points(root, files_meta, symbols_list, previous_meta)
 
-    # 機械向け YAML 書き出し (PyYAML非依存)
-    yaml_path = output_dir / "machine_analysis.yaml"
-    yaml_path.write_text(simple_yaml_dump(result), encoding="utf-8")
-
-    # 人間向け Markdown 書き出し
-    report_path = output_dir / "machine_report.md"
-    report_content = generate_machine_report(root, files_meta, repo_map, attention, forward_graph)
-    report_path.write_text(report_content, encoding="utf-8")
+    coverage_targets = _build_coverage_targets(files_meta)
 
     # ドキュメントの存在有無・更新チェックとカバレッジの算出
     missing_docs = []
     stale_docs = []
     valid_docs = []
-    
-    # 対象ファイル： kind が source であり、かつ言語が判明しており（unknown でない）、バイナリやエラーでないもの
-    coverage_targets = [
-        m for m in files_meta 
-        if m["kind"] == "source" 
-        and m["language"] != "unknown" 
-        and m["hash"] not in ("binary_skipped", "error")
-    ]
-    
+
     for meta in coverage_targets:
         rel_path = meta["path"]
         doc_candidates = [
@@ -862,6 +866,56 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
     total_targets = len(coverage_targets)
     documented_count = total_targets - len(missing_docs)
     coverage_percent = (documented_count / total_targets * 100) if total_targets > 0 else 100.0
+    coverage_summary = {
+        "all_files_discovered": len(all_files),
+        "ignored_files": ignored_count,
+        "coverage_target_files": total_targets,
+        "documented_files": documented_count,
+        "missing_docs": len(missing_docs),
+        "stale_docs": len(stale_docs),
+        "coverage_percent": coverage_percent,
+    }
+    coverage_contract = {
+        "include": [
+            "kind == source",
+            "language != unknown",
+            "hash not in ('binary_skipped', 'error')",
+        ],
+        "exclude": [
+            "kind in test/config/doc/other",
+            "ignored by .gitignore",
+        ],
+        "counts": coverage_summary,
+    }
+
+    # 最終データの統合
+    result = {
+        "files": files_meta,
+        "symbols": symbols_list,
+        "repo_map": repo_map,
+        "attention": attention,
+        "dependency_graph": forward_graph,
+        "dependency_order": dependency_order,
+        "coverage_targets": [meta["path"] for meta in coverage_targets],
+        "coverage_summary": coverage_summary,
+        "coverage_contract": coverage_contract,
+    }
+
+    # 機械向け JSON 書き出し
+    json_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # machine_index.json の書き出し
+    index_json_path = output_dir / "machine_index.json"
+    index_json_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # 機械向け YAML 書き出し (PyYAML非依存)
+    yaml_path = output_dir / "machine_analysis.yaml"
+    yaml_path.write_text(simple_yaml_dump(result), encoding="utf-8")
+
+    # 人間向け Markdown 書き出し
+    report_path = output_dir / "machine_report.md"
+    report_content = generate_machine_report(root, files_meta, repo_map, attention, forward_graph)
+    report_path.write_text(report_content, encoding="utf-8")
 
     # analysis_report.md の自動合成 (コントローラー互換フォーマット)
     percent_str = f"{coverage_percent:.1f}%"
@@ -878,6 +932,11 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
         f"**Global Budget:** 0 tokens, 0 LLM calls  \n\n"
         f"## Executive Summary\n\n"
         f"This report summarizes the static machine scan of the project. No LLM resources were utilized.\n\n"
+        f"## Coverage Contract\n\n"
+        f"- Included in coverage: source files with known language and non-binary hashes\n"
+        f"- Excluded from coverage: tests, config, docs, other, ignored paths, binary files, unknown-language files\n"
+        f"- All files discovered: {coverage_summary['all_files_discovered']}\n"
+        f"- Coverage target files: {coverage_summary['coverage_target_files']}\n\n"
         f"## Source Coverage\n\n"
         f"- Source files discovered: {total_targets}\n"
         f"- Source files with matching docs: {documented_count}\n"
@@ -909,8 +968,9 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
 
     # index.md の自動合成
     changed_files = [m["path"] for m in files_meta if m["status"] in ("changed", "added") and m["kind"] == "source" and m["language"] != "unknown"]
-    # 解説が必要なファイル（新規・変更されたファイル、解説欠損、陳腐化ドキュメント）
-    needs_explanation = set(changed_files) | set(missing_docs) | set(stale_docs)
+    git_changed = [m["path"] for m in files_meta if m.get("git_status") is not None and m["kind"] == "source" and m["language"] != "unknown"]
+    # 解説が必要なファイル（新規・変更されたファイル、解説欠損、陳腐化ドキュメント、Git変更検知されたファイル）
+    needs_explanation = set(changed_files) | set(missing_docs) | set(stale_docs) | set(git_changed)
     
     # トポロジカルソート順（Bottom-up）で並べ替え
     sorted_needs_explanation = []
@@ -926,7 +986,8 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
         f"# Directory: {root.name}\n\n"
         f"Welcome to the static analysis index for `{root.name}`.\n\n"
         f"## Project Summary\n"
-        f"- **Total Source Files:** {len(all_files)}\n"
+        f"- **Total Files Discovered:** {coverage_summary['all_files_discovered']}\n"
+        f"- **Coverage Target Files:** {coverage_summary['coverage_target_files']}\n"
         f"- **Status:** Static Scan Complete\n\n"
         f"## Stale or Newly Added Files (Need Explanation)\n"
         f"These files are either new or modified, and their corresponding documentation (if any) may be stale.\n"
@@ -942,9 +1003,38 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
             m_status = next((m["status"] for m in files_meta if m["path"] == cf), None)
             if m_status in ("changed", "added"):
                 reasons.append(f"source {m_status}")
+
+            m_git_status = next((m.get("git_status") for m in files_meta if m["path"] == cf), None)
+            if m_git_status:
+                if m_git_status == "M":
+                    reasons.append("Modified in Git")
+                elif m_git_status in ("A", "??"):
+                    reasons.append("Added in Git")
                 
             reason_str = f" ({', '.join(reasons)})" if reasons else ""
             index_content += f"- [ ] `{cf}`{reason_str}\n"
+
+            # アウトライン（クラス・関数）があれば折りたたみで表示
+            file_meta_info = next((m for m in files_meta if m["path"] == cf), None)
+            if file_meta_info:
+                pub_syms = file_meta_info.get("public_symbols", [])
+                int_syms = file_meta_info.get("internal_symbols", [])
+                if pub_syms or int_syms:
+                    index_content += "  <details>\n"
+                    index_content += "    <summary>Outline (Symbols)</summary>\n"
+                    if pub_syms:
+                        index_content += "    <strong>Public API:</strong>\n"
+                        index_content += "    <ul>\n"
+                        for s in pub_syms:
+                            index_content += f"      <li><code>{s}</code></li>\n"
+                        index_content += "    </ul>\n"
+                    if int_syms:
+                        index_content += "    <strong>Internal Helpers:</strong>\n"
+                        index_content += "    <ul>\n"
+                        for s in int_syms:
+                            index_content += f"      <li><code>{s}</code></li>\n"
+                        index_content += "    </ul>\n"
+                    index_content += "  </details>\n"
     else:
         index_content += "- No modified or added files detected. All files are unchanged.\n"
         

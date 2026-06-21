@@ -475,6 +475,137 @@ class TestMachineAnalysis(unittest.TestCase):
         self.assertIn("Dependency graph is too large to display as a Mermaid diagram", report_content)
         self.assertNotIn("graph TD", report_content)
 
+    def test_git_status_extraction(self):
+        # Gitステータス抽出と例外安全、JSON出力の検証
+        # ダミーのGit変更ファイルを模擬するため、一時ディレクトリ上にGitリポジトリを初期化してテストすることも可能だが、
+        # ここでは get_git_modified_files の戻り値が analyze_machine_level の処理を通じて
+        # JSON内の files_meta 各項目の git_status キーに格納されるかを検証。
+        result = analyze_machine_level(self.test_dir, self.output_dir)
+        json_path = self.output_dir / "machine_analysis.json"
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            # 各ファイルのメタデータに git_status がデフォルト（"?" や "unchanged" や Noneなど）で含まれていること
+            for file_info in data["files"]:
+                if file_info["kind"] == "source":
+                    self.assertIn("git_status", file_info)
+
+    def test_ast_outline_extraction(self):
+        # ASTを用いたクラス・主要関数の抽出と例外安全の検証
+        # テスト対象ファイルの1つにダミーのクラスと関数を定義しておく
+        dummy_code = (
+            "class MyDummyClass:\n"
+            "    def method(self):\n"
+            "        pass\n"
+            "def my_dummy_function():\n"
+            "    pass\n"
+        )
+        dummy_py = self.src_dir / "dummy_ast.py"
+        dummy_py.write_text(dummy_code, encoding="utf-8")
+
+        # 構文エラーのファイルも作成して例外安全（クラッシュしないこと）を検証
+        bad_py = self.src_dir / "bad_syntax.py"
+        bad_py.write_text("class Unfinished:", encoding="utf-8")
+
+        result = analyze_machine_level(self.test_dir, self.output_dir)
+        
+        json_path = self.output_dir / "machine_analysis.json"
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            
+            # files_meta 内の各ファイルに classes / functions フィールドが存在すること
+            found_dummy = False
+            found_bad = False
+            for file_info in data["files"]:
+                if file_info["path"] == "src/dummy_ast.py":
+                    found_dummy = True
+                    self.assertIn("classes", file_info)
+                    self.assertIn("functions", file_info)
+                    self.assertEqual(file_info["classes"], ["MyDummyClass"])
+                    self.assertEqual(file_info["functions"], ["my_dummy_function"])
+                elif file_info["path"] == "src/bad_syntax.py":
+                    found_bad = True
+                    self.assertIn("classes", file_info)
+                    self.assertIn("functions", file_info)
+                    self.assertEqual(file_info["classes"], [])
+                    self.assertEqual(file_info["functions"], [])
+            self.assertTrue(found_dummy)
+            self.assertTrue(found_bad)
+
+    def test_fan_in_fan_out_metrics(self):
+        # ファンイン・ファンアウトメトリクスの算出、JSON保存、およびAttention Pointsへの追加検証
+        # setUpにより runner.py が src/config.py をインポートしているため、
+        # config.py のファンインは >= 1, runner.py のファンアウトは >= 1 になるはず。
+        result = analyze_machine_level(self.test_dir, self.output_dir)
+        
+        json_path = self.output_dir / "machine_analysis.json"
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            
+            # files 各項目の fan_in / fan_out キーの存在と値の検証
+            for file_info in data["files"]:
+                if file_info["path"] == "src/config.py":
+                    self.assertIn("fan_in", file_info)
+                    self.assertGreaterEqual(file_info["fan_in"], 1)
+                elif file_info["path"] == "src/runner.py":
+                    self.assertIn("fan_out", file_info)
+                    self.assertGreaterEqual(file_info["fan_out"], 1)
+
+    def test_markdown_noise_reduction_details(self):
+        # クラス・主要関数数が閾値以上、または常に index.md 等で折りたたみ（details）構造になっているかの検証
+        result = analyze_machine_level(self.test_dir, self.output_dir)
+        index_path = self.output_dir / "index.md"
+        index_content = index_path.read_text(encoding="utf-8")
+        
+        # HTMLの details タグによる折りたたみがマークダウンに含まれていること
+        self.assertIn("<details>", index_content)
+        self.assertIn("</details>", index_content)
+
+    def test_machine_index_json_generation_and_symbol_classification(self):
+        # machine_index.json の生成と、public/internal シンボル分類の検証
+        # テスト対象ファイルの1つに、公開および内部（_始まり）のクラスと関数を定義しておく
+        dummy_code = (
+            "class PublicClass:\n"
+            "    pass\n"
+            "class _InternalClass:\n"
+            "    pass\n"
+            "def public_function():\n"
+            "    pass\n"
+            "def _internal_function():\n"
+            "    pass\n"
+        )
+        dummy_py = self.src_dir / "dummy_symbols.py"
+        dummy_py.write_text(dummy_code, encoding="utf-8")
+
+        result = analyze_machine_level(self.test_dir, self.output_dir)
+
+        index_json_path = self.output_dir / "machine_index.json"
+        self.assertTrue(index_json_path.exists())
+
+        with open(index_json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            
+            found_dummy = False
+            for file_info in data.get("files", []):
+                if file_info["path"] == "src/dummy_symbols.py":
+                    found_dummy = True
+                    self.assertIn("public_symbols", file_info)
+                    self.assertIn("internal_symbols", file_info)
+                    
+                    # 公開シンボル（先頭が _ でないもの）の検証
+                    self.assertIn("PublicClass", file_info["public_symbols"])
+                    self.assertIn("public_function", file_info["public_symbols"])
+                    self.assertNotIn("_InternalClass", file_info["public_symbols"])
+                    self.assertNotIn("_internal_function", file_info["public_symbols"])
+                    
+                    # 内部シンボル（先頭が _ で始まるもの）の検証
+                    self.assertIn("_InternalClass", file_info["internal_symbols"])
+                    self.assertIn("_internal_function", file_info["internal_symbols"])
+                    self.assertNotIn("PublicClass", file_info["internal_symbols"])
+                    self.assertNotIn("public_function", file_info["internal_symbols"])
+                    
+            self.assertTrue(found_dummy)
+
 if __name__ == "__main__":
     unittest.main()
+
 
