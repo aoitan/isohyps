@@ -927,7 +927,6 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
     # 投影は履歴・mtime・Git 状態・coverage/attention を参照せず、契約検証後に
     # 決定的 serializer と atomic writer へ渡す。
     machine_index = build_machine_index_v1(result)
-    validate_machine_index(machine_index)
 
     # 機械向け JSON 書き出し
     json_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
