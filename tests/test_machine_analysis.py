@@ -2,6 +2,8 @@ import unittest
 import tempfile
 import shutil
 import json
+import os
+from copy import deepcopy
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -12,6 +14,16 @@ from isohyps.machine_analysis import (
     extract_file_symbols,
     build_repo_map_summary,
     detect_attention_points,
+)
+from isohyps.machine_index import (
+    MACHINE_INDEX_FILE_FIELDS,
+    MACHINE_INDEX_SCHEMA_VERSION,
+    MACHINE_INDEX_TOP_LEVEL_FIELDS,
+    MachineIndexContractError,
+    build_machine_index_v1,
+    load_machine_index,
+    serialize_machine_index,
+    validate_machine_index,
 )
 
 class TestMachineAnalysis(unittest.TestCase):
@@ -101,6 +113,54 @@ class TestMachineAnalysis(unittest.TestCase):
 
         self.yaml_config_file = self.src_dir / "settings.yaml"
         self.yaml_config_file.write_text("debug: false", encoding="utf-8")
+
+    @staticmethod
+    def _valid_machine_index_fixture():
+        """Return a small v1 fixture with a dependency edge and non-source file."""
+
+        return {
+            "schema_version": MACHINE_INDEX_SCHEMA_VERSION,
+            "files": [
+                {
+                    "path": "README.md",
+                    "hash": "b" * 64,
+                    "size": 12,
+                    "language": "unknown",
+                    "kind": "doc",
+                    "public_symbols": [],
+                    "internal_symbols": [],
+                    "fan_in": 0,
+                    "fan_out": 0,
+                },
+                {
+                    "path": "src/app.py",
+                    "hash": "a" * 64,
+                    "size": 128,
+                    "language": "python",
+                    "kind": "source",
+                    "public_symbols": ["App", "run"],
+                    "internal_symbols": ["_helper"],
+                    "fan_in": 0,
+                    "fan_out": 1,
+                },
+                {
+                    "path": "src/config.py",
+                    "hash": "c" * 64,
+                    "size": 64,
+                    "language": "python",
+                    "kind": "source",
+                    "public_symbols": ["Config"],
+                    "internal_symbols": [],
+                    "fan_in": 1,
+                    "fan_out": 0,
+                },
+            ],
+            "dependency_graph": {
+                "src/app.py": ["src/config.py"],
+                "src/config.py": [],
+            },
+            "dependency_order": ["src/config.py", "src/app.py"],
+        }
 
     def tearDown(self):
         shutil.rmtree(self.test_dir)
@@ -602,10 +662,454 @@ class TestMachineAnalysis(unittest.TestCase):
                     self.assertIn("_internal_function", file_info["internal_symbols"])
                     self.assertNotIn("PublicClass", file_info["internal_symbols"])
                     self.assertNotIn("public_function", file_info["internal_symbols"])
-                    
+
             self.assertTrue(found_dummy)
+
+    def test_machine_index_preserves_exact_symbol_order(self):
+        # classes -> top-level functions の既存抽出順と public/internal 分類を固定する。
+        root = self.test_dir / "symbol-order-root"
+        source = root / "src" / "symbols.py"
+        source.parent.mkdir(parents=True)
+        source.write_text(
+            "class PublicClass:\n"
+            "    pass\n"
+            "class _InternalClass:\n"
+            "    pass\n"
+            "def public_first():\n"
+            "    pass\n"
+            "def _internal_helper():\n"
+            "    pass\n"
+            "class PublicSecond:\n"
+            "    pass\n"
+            "def public_second():\n"
+            "    pass\n",
+            encoding="utf-8",
+        )
+
+        analyze_machine_level(root, self.output_dir)
+        data = json.loads(
+            (self.output_dir / "machine_index.json").read_text(encoding="utf-8")
+        )
+        entry = next(file for file in data["files"] if file["path"] == "src/symbols.py")
+
+        self.assertEqual(
+            entry["public_symbols"],
+            ["PublicClass", "PublicSecond", "public_first", "public_second"],
+        )
+        self.assertEqual(
+            entry["internal_symbols"], ["_InternalClass", "_internal_helper"]
+        )
+
+    def test_machine_index_preserves_dependency_semantics_for_branch_and_cycle(self):
+        # 分岐、同一 source からの複数 edge、cycle を含む isolated fixture を使う。
+        root = self.test_dir / "dependency-contract-root"
+        files = {
+            "src/app.py": (
+                "from src.beta import Beta\n"
+                "from src.alpha import Alpha\n"
+                "class App: pass\n"
+            ),
+            "src/worker.py": (
+                "from src.beta import Beta\n"
+                "from src.alpha import Alpha\n"
+                "def work(): pass\n"
+            ),
+            "src/alpha.py": (
+                "from src.shared import Shared\n"
+                "class Alpha: pass\n"
+            ),
+            "src/beta.py": (
+                "from src.shared import Shared\n"
+                "class Beta: pass\n"
+            ),
+            "src/shared.py": "class Shared: pass\n",
+            "src/cycle_a.py": (
+                "from src.cycle_b import B\n"
+                "class A: pass\n"
+            ),
+            "src/cycle_b.py": (
+                "from src.cycle_a import A\n"
+                "class B: pass\n"
+            ),
+        }
+        for relative_path, content in files.items():
+            path = root / relative_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+
+        output = self.output_dir / "dependency-contract"
+        analyze_machine_level(root, output)
+        index_path = output / "machine_index.json"
+        data = json.loads(index_path.read_text(encoding="utf-8"))
+        first_bytes = index_path.read_bytes()
+
+        self.assertEqual(
+            data["dependency_graph"],
+            {
+                "src/alpha.py": ["src/shared.py"],
+                "src/app.py": ["src/alpha.py", "src/beta.py"],
+                "src/beta.py": ["src/shared.py"],
+                "src/cycle_a.py": ["src/cycle_b.py"],
+                "src/cycle_b.py": ["src/cycle_a.py"],
+                "src/shared.py": [],
+                "src/worker.py": ["src/alpha.py", "src/beta.py"],
+            },
+        )
+        self.assertEqual(
+            data["dependency_order"],
+            [
+                "src/shared.py",
+                "src/alpha.py",
+                "src/beta.py",
+                "src/app.py",
+                "src/worker.py",
+                "src/cycle_a.py",
+                "src/cycle_b.py",
+            ],
+        )
+        self.assertEqual(
+            {
+                file["path"]: (file["fan_in"], file["fan_out"])
+                for file in data["files"]
+            },
+            {
+                "src/alpha.py": (2, 1),
+                "src/app.py": (0, 2),
+                "src/beta.py": (2, 1),
+                "src/cycle_a.py": (1, 1),
+                "src/cycle_b.py": (1, 1),
+                "src/shared.py": (2, 0),
+                "src/worker.py": (0, 2),
+            },
+        )
+
+        analyze_machine_level(root, output)
+        self.assertEqual(first_bytes, index_path.read_bytes())
+
+    def test_machine_index_is_byte_stable_across_prior_analysis_and_stale_docs(self):
+        # 初回の added/stale 状態と、前回解析を読んだ2回目の unchanged 状態を跨いでも、
+        # history-aware な内部 result が公開 index の bytes を変えないことを確認する。
+        root = self.test_dir / "repeat-scan-root"
+        source = root / "src" / "app.py"
+        source.parent.mkdir(parents=True)
+        source.write_text("def app():\n    return 'stable'\n", encoding="utf-8")
+
+        doc = self.output_dir / "src" / "app.py.md"
+        doc.parent.mkdir(parents=True)
+        doc.write_text("# App", encoding="utf-8")
+        source_mtime = source.stat().st_mtime
+        os.utime(doc, (source_mtime - 10.0, source_mtime - 10.0))
+
+        first_result = analyze_machine_level(root, self.output_dir)
+        index_path = self.output_dir / "machine_index.json"
+        first_bytes = index_path.read_bytes()
+        first_file = next(
+            file for file in first_result["files"] if file["path"] == "src/app.py"
+        )
+        self.assertNotEqual(first_file["status"], "unchanged")
+        self.assertGreater(first_result["coverage_summary"]["stale_docs"], 0)
+
+        second_result = analyze_machine_level(root, self.output_dir)
+        second_bytes = index_path.read_bytes()
+        second_file = next(
+            file for file in second_result["files"] if file["path"] == "src/app.py"
+        )
+
+        self.assertEqual(second_file["status"], "unchanged")
+        self.assertNotEqual(first_file["status"], second_file["status"])
+        self.assertEqual(first_bytes, second_bytes)
+
+    def test_machine_index_is_byte_stable_when_files_are_created_in_different_orders(self):
+        logical_files = [
+            (
+                "src/root.py",
+                "from src.zed import Zed\nfrom src.alpha import Alpha\n",
+            ),
+            ("src/zed.py", "class Zed: pass\n"),
+            ("src/alpha.py", "class Alpha: pass\n"),
+            ("README.md", "# Fixture\n"),
+        ]
+        outputs = []
+
+        for suffix, creation_order in (
+            ("forward", logical_files),
+            ("reverse", list(reversed(logical_files))),
+        ):
+            root = self.test_dir / f"creation-order-{suffix}"
+            for relative_path, content in creation_order:
+                path = root / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+
+            output = self.output_dir / f"creation-order-{suffix}"
+            analyze_machine_level(root, output)
+            outputs.append((output / "machine_index.json").read_bytes())
+
+        self.assertEqual(outputs[0], outputs[1])
+
+    def test_machine_scan_excludes_root_contained_output_and_rejects_same_root(self):
+        root = self.test_dir / "contained-output-root"
+        source = root / "src" / "app.py"
+        source.parent.mkdir(parents=True)
+        source.write_text("def app():\n    return 1\n", encoding="utf-8")
+
+        contained_output = root / "analysis"
+        (contained_output / "nested").mkdir(parents=True)
+        (contained_output / "ghost.py").write_text("def ghost(): pass\n", encoding="utf-8")
+        (contained_output / "nested" / "ghost.py").write_text(
+            "def nested_ghost(): pass\n", encoding="utf-8"
+        )
+
+        first_result = analyze_machine_level(root, contained_output)
+        second_result = analyze_machine_level(root, contained_output)
+        for result in (first_result, second_result):
+            paths = [file["path"] for file in result["files"]]
+            self.assertEqual(paths, ["src/app.py"])
+            self.assertNotIn("analysis/ghost.py", paths)
+            self.assertNotIn("analysis/nested/ghost.py", paths)
+
+            public_data = json.loads(
+                (contained_output / "machine_index.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                [file["path"] for file in public_data["files"]], ["src/app.py"]
+            )
+
+        same_root = self.test_dir / "same-root-output"
+        same_root.mkdir()
+        (same_root / "source.py").write_text("value = 1\n", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            analyze_machine_level(same_root, same_root)
+        self.assertFalse((same_root / "machine_analysis.json").exists())
+
+    def test_machine_index_schema_matches_python_contract(self):
+        schema_path = (
+            Path(__file__).resolve().parents[1]
+            / "schemas"
+            / "machine-index.schema.json"
+        )
+        with schema_path.open(encoding="utf-8") as handle:
+            schema = json.load(handle)
+
+        self.assertEqual(
+            schema["$schema"], "https://json-schema.org/draft/2020-12/schema"
+        )
+        self.assertEqual(
+            schema["required"], list(MACHINE_INDEX_TOP_LEVEL_FIELDS)
+        )
+        self.assertTrue(schema["additionalProperties"])
+
+        top_level_types = {
+            "schema_version": "string",
+            "files": "array",
+            "dependency_graph": "object",
+            "dependency_order": "array",
+        }
+        for field, expected_type in top_level_types.items():
+            with self.subTest(top_level_field=field):
+                self.assertEqual(schema["properties"][field]["type"], expected_type)
+
+        file_schema = schema["$defs"]["fileEntry"]
+        self.assertEqual(file_schema["required"], list(MACHINE_INDEX_FILE_FIELDS))
+        self.assertTrue(file_schema["additionalProperties"])
+
+        file_types = {
+            "hash": "string",
+            "size": "integer",
+            "language": "string",
+            "kind": "string",
+            "public_symbols": "array",
+            "internal_symbols": "array",
+            "fan_in": "integer",
+            "fan_out": "integer",
+        }
+        for field, expected_type in file_types.items():
+            with self.subTest(file_field=field):
+                self.assertEqual(
+                    file_schema["properties"][field]["type"], expected_type
+                )
+        self.assertEqual(
+            file_schema["properties"]["path"]["$ref"],
+            "#/$defs/repositoryRelativePath",
+        )
+
+    def test_machine_index_minor_versions_and_unknown_fields_are_compatible(self):
+        fixture = self._valid_machine_index_fixture()
+        fixture["schema_version"] = "1.7"
+        fixture["future_top_level"] = {"owner": "downstream"}
+        fixture["files"][1]["future_file_field"] = ["kept for a newer reader"]
+
+        index_path = self.output_dir / "machine-index-v1-minor.json"
+        index_path.write_text(serialize_machine_index(fixture), encoding="utf-8")
+        loaded = load_machine_index(index_path)
+
+        self.assertEqual(loaded["schema_version"], "1.7")
+        self.assertEqual(loaded["future_top_level"], {"owner": "downstream"})
+        self.assertEqual(
+            loaded["files"][1]["future_file_field"], ["kept for a newer reader"]
+        )
+        self.assertEqual(
+            {field: loaded[field] for field in MACHINE_INDEX_TOP_LEVEL_FIELDS},
+            {field: fixture[field] for field in MACHINE_INDEX_TOP_LEVEL_FIELDS},
+        )
+        for loaded_entry, expected_entry in zip(loaded["files"], fixture["files"]):
+            self.assertEqual(
+                {field: loaded_entry[field] for field in MACHINE_INDEX_FILE_FIELDS},
+                {field: expected_entry[field] for field in MACHINE_INDEX_FILE_FIELDS},
+            )
+
+    def test_machine_index_rejects_invalid_versions_required_fields_and_types(self):
+        fixture = self._valid_machine_index_fixture()
+        invalid_cases = []
+
+        malformed_version = deepcopy(fixture)
+        malformed_version["schema_version"] = "1"
+        invalid_cases.append(("malformed version", malformed_version, "schema_version"))
+
+        non_string_version = deepcopy(fixture)
+        non_string_version["schema_version"] = 1.0
+        invalid_cases.append(("version type", non_string_version, "schema_version"))
+
+        unknown_major = deepcopy(fixture)
+        unknown_major["schema_version"] = "2.0"
+        invalid_cases.append(("unknown major", unknown_major, "schema_version"))
+
+        missing_top_level = deepcopy(fixture)
+        del missing_top_level["files"]
+        invalid_cases.append(("missing top-level field", missing_top_level, "root.files"))
+
+        missing_file_field = deepcopy(fixture)
+        del missing_file_field["files"][1]["hash"]
+        invalid_cases.append(("missing file field", missing_file_field, "files[1].hash"))
+
+        wrong_file_type = deepcopy(fixture)
+        wrong_file_type["files"][1]["size"] = True
+        invalid_cases.append(("file field type", wrong_file_type, "files[1].size"))
+
+        wrong_nested_type = deepcopy(fixture)
+        wrong_nested_type["files"][1]["public_symbols"] = ["App", 3]
+        invalid_cases.append(
+            ("symbol item type", wrong_nested_type, "files[1].public_symbols[1]")
+        )
+
+        wrong_graph_type = deepcopy(fixture)
+        wrong_graph_type["dependency_graph"] = []
+        invalid_cases.append(("graph type", wrong_graph_type, "dependency_graph"))
+
+        for label, data, location in invalid_cases:
+            with self.subTest(case=label):
+                with self.assertRaises(MachineIndexContractError) as context:
+                    validate_machine_index(data)
+                self.assertIn(location, str(context.exception))
+
+    def test_machine_index_rejects_invalid_and_duplicate_paths(self):
+        invalid_paths = [
+            ("absolute path", "/README.md", "files[0].path"),
+            ("traversal path", "../README.md", "files[0].path"),
+            ("empty path segment", "src//app.py", "files[1].path"),
+            ("windows path", r"src\\app.py", "files[1].path"),
+        ]
+
+        for label, path, location in invalid_paths:
+            with self.subTest(case=label):
+                data = self._valid_machine_index_fixture()
+                target_index = 0 if location == "files[0].path" else 1
+                data["files"][target_index]["path"] = path
+                with self.assertRaises(MachineIndexContractError) as context:
+                    validate_machine_index(data)
+                self.assertIn(location, str(context.exception))
+
+        duplicate_path = self._valid_machine_index_fixture()
+        duplicate_path["files"][1]["path"] = duplicate_path["files"][0]["path"]
+        with self.assertRaises(MachineIndexContractError) as context:
+            validate_machine_index(duplicate_path)
+        self.assertIn("files[1].path", str(context.exception))
+
+        invalid_dependency_path = self._valid_machine_index_fixture()
+        invalid_dependency_path["dependency_graph"]["src/app.py"] = [
+            "../src/config.py"
+        ]
+        with self.assertRaises(MachineIndexContractError) as context:
+            validate_machine_index(invalid_dependency_path)
+        self.assertIn("dependency_graph['src/app.py'][0]", str(context.exception))
+
+    def test_machine_index_rejects_graph_order_and_fan_invariant_violations(self):
+        invalid_cases = []
+
+        missing_graph_key = self._valid_machine_index_fixture()
+        del missing_graph_key["dependency_graph"]["src/config.py"]
+        invalid_cases.append(("missing graph key", missing_graph_key, "dependency_graph"))
+
+        unknown_dependency = self._valid_machine_index_fixture()
+        unknown_dependency["dependency_graph"]["src/app.py"] = ["src/missing.py"]
+        invalid_cases.append(
+            (
+                "unknown dependency",
+                unknown_dependency,
+                "dependency_graph['src/app.py'][0]",
+            )
+        )
+
+        wrong_order = self._valid_machine_index_fixture()
+        wrong_order["dependency_order"] = ["src/app.py", "src/config.py"]
+        invalid_cases.append(("dependency order", wrong_order, "dependency_order"))
+
+        wrong_fan_out = self._valid_machine_index_fixture()
+        wrong_fan_out["files"][1]["fan_out"] = 0
+        invalid_cases.append(("fan out", wrong_fan_out, "files[1].fan_out"))
+
+        wrong_fan_in = self._valid_machine_index_fixture()
+        wrong_fan_in["files"][2]["fan_in"] = 0
+        invalid_cases.append(("fan in", wrong_fan_in, "files[2].fan_in"))
+
+        cycle_with_wrong_fallback = {
+            "schema_version": "1.0",
+            "files": [
+                {
+                    "path": path,
+                    "hash": "a" * 64,
+                    "size": 1,
+                    "language": "python",
+                    "kind": "source",
+                    "public_symbols": [],
+                    "internal_symbols": [],
+                    "fan_in": 1,
+                    "fan_out": 1,
+                }
+                for path in ("a.py", "b.py")
+            ],
+            "dependency_graph": {"a.py": ["b.py"], "b.py": ["a.py"]},
+            "dependency_order": ["b.py", "a.py"],
+        }
+        invalid_cases.append(
+            ("cycle fallback order", cycle_with_wrong_fallback, "dependency_order")
+        )
+
+        for label, data, location in invalid_cases:
+            with self.subTest(case=label):
+                with self.assertRaises(MachineIndexContractError) as context:
+                    validate_machine_index(data)
+                self.assertIn(location, str(context.exception))
+
+    def test_machine_index_projection_is_allowlisted_and_does_not_mutate_analysis(self):
+        analysis = self._valid_machine_index_fixture()
+        analysis.pop("schema_version")
+        analysis["attention"] = ["history-dependent diagnostic"]
+        analysis["coverage"] = {"stale_docs": 1}
+        analysis["files"][1]["status"] = "added"
+        analysis["files"][1]["mtime"] = 123.0
+        original_analysis = deepcopy(analysis)
+
+        projected = build_machine_index_v1(analysis)
+
+        self.assertEqual(analysis, original_analysis)
+        self.assertEqual(set(projected), set(MACHINE_INDEX_TOP_LEVEL_FIELDS))
+        for entry in projected["files"]:
+            self.assertEqual(set(entry), set(MACHINE_INDEX_FILE_FIELDS))
+        self.assertNotIn("attention", projected)
+        self.assertNotIn("coverage", projected)
+        self.assertNotIn("status", projected["files"][1])
+        self.assertEqual(projected["schema_version"], MACHINE_INDEX_SCHEMA_VERSION)
 
 if __name__ == "__main__":
     unittest.main()
-
-

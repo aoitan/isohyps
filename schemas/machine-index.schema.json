@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/aoitan/isohyps/schemas/machine-index.schema.json",
+  "title": "isohyps machine index",
+  "description": "Public, versioned machine_index.json contract. The producer emits an explicit allowlist; readers must ignore unknown fields for supported schema major 1.x and reject unknown major versions.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "files",
+    "dependency_graph",
+    "dependency_order"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+$",
+      "description": "Decimal major.minor version string. The initial producer version is 1.0; major changes are not backward compatible."
+    },
+    "files": {
+      "type": "array",
+      "description": "File entries sorted by their repository-relative POSIX path. Path uniqueness and ordering are checked by the runtime contract validator.",
+      "items": {
+        "$ref": "#/$defs/fileEntry"
+      }
+    },
+    "dependency_graph": {
+      "type": "object",
+      "description": "Mapping from a source file to its direct internal dependencies. Keys and adjacency arrays are sorted by path; graph consistency is checked by the runtime contract validator.",
+      "propertyNames": {
+        "$ref": "#/$defs/repositoryRelativePath"
+      },
+      "additionalProperties": {
+        "type": "array",
+        "uniqueItems": true,
+        "items": {
+          "$ref": "#/$defs/repositoryRelativePath"
+        }
+      }
+    },
+    "dependency_order": {
+      "type": "array",
+      "uniqueItems": true,
+      "description": "Dependency-first path order. Acyclic edges place dependencies before dependents; cycle fallback ordering is deterministic but is not a strict topological order.",
+      "items": {
+        "$ref": "#/$defs/repositoryRelativePath"
+      }
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "repositoryRelativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!.*\\u0000)(?!.*//)(?!.*(?:^|/)(?:\\.|\\.\\.)(?:/|$))(?!.*\/$).+$",
+      "description": "Normalized repository-relative POSIX path. Absolute paths, Windows drive paths, backslashes, NULs, empty segments, and '.' or '..' segments are invalid."
+    },
+    "fileEntry": {
+      "type": "object",
+      "required": [
+        "path",
+        "hash",
+        "size",
+        "language",
+        "kind",
+        "public_symbols",
+        "internal_symbols",
+        "fan_in",
+        "fan_out"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/repositoryRelativePath",
+          "description": "Stable file identity relative to the scan root."
+        },
+        "hash": {
+          "type": "string",
+          "pattern": "^(?:[0-9a-f]{64}|binary_skipped|error)$",
+          "description": "Lowercase SHA-256 content digest for readable text, or the existing binary_skipped/error sentinel."
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "File size in bytes at scan time."
+        },
+        "language": {
+          "type": "string",
+          "description": "Value returned by the existing language detector; unknown is used when no language is detected."
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "source",
+            "test",
+            "config",
+            "doc",
+            "other"
+          ],
+          "description": "Existing file classification."
+        },
+        "public_symbols": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Public symbols in the existing classes-then-functions extraction order."
+        },
+        "internal_symbols": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Internal symbols in the existing classes-then-functions extraction order."
+        },
+        "fan_in": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of direct incoming dependency edges."
+        },
+        "fan_out": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of direct dependencies listed for this file."
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

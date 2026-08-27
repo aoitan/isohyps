@@ -11,6 +11,11 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from isohyps.analysis_helpers import detect_language, is_probably_binary, extract_symbols
+from isohyps.machine_index import (
+    build_machine_index_v1,
+    validate_machine_index,
+    write_machine_index_atomic,
+)
 
 # 簡易的なYAML出力のためのシリアライザ
 def simple_yaml_dump(data: Any, indent_level: int = 0) -> str:
@@ -673,6 +678,16 @@ def should_ignore(path: Path, root: Path, gitignore_patterns: list[str]) -> bool
     return False
 
 
+def _is_path_within(path: Path, directory: Path) -> bool:
+    """Return whether ``path`` is inside ``directory`` after resolution."""
+
+    try:
+        path.resolve().relative_to(directory)
+    except ValueError:
+        return False
+    return True
+
+
 def generate_machine_report(
     root: Path,
     files_meta: list[dict[str, Any]],
@@ -752,7 +767,12 @@ def generate_machine_report(
 
 def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
     root = root_path.resolve()
+    output_dir = output_dir.resolve()
+    if output_dir == root:
+        raise ValueError("output_dir must be different from the scan root")
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    output_is_within_root = _is_path_within(output_dir, root)
 
     # 前回の結果をロードして変更履歴を比較
     json_path = output_dir / "machine_analysis.json"
@@ -772,6 +792,8 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
     ignored_count = 0
     for p in sorted(root.rglob("*")):
         if p.is_file() and not p.is_symlink():
+            if output_is_within_root and _is_path_within(p, output_dir):
+                continue
             if should_ignore(p, root, gitignore_patterns):
                 ignored_count += 1
                 continue
@@ -901,12 +923,18 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
         "coverage_contract": coverage_contract,
     }
 
+    # 公開機械 index は内部解析結果の allowlist 投影として生成する。
+    # 投影は履歴・mtime・Git 状態・coverage/attention を参照せず、契約検証後に
+    # 決定的 serializer と atomic writer へ渡す。
+    machine_index = build_machine_index_v1(result)
+    validate_machine_index(machine_index)
+
     # 機械向け JSON 書き出し
     json_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # machine_index.json の書き出し
     index_json_path = output_dir / "machine_index.json"
-    index_json_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_machine_index_atomic(index_json_path, machine_index)
 
     # 機械向け YAML 書き出し (PyYAML非依存)
     yaml_path = output_dir / "machine_analysis.yaml"

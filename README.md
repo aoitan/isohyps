@@ -13,7 +13,8 @@ LLM がファイルシステムを自律的に探索し、各ディレクトリ�
 5. [運用上の制約とパラメータ仕様](#運用上の制約とパラメータ仕様)
 6. [依存関係とフォールバック](#依存関係とフォールバック)
 7. [出力結果](#出力結果)
-8. [制限事項と非推奨機能](#制限事項と非推奨機能)
+8. [`machine_index.json` の公開契約](#machine_indexjson-の公開契約)
+9. [制限事項と非推奨機能](#制限事項と非推奨機能)
 
 ---
 
@@ -199,8 +200,12 @@ Controller runtime では、探索の初期ガイドとして**リポジトリ�
 
 ```text
 analysis_docs/
-├── analysis_report.md   # 実行サマリー（ステータス・トークン使用量等）
-├── index.md             # プロジェクト全体の要約
+├── machine_index.json   # 後段処理向けの versioned machine index
+├── machine_analysis.json # 詳細な内部解析結果
+├── machine_analysis.yaml # 内部解析結果の YAML 版
+├── machine_report.md     # 機械解析レポート
+├── analysis_report.md    # 実行サマリー（ステータス・トークン使用量等）
+├── index.md              # プロジェクト全体の要約
 ├── src/
 │   ├── index.md         # src ディレクトリの要約
 │   ├── main.md          # main.py の解析結果
@@ -213,6 +218,16 @@ analysis_docs/
 - ランタイムステータス（`finished` / `budget_exceeded` / `error` 等）
 - 使用済みステップ数・トークン数
 - エグゼクティブサマリー
+
+---
+
+## `machine_index.json` の公開契約
+
+`machine_index.json` は、後段の機械処理が依存する versioned artifact です。現在の producer は schema version `1.0` を出力し、安定した file inventory、public/internal symbols、依存関係だけを公開します。
+
+必須フィールド、型、順序、決定性、未知フィールドの扱い、旧形式からの移行方針は [machine index 公開契約](docs/machine-index.md) にまとめています。言語非依存の shape は [JSON Schema](schemas/machine-index.schema.json) で確認できます。
+
+`machine_index.json` は `machine_analysis.json` の単純なコピーではありません。coverage、attention、Git／mtime／前回出力に依存する診断情報など、安定した公開契約に含めない情報は `machine_analysis.json` と Markdown の責務として残ります。
 
 ---
 
