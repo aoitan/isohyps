@@ -201,7 +201,8 @@ def _expected_dependency_order(graph: Mapping[str, list[str]]) -> list[str]:
             if in_degree[dependent] == 0:
                 heapq.heappush(queue, dependent)
 
-    order.extend(sorted(path for path in graph if path not in order))
+    order_set = set(order)
+    order.extend(sorted(path for path in graph if path not in order_set))
     return order
 
 
