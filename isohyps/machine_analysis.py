@@ -1473,8 +1473,10 @@ def generate_machine_report(
 
 
 def _markdown_code(value: object) -> str:
-    text = str(value).replace("\r", " ").replace("\n", " ").replace("`", "\\`")
-    return f"`{text}`"
+    text = str(value).replace("\r", " ").replace("\n", " ")
+    max_backticks = max((len(m.group(0)) for m in re.finditer(r"`+", text)), default=0)
+    fence = "`" * (max_backticks + 1)
+    return f"{fence}{text}{fence}"
 
 
 def render_attention_markdown(attention: Sequence[Mapping[str, Any]]) -> str:
