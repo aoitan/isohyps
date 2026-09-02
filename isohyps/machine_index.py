@@ -9,6 +9,7 @@ details.
 from __future__ import annotations
 
 import copy
+import heapq
 import json
 import os
 import re
@@ -189,18 +190,22 @@ def _expected_dependency_order(graph: Mapping[str, list[str]]) -> list[str]:
         for path in paths:
             in_degree[path] += 1
 
-    queue = sorted(path for path, degree in in_degree.items() if degree == 0)
+    queue = [path for path, degree in in_degree.items() if degree == 0]
+    heapq.heapify(queue)
+    sorted_dependents = {
+        path: sorted(path_dependents) for path, path_dependents in dependents.items()
+    }
     order: list[str] = []
     while queue:
-        path = queue.pop(0)
+        path = heapq.heappop(queue)
         order.append(path)
-        for dependent in sorted(dependents[path]):
+        for dependent in sorted_dependents[path]:
             in_degree[dependent] -= 1
             if in_degree[dependent] == 0:
-                queue.append(dependent)
-                queue.sort()
+                heapq.heappush(queue, dependent)
 
-    order.extend(sorted(path for path in graph if path not in order))
+    order_set = set(order)
+    order.extend(sorted(path for path in graph if path not in order_set))
     return order
 
 
