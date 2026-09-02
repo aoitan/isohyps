@@ -1,24 +1,25 @@
 # `machine_index.json` 公開契約
 
-この文書は、Isohyps が生成する `machine_index.json` v1 の利用者向け契約です。言語非依存の型定義は [`schemas/machine-index.schema.json`](../schemas/machine-index.schema.json)、producer／reader の実装は [`isohyps/machine_index.py`](../isohyps/machine_index.py) にあります。
+この文書は、Isohyps が生成する `machine_index.json` v2 の利用者向け契約です。言語非依存の型定義は [`schemas/machine-index.schema.json`](../schemas/machine-index.schema.json)、producer／reader の実装は [`isohyps/machine_index.py`](../isohyps/machine_index.py) にあります。
 
 ## 1. 責務とバージョン
 
 `machine_index.json` は、後段の LLM、表示生成、追加成果物が参照するための公開機械成果物です。内部解析や履歴比較のための `machine_analysis.json` とは責務を分けています。
 
-- 現行 producer version: `schema_version: "1.0"`
+- 現行 producer version: `schema_version: "2.0"`
 - version format: 整数の `major.minor` を表す文字列（例: `1.0`, `1.7`）
-- v1 producer の top-level field: 下表の4項目のみ
-- v1 producer の file entry field: 下表の9項目のみ
-- v1.0 で producer が出力する任意 field はない。将来の任意 field は、supported major 内の拡張枠として扱う
+- v2 producer の top-level field: `schema_version`, `files`, `dependency_graph`, `dependency_order`, `attention`
+- file entry field: 下表の9項目のみ
+- v1 source-only builder は移行用に維持する
 
-`schema_version` は浮動小数点数として比較しません。reader は現在 major `1` をサポートし、`1.x` を受理します。未知の major（例: `2.0`）は、未知 field の追加とは別の変更として拒否します。
+`schema_version` は浮動小数点数として比較しません。通常 producer は v2 を出力します。v1 API は source-only consumer の移行用に保存され、reader は指定した supported major と異なる版を拒否します。
 
 ## 2. Top-level fields
 
 | Field | Required | Type | 契約 |
 | --- | --- | --- | --- |
-| `schema_version` | yes | string | `^[0-9]+\.[0-9]+$`。producer は `"1.0"` |
+| `schema_version` | yes | string | `^[0-9]+\.[0-9]+$`。producer は `"2.0"` |
+| `attention` | v2 yes | array | severity 順、同一 severity 内は `(path, kind)` 順の構造化 entry |
 | `files` | yes | array of objects | repository-relative `path` の昇順。一つの path は一度だけ現れる |
 | `dependency_graph` | yes | object: path -> array of path | `file -> direct internal dependency`。key と隣接配列は path の昇順 |
 | `dependency_order` | yes | array of path | 依存先を先に置く決定的な順序。各 graph key をちょうど一度含む |
@@ -60,19 +61,16 @@ graph の key は `kind == "source"` かつ `language != "unknown"` の解析可
 
 ## 4. 順序と決定性
 
-同じ入力とは、正規化された scan root、対象 file の path と bytes、および同じ ignore・classification・symbol/dependency extraction 規則を指します。次の状態は public index の暗黙入力にしません。
+v2 で同じ入力とは、正規化された scan root、対象 file の path と bytes、同じ解析規則、および正規化済み doc status・前回 TODO count を含む analysis snapshot 全体を指します。mtime や例外文そのものは公開値や sort key に含めません。
 
-- 前回の `machine_analysis.json` やその他の出力
-- file の mtime
-- Git history、worktree status
-- 生成済み Markdown の存在や更新時刻
-- coverage／attention の履歴比較結果
+v1 builder は従来どおり source-only projection を提供します。したがって v1 と v2 では「同じ入力」の範囲が異なります。
 
 producer は次の規則で値と bytes を正規化します。
 
 - `files`、dependency graph の key、各 adjacency は path 昇順
 - `public_symbols`／`internal_symbols` は現行の classes-then-functions 抽出順
 - `dependency_order` は決定的な dependency-first topological order。cycle 時は決定的 fallback
+- `attention` は `critical`, `high`, `medium`, `low` 順、同一 severity 内は `(path, kind)` 順
 - JSON は UTF-8、`ensure_ascii=false`、2-space indent、object key の `sort_keys=true`
 - JSON の末尾には LF を一つだけ付ける
 
@@ -80,9 +78,9 @@ producer は次の規則で値と bytes を正規化します。
 
 ## 5. Unknown fields と version compatibility
 
-reader は supported major `1` の index について、未知の追加 field を無視して既知の契約を検証します。Python reader は未知 field を保持した object を返す場合がありますが、未知 field に意味を依存しないことが consumer の責務です。
+reader は明示された supported major の index について契約を検証します。Python reader は未知 field を保持した object を返す場合がありますが、未知 field に意味を依存しないことが consumer の責務です。
 
-この方針は producer が内部 object をそのまま公開してよいという意味ではありません。producer は明示的な allowlist projection を使い、v1.0 で出力する key set を固定します。
+この方針は producer が内部 object をそのまま公開してよいという意味ではありません。producer は明示的な allowlist projection を使い、v2 では5つの top-level fieldだけを出力します。
 
 受理される拡張と拒否される変更は次のとおりです。
 
@@ -100,16 +98,27 @@ JSON Schema の `additionalProperties: true` は、supported major 内で reader
 
 旧形式の `machine_index.json` は version がなく、`machine_analysis.json` と同じ内部 result の複製でした。v1 ではこの偶然の field 公開を正式契約にしません。旧形式を読む consumer は v1 reader の前提を満たさないため、再 scan で v1 index を生成するか、必要な間だけ個別の migration shim を用意してください。
 
-v1 index に含めない主な情報と所有先は次のとおりです。
+v2 index に含めない主な情報と所有先は次のとおりです。
 
 | 旧／内部情報 | v1 の扱い | 参照先・理由 |
 | --- | --- | --- |
 | `symbols`、`repo_map`、file の `classes`／`functions`／`imports` | public index には出さない | 詳細な内部解析が必要なら `machine_analysis.json` |
-| `attention` | 出さない | 前回結果との差分に依存する診断情報 |
+| `attention_diagnostics` | 出さない | 検出不能を no-finding と区別する内部診断 |
 | `coverage_targets`、`coverage_summary`、`coverage_contract` | 出さない | docs、mtime、status に依存する coverage／表示情報 |
 | file の `mtime`、`status`、`git_status`、`last_seen_commit`、`todo_count` | 出さない | filesystem、Git、worktree、previous output に依存 |
 
-v1 の `hash` は安定した content digest のみを提供します。freshness の hash comparison／判定、severity 判定、LLM による module summary は v1 の責務ではありません。将来追加する場合は、現在状態だけから導出できる optional snapshot または別 artifact として設計し、既存 field の意味を変更しないことが必要です。
+`attention` entry は exactly `severity`, `kind`, `path`, `reason`, `evidence` を持ちます。severity 規則は次のとおりです。
+
+| signal | baseline | promotion |
+| --- | --- | --- |
+| high fan-in | high | large file 併発で critical |
+| large file | medium | high fan-in 併発で critical |
+| missing doc | medium | high fan-in 併発で high、entrypoint なら critical |
+| stale doc | medium | entrypoint なら high |
+| test missing / high fan-out | medium | なし |
+| TODO/FIXME increase | low | なし |
+
+閾値は fan-in `>= 5`、fan-out `>= 15`、line count `> 300` です。severity は自動修正可否ではなくトリアージ順を表します。v1-only consumer は v2 の required `attention` を扱うよう更新するか、移行期間だけ `build_machine_index_v1()` を明示利用してください。
 
 repo 外の旧形式 consumer はリポジトリからは観測できません。そうした consumer がある場合、v1 への切替前にこの契約を共有し、旧 field の移行先を決めてください。
 
@@ -124,9 +133,10 @@ producer は一時ファイルを destination と同じ directory に作成し�
 契約を利用・検証する入口は次のとおりです。
 
 - `build_machine_index_v1(analysis)`: 内部 analysis から allowlist projection を作る
+- `build_machine_index_v2(analysis)`: 構造化 attention を含む現行 projection を作る
 - `validate_machine_index(data)`: version、型、path、graph/order、fan metrics を検証する
 - `load_machine_index(path)`: UTF-8 JSON を読み、supported major と契約を検証する
 - `serialize_machine_index(data)`: canonical JSON text を返す
 - `write_machine_index_atomic(path, data)`: canonical JSON を atomic replace で書く
 
-契約の回帰テストは [`tests/test_machine_analysis.py`](../tests/test_machine_analysis.py) にあります。ここでは v1 minor と unknown field、未知 major／不正 field、symbol／dependency の既存意味、cycle、stale-doc を含む連続 scan の byte equality、root 内 output の自己混入防止を確認します。
+契約の回帰テストは [`tests/test_machine_analysis.py`](../tests/test_machine_analysis.py) にあります。ここでは v1 preservation、v2 structured attention、未知 major／不正 field、severity 境界、決定的順序、doc-status 変化、root 内 output の自己混入防止を確認します。

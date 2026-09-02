@@ -10,10 +10,13 @@ from unittest.mock import MagicMock
 # 機械解析（Level 0）モジュールの各機能を検証します
 from isohyps.machine_analysis import (
     analyze_machine_level,
+    build_attention_snapshots,
+    build_doc_status_snapshot,
     extract_file_metadata,
     extract_file_symbols,
     build_repo_map_summary,
     detect_attention_points,
+    resolve_attention_entrypoints,
 )
 from isohyps.machine_index import (
     MACHINE_INDEX_FILE_FIELDS,
@@ -24,6 +27,16 @@ from isohyps.machine_index import (
     load_machine_index,
     serialize_machine_index,
     validate_machine_index,
+)
+from isohyps.attention import (
+    AttentionContractError,
+    AttentionSignalSnapshot,
+    ATTENTION_ENTRY_FIELDS,
+    ATTENTION_KINDS,
+    canonical_attention_bytes,
+    classify_attention,
+    serialize_attention,
+    validate_attention,
 )
 
 class TestMachineAnalysis(unittest.TestCase):
@@ -174,6 +187,8 @@ class TestMachineAnalysis(unittest.TestCase):
         self.assertEqual(meta["kind"], "source")
         self.assertTrue(len(meta["hash"]) > 0)
         self.assertEqual(meta["size"], self.runner_file.stat().st_size)
+        self.assertEqual(meta["line_count"], len(self.runner_file.read_text(encoding="utf-8").splitlines()))
+        self.assertTrue(meta["readable"])
 
         meta_test = extract_file_metadata(self.runner_test_file, self.test_dir)
         self.assertEqual(meta_test["kind"], "test")
@@ -817,7 +832,15 @@ class TestMachineAnalysis(unittest.TestCase):
 
         self.assertEqual(second_file["status"], "unchanged")
         self.assertNotEqual(first_file["status"], second_file["status"])
-        self.assertEqual(first_bytes, second_bytes)
+        # v2 includes normalized history/doc attention.  The first snapshot is
+        # stale while the second is current, so the public bytes intentionally
+        # differ; determinism is guaranteed for an identical analysis snapshot.
+        self.assertNotEqual(first_bytes, second_bytes)
+        first_index = json.loads(first_bytes)
+        second_index = json.loads(second_bytes)
+        self.assertEqual(first_index["schema_version"], "2.0")
+        self.assertTrue(any(entry["kind"] == "doc_stale" for entry in first_index["attention"]))
+        self.assertFalse(any(entry["kind"] == "doc_stale" for entry in second_index["attention"]))
 
     def test_machine_index_is_byte_stable_when_files_are_created_in_different_orders(self):
         logical_files = [
@@ -1110,6 +1133,473 @@ class TestMachineAnalysis(unittest.TestCase):
         self.assertNotIn("coverage", projected)
         self.assertNotIn("status", projected["files"][1])
         self.assertEqual(projected["schema_version"], MACHINE_INDEX_SCHEMA_VERSION)
+
+
+class TestAttentionSnapshotBuilder(unittest.TestCase):
+    @staticmethod
+    def metadata(path: str, **overrides: object) -> dict[str, object]:
+        values: dict[str, object] = {
+            "path": path,
+            "hash": "a" * 64,
+            "size": 100,
+            "language": "python",
+            "kind": "source",
+            "status": "changed",
+            "todo_count": 0,
+            "line_count": 10,
+            "readable": True,
+            "fan_in": 0,
+            "fan_out": 0,
+            "mtime": 100,
+        }
+        values.update(overrides)
+        return values
+
+    def test_builds_one_sorted_snapshot_with_all_attention_signals(self):
+        files_meta = [
+            self.metadata(
+                "src/app.py",
+                line_count=301,
+                todo_count=2,
+                fan_in=5,
+                fan_out=15,
+            ),
+            self.metadata("src/untested.py", size=100),
+            self.metadata("tests/test_app.py", kind="test", language="python"),
+            self.metadata("README.md", kind="doc", language="unknown"),
+        ]
+
+        snapshots, diagnostics = build_attention_snapshots(
+            None,
+            list(reversed(files_meta)),
+            {"src/app.py": {"todo_count": 1}},
+            doc_status_by_path={
+                "src/app.py": "missing",
+                "src/untested.py": "stale",
+            },
+            entrypoint_paths={"src/app.py"},
+        )
+
+        self.assertEqual(diagnostics, [])
+        self.assertEqual([snapshot.path for snapshot in snapshots], [
+            "README.md",
+            "src/app.py",
+            "src/untested.py",
+            "tests/test_app.py",
+        ])
+        by_path = {snapshot.path: snapshot for snapshot in snapshots}
+
+        app = by_path["src/app.py"]
+        self.assertEqual(app.line_count, 301)
+        self.assertEqual(app.fan_in, 5)
+        self.assertEqual(app.fan_out, 15)
+        self.assertFalse(app.test_missing)
+        self.assertEqual(app.todo_current, 2)
+        self.assertEqual(app.todo_previous, 1)
+        self.assertTrue(app.todo_increased)
+        self.assertTrue(app.is_entrypoint)
+        self.assertEqual(app.doc_status, "missing")
+
+        untested = by_path["src/untested.py"]
+        self.assertTrue(untested.test_missing)
+        self.assertEqual(untested.doc_status, "stale")
+
+    def test_only_kind_test_paths_are_used_for_test_lookup(self):
+        source_files = [
+            self.metadata("src/widget.py"),
+            # A source-shaped filename must not count as a test candidate.
+            self.metadata("src/test_widget.py"),
+        ]
+        snapshots, diagnostics = build_attention_snapshots(None, source_files)
+        self.assertEqual(diagnostics, [])
+        self.assertTrue(next(s for s in snapshots if s.path == "src/widget.py").test_missing)
+
+        test_files = source_files + [
+            self.metadata("tests/test_widget.py", kind="test"),
+        ]
+        snapshots, diagnostics = build_attention_snapshots(None, test_files)
+        self.assertEqual(diagnostics, [])
+        self.assertFalse(next(s for s in snapshots if s.path == "src/widget.py").test_missing)
+
+    def test_todo_previous_count_and_first_snapshot_boundaries(self):
+        files_meta = [
+            self.metadata("src/increased.py", todo_count=2),
+            self.metadata("src/unchanged.py", todo_count=1),
+            self.metadata("src/decreased.py", todo_count=1),
+            self.metadata("src/first.py", todo_count=1),
+            self.metadata("src/empty-first.py", todo_count=0),
+        ]
+        previous = {
+            "src/increased.py": {"todo_count": 1},
+            "src/unchanged.py": {"todo_count": 1},
+            "src/decreased.py": {"todo_count": 2},
+        }
+
+        snapshots, diagnostics = build_attention_snapshots(None, files_meta, previous)
+        self.assertEqual(diagnostics, [])
+        by_path = {snapshot.path: snapshot for snapshot in snapshots}
+        self.assertTrue(by_path["src/increased.py"].todo_increased)
+        self.assertFalse(by_path["src/unchanged.py"].todo_increased)
+        self.assertFalse(by_path["src/decreased.py"].todo_increased)
+        self.assertTrue(by_path["src/first.py"].todo_increased)
+        self.assertFalse(by_path["src/empty-first.py"].todo_increased)
+        self.assertIsNone(by_path["src/first.py"].todo_previous)
+
+    def test_unavailable_previous_todo_baselines_do_not_trigger_first_snapshot(self):
+        files_meta = [
+            self.metadata("src/invalid-previous.py", todo_count=1, size=40),
+            self.metadata("src/missing-previous.py", todo_count=1, size=40),
+        ]
+        previous = {
+            "src/invalid-previous.py": {"todo_count": "bad"},
+            "src/missing-previous.py": {},
+        }
+
+        snapshots, diagnostics = build_attention_snapshots(None, files_meta, previous)
+        by_path = {snapshot.path: snapshot for snapshot in snapshots}
+
+        self.assertFalse(by_path["src/invalid-previous.py"].todo_increased)
+        self.assertFalse(by_path["src/missing-previous.py"].todo_increased)
+        self.assertEqual(
+            {(diagnostic.detector, diagnostic.code, diagnostic.path) for diagnostic in diagnostics},
+            {
+                ("metadata", "invalid_todo_count", "src/invalid-previous.py"),
+                (
+                    "metadata",
+                    "previous_todo_count_unavailable",
+                    "src/missing-previous.py",
+                ),
+            },
+        )
+        self.assertEqual(classify_attention(snapshots), [])
+
+    def test_missing_graph_metrics_are_diagnostics_and_valid_zero_is_preserved(self):
+        missing_fan_in = self.metadata("src/missing-in.py", size=40)
+        missing_fan_in.pop("fan_in")
+        null_fan_out = self.metadata("src/null-out.py", size=40, fan_out=None)
+        valid_zero = self.metadata("src/zero.py", size=40, fan_in=0, fan_out=0)
+
+        snapshots, diagnostics = build_attention_snapshots(
+            None, [missing_fan_in, null_fan_out, valid_zero]
+        )
+        by_path = {snapshot.path: snapshot for snapshot in snapshots}
+
+        self.assertEqual(set(by_path), {"src/zero.py"})
+        self.assertEqual(by_path["src/zero.py"].fan_in, 0)
+        self.assertEqual(by_path["src/zero.py"].fan_out, 0)
+        self.assertEqual(
+            {(diagnostic.detector, diagnostic.code, diagnostic.path) for diagnostic in diagnostics},
+            {
+                ("metadata", "fan_in_unavailable", "src/missing-in.py"),
+                ("metadata", "fan_out_unavailable", "src/null-out.py"),
+            },
+        )
+
+    def test_doc_status_snapshot_keeps_missing_current_stale_and_two_second_boundary(self):
+        root = Path(tempfile.mkdtemp())
+        output = Path(tempfile.mkdtemp())
+        try:
+            files_meta = [
+                self.metadata("src/exact.py", mtime=100),
+                self.metadata("src/stale.py", mtime=100),
+                self.metadata("src/missing.py", mtime=100),
+                self.metadata("src/unchanged.py", mtime=100, status="unchanged"),
+            ]
+            for path, mtime in (
+                ("src/exact.py.md", 98.0),
+                ("src/stale.py.md", 97.99),
+                ("src/unchanged.py.md", 0.0),
+            ):
+                doc = output / path
+                doc.parent.mkdir(parents=True, exist_ok=True)
+                doc.write_text("# doc", encoding="utf-8")
+                os.utime(doc, (mtime, mtime))
+
+            statuses, diagnostics = build_doc_status_snapshot(root, files_meta, output)
+            self.assertEqual(diagnostics, [])
+            self.assertEqual(statuses["src/exact.py"], "current")
+            self.assertEqual(statuses["src/stale.py"], "stale")
+            self.assertEqual(statuses["src/missing.py"], "missing")
+            self.assertEqual(statuses["src/unchanged.py"], "current")
+
+            snapshots, diagnostics = build_attention_snapshots(
+                root, files_meta, output_dir=output
+            )
+            self.assertEqual(diagnostics, [])
+            by_path = {snapshot.path: snapshot for snapshot in snapshots}
+            self.assertEqual(by_path["src/exact.py"].doc_status, "current")
+            self.assertEqual(by_path["src/stale.py"].doc_status, "stale")
+            self.assertEqual(by_path["src/missing.py"].doc_status, "missing")
+            self.assertEqual(by_path["src/unchanged.py"].doc_status, "current")
+        finally:
+            shutil.rmtree(root)
+            shutil.rmtree(output)
+
+    def test_unavailable_metadata_and_doc_status_are_diagnostics_not_findings(self):
+        unavailable = self.metadata(
+            "src/unavailable.py",
+            hash="error",
+            readable=False,
+            line_count=None,
+            todo_count=None,
+            size=40,
+            doc_status="unavailable",
+        )
+        snapshots, diagnostics = build_attention_snapshots(
+            None,
+            [unavailable],
+            doc_status_by_path={"src/unavailable.py": "unavailable"},
+        )
+
+        self.assertEqual(len(snapshots), 1)
+        self.assertFalse(snapshots[0].readable)
+        self.assertIsNone(snapshots[0].line_count)
+        self.assertEqual(
+            {(diagnostic.detector, diagnostic.code, diagnostic.path) for diagnostic in diagnostics},
+            {
+                ("metadata", "read_unavailable", "src/unavailable.py"),
+                ("doc_status", "status_unavailable", "src/unavailable.py"),
+            },
+        )
+        self.assertEqual(classify_attention(snapshots), [])
+
+    def test_resolves_structured_python_and_node_entrypoints(self):
+        root = Path(tempfile.mkdtemp())
+        try:
+            (root / "pyproject.toml").write_text(
+                '[project.scripts]\ncli = "pkg.cli:main"\n', encoding="utf-8"
+            )
+            (root / "package.json").write_text(
+                json.dumps({"bin": {"tool": "bin/tool.js"}, "scripts": {"fake": "src/fake.js"}}),
+                encoding="utf-8",
+            )
+            metadata = [
+                self.metadata("src/pkg/cli.py"),
+                self.metadata("bin/tool.js", language="javascript"),
+                self.metadata("src/fake.js", language="javascript"),
+            ]
+            paths, diagnostics = resolve_attention_entrypoints(root, metadata)
+            self.assertEqual(paths, {"src/pkg/cli.py", "bin/tool.js"})
+            self.assertEqual(diagnostics, [])
+        finally:
+            shutil.rmtree(root)
+
+
+class TestAttentionClassifier(unittest.TestCase):
+    @staticmethod
+    def snapshot(path: str, **overrides: object) -> AttentionSignalSnapshot:
+        values: dict[str, object] = {
+            "path": path,
+            "kind": "source",
+            "language": "python",
+            "readable": True,
+            "line_count": 10,
+            "fan_in": 0,
+            "fan_out": 0,
+            "test_missing": False,
+            "todo_current": 0,
+            "todo_previous": None,
+            "todo_increased": False,
+            "is_entrypoint": False,
+            "doc_status": "current",
+        }
+        values.update(overrides)
+        return AttentionSignalSnapshot(**values)
+
+    @staticmethod
+    def entry_by_identity(entries: list[dict[str, object]], path: str, kind: str):
+        return next(entry for entry in entries if entry["path"] == path and entry["kind"] == kind)
+
+    def test_classifier_emits_all_kinds_and_severity_levels(self):
+        snapshots = [
+            self.snapshot("src/critical_hub.py", line_count=301, fan_in=5),
+            self.snapshot(
+                "src/critical_cli.py",
+                is_entrypoint=True,
+                doc_status="missing",
+            ),
+            self.snapshot("src/high_hub.py", fan_in=5),
+            self.snapshot("src/high_cli.py", is_entrypoint=True, doc_status="stale"),
+            self.snapshot("src/testless.py", test_missing=True),
+            self.snapshot("src/wide.py", fan_out=15),
+            self.snapshot("src/undocumented.py", doc_status="missing"),
+            self.snapshot("src/stale.py", doc_status="stale"),
+            self.snapshot(
+                "src/todo.py",
+                todo_current=1,
+                todo_previous=None,
+                todo_increased=True,
+            ),
+        ]
+
+        entries = classify_attention(snapshots)
+
+        self.assertEqual({entry["kind"] for entry in entries}, set(ATTENTION_KINDS))
+        self.assertEqual(
+            {entry["severity"] for entry in entries},
+            {"critical", "high", "medium", "low"},
+        )
+        for entry in entries:
+            self.assertEqual(set(entry), set(ATTENTION_ENTRY_FIELDS))
+            self.assertTrue(entry["reason"])
+            self.assertIsInstance(entry["evidence"], dict)
+
+        self.assertEqual(
+            self.entry_by_identity(entries, "src/critical_hub.py", "large_file")["severity"],
+            "critical",
+        )
+        self.assertEqual(
+            self.entry_by_identity(entries, "src/critical_hub.py", "high_fan_in")["severity"],
+            "critical",
+        )
+        self.assertEqual(
+            self.entry_by_identity(entries, "src/critical_cli.py", "doc_missing")["severity"],
+            "critical",
+        )
+        self.assertEqual(
+            self.entry_by_identity(entries, "src/high_hub.py", "high_fan_in")["severity"],
+            "high",
+        )
+        self.assertEqual(
+            self.entry_by_identity(entries, "src/high_cli.py", "doc_stale")["severity"],
+            "high",
+        )
+        for path, kind in (
+            ("src/testless.py", "test_missing"),
+            ("src/wide.py", "high_fan_out"),
+            ("src/undocumented.py", "doc_missing"),
+            ("src/stale.py", "doc_stale"),
+        ):
+            with self.subTest(path=path, kind=kind):
+                self.assertEqual(self.entry_by_identity(entries, path, kind)["severity"], "medium")
+        self.assertEqual(
+            self.entry_by_identity(entries, "src/todo.py", "todo_increase")["severity"],
+            "low",
+        )
+
+    def test_classifier_enforces_threshold_boundaries_and_non_promotions(self):
+        entries = classify_attention(
+            [
+                self.snapshot("boundary/fan-in-4.py", fan_in=4),
+                self.snapshot("boundary/fan-in-5.py", fan_in=5),
+                self.snapshot("boundary/fan-out-14.py", fan_out=14),
+                self.snapshot("boundary/fan-out-15.py", fan_out=15),
+                self.snapshot("boundary/lines-300.py", line_count=300),
+                self.snapshot("boundary/lines-301.py", line_count=301),
+                self.snapshot("single/missing.py", doc_status="missing"),
+                self.snapshot("single/stale.py", doc_status="stale"),
+                self.snapshot("single/large.py", line_count=301),
+                self.snapshot("single/testless.py", test_missing=True),
+            ]
+        )
+        found = {(entry["path"], entry["kind"]): entry for entry in entries}
+
+        self.assertNotIn(("boundary/fan-in-4.py", "high_fan_in"), found)
+        self.assertEqual(found[("boundary/fan-in-5.py", "high_fan_in")]["severity"], "high")
+        self.assertNotIn(("boundary/fan-out-14.py", "high_fan_out"), found)
+        self.assertEqual(found[("boundary/fan-out-15.py", "high_fan_out")]["severity"], "medium")
+        self.assertNotIn(("boundary/lines-300.py", "large_file"), found)
+        self.assertEqual(found[("boundary/lines-301.py", "large_file")]["severity"], "medium")
+        self.assertEqual(found[("single/missing.py", "doc_missing")]["severity"], "medium")
+        self.assertEqual(found[("single/stale.py", "doc_stale")]["severity"], "medium")
+        self.assertEqual(found[("single/large.py", "large_file")]["severity"], "medium")
+        self.assertEqual(found[("single/testless.py", "test_missing")]["severity"], "medium")
+
+    def test_classifier_applies_compound_promotions_without_overpromoting(self):
+        entries = classify_attention(
+            [
+                self.snapshot("compound/fan-in-doc.py", fan_in=5, doc_status="missing"),
+                self.snapshot(
+                    "compound/entrypoint-doc.py",
+                    fan_in=5,
+                    is_entrypoint=True,
+                    doc_status="missing",
+                ),
+                self.snapshot(
+                    "compound/entrypoint-stale.py",
+                    fan_in=5,
+                    is_entrypoint=True,
+                    doc_status="stale",
+                ),
+            ]
+        )
+        found = {(entry["path"], entry["kind"]): entry for entry in entries}
+
+        self.assertEqual(
+            found[("compound/fan-in-doc.py", "high_fan_in")]["severity"], "high"
+        )
+        self.assertEqual(
+            found[("compound/fan-in-doc.py", "doc_missing")]["severity"], "high"
+        )
+        self.assertEqual(
+            found[("compound/entrypoint-doc.py", "high_fan_in")]["severity"], "high"
+        )
+        self.assertEqual(
+            found[("compound/entrypoint-doc.py", "doc_missing")]["severity"], "critical"
+        )
+        self.assertEqual(
+            found[("compound/entrypoint-stale.py", "high_fan_in")]["severity"], "high"
+        )
+        self.assertEqual(
+            found[("compound/entrypoint-stale.py", "doc_stale")]["severity"], "high"
+        )
+        self.assertNotEqual(
+            found[("compound/fan-in-doc.py", "doc_missing")]["severity"], "critical"
+        )
+
+    def test_classifier_is_deterministic_for_permutations_and_canonical_bytes(self):
+        snapshots = [
+            self.snapshot("z/low.py", todo_current=2, todo_previous=1, todo_increased=True),
+            self.snapshot("a/critical.py", fan_in=5, line_count=301),
+            self.snapshot("m/medium.py", fan_out=15),
+            self.snapshot("b/high.py", fan_in=5),
+        ]
+        variants = (snapshots, list(reversed(snapshots)), snapshots[2:] + snapshots[:2])
+        expected = classify_attention(variants[0])
+        expected_bytes = canonical_attention_bytes(expected)
+
+        for variant in variants:
+            with self.subTest(order=[snapshot.path for snapshot in variant]):
+                actual = classify_attention(variant)
+                self.assertEqual(actual, expected)
+                self.assertEqual(canonical_attention_bytes(actual), expected_bytes)
+                self.assertEqual(serialize_attention(actual).encode("utf-8"), expected_bytes)
+
+        self.assertEqual(
+            [(entry["severity"], entry["path"], entry["kind"]) for entry in expected],
+            [
+                ("critical", "a/critical.py", "high_fan_in"),
+                ("critical", "a/critical.py", "large_file"),
+                ("high", "b/high.py", "high_fan_in"),
+                ("medium", "m/medium.py", "high_fan_out"),
+                ("low", "z/low.py", "todo_increase"),
+            ],
+        )
+
+    def test_classifier_deduplicates_identical_snapshots_and_rejects_conflicts(self):
+        snapshot = self.snapshot("src/duplicate.py", fan_in=5)
+        self.assertEqual(classify_attention([snapshot, snapshot]), classify_attention([snapshot]))
+
+        with self.assertRaises(AttentionContractError):
+            classify_attention(
+                [
+                    self.snapshot("src/conflict.py", fan_in=5),
+                    self.snapshot("src/conflict.py", fan_in=6),
+                ]
+            )
+
+    def test_attention_entry_validator_rejects_noncanonical_or_invalid_shape(self):
+        entries = classify_attention([self.snapshot("src/a.py", fan_in=5), self.snapshot("src/b.py", fan_out=15)])
+        validate_attention(entries)
+
+        with self.assertRaises(AttentionContractError):
+            validate_attention(list(reversed(entries)))
+
+        invalid = [dict(entry) for entry in entries]
+        invalid[0]["evidence"] = dict(invalid[0]["evidence"])
+        invalid[0]["evidence"]["fan_in"] = True
+        with self.assertRaises(AttentionContractError):
+            validate_attention(invalid)
 
 if __name__ == "__main__":
     unittest.main()

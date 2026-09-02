@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/aoitan/isohyps/schemas/machine-index.schema.json",
   "title": "isohyps machine index",
-  "description": "Public, versioned machine_index.json contract. The producer emits an explicit allowlist; readers must ignore unknown fields for supported schema major 1.x and reject unknown major versions.",
+  "description": "Public, versioned machine_index.json contract. The current producer emits v2 with structured attention; v1 remains readable through the version-aware runtime API.",
   "type": "object",
   "required": [
     "schema_version",
@@ -44,8 +44,18 @@
       "items": {
         "$ref": "#/$defs/repositoryRelativePath"
       }
+    },
+    "attention": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/attentionEntry" }
     }
   },
+  "allOf": [
+    {
+      "if": { "properties": { "schema_version": { "pattern": "^2\\." } } },
+      "then": { "required": ["attention"] }
+    }
+  ],
   "additionalProperties": true,
   "$defs": {
     "repositoryRelativePath": {
@@ -53,6 +63,21 @@
       "minLength": 1,
       "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!.*\\u0000)(?!.*//)(?!.*(?:^|/)(?:\\.|\\.\\.)(?:/|$))(?!.*\/$).+$",
       "description": "Normalized repository-relative POSIX path. Absolute paths, Windows drive paths, backslashes, NULs, empty segments, and '.' or '..' segments are invalid."
+    },
+    "attentionEntry": {
+      "type": "object",
+      "required": ["severity", "kind", "path", "reason", "evidence"],
+      "properties": {
+        "severity": { "enum": ["critical", "high", "medium", "low"] },
+        "kind": { "enum": ["large_file", "test_missing", "todo_increase", "high_fan_in", "high_fan_out", "doc_missing", "doc_stale"] },
+        "path": { "$ref": "#/$defs/repositoryRelativePath" },
+        "reason": { "type": "string", "minLength": 1 },
+        "evidence": {
+          "type": "object",
+          "additionalProperties": { "type": ["string", "integer", "boolean", "null"] }
+        }
+      },
+      "additionalProperties": false
     },
     "fileEntry": {
       "type": "object",
