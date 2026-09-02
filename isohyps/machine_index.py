@@ -18,9 +18,12 @@ from collections.abc import Mapping
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
+from isohyps.attention import AttentionContractError, validate_attention
+
 
 MACHINE_INDEX_SCHEMA_VERSION = "1.0"
 MACHINE_INDEX_SCHEMA_MAJOR = 1
+MACHINE_INDEX_V2_SCHEMA_VERSION = "2.0"
 
 MACHINE_INDEX_TOP_LEVEL_FIELDS = (
     "schema_version",
@@ -229,6 +232,9 @@ def validate_machine_index(
             f"unsupported schema major {major}; expected {supported_major}",
         )
 
+    if major not in (1, 2):
+        _fail("schema_version", f"unsupported schema major {major}")
+
     files = _require_list(_required(root, "files", "root"), "files")
     file_descriptions: list[dict[str, Any]] = []
     seen_paths: set[str] = set()
@@ -241,6 +247,13 @@ def validate_machine_index(
         seen_paths.add(path)
         file_paths.append(path)
         file_descriptions.append(description)
+
+    if major == 2:
+        attention = _require_list(_required(root, "attention", "root"), "attention")
+        try:
+            validate_attention(attention)
+        except AttentionContractError as exc:
+            _fail("attention", str(exc))
 
     if file_paths != sorted(file_paths):
         _fail("files", "entries must be ordered by path")
@@ -413,10 +426,30 @@ def build_machine_index_v1(analysis: Mapping[str, Any]) -> dict[str, Any]:
     return projected_index
 
 
-def serialize_machine_index(data: Mapping[str, Any]) -> str:
+def build_machine_index_v2(analysis: Mapping[str, Any]) -> dict[str, Any]:
+    """Build the v2 projection with required structured attention."""
+
+    projected = build_machine_index_v1(analysis)
+    source = _require_mapping(analysis, "analysis")
+    attention = copy.deepcopy(
+        _require_list(_required(source, "attention", "analysis"), "analysis.attention")
+    )
+    try:
+        validate_attention(attention)
+    except AttentionContractError as exc:
+        _fail("analysis.attention", str(exc))
+    projected["schema_version"] = MACHINE_INDEX_V2_SCHEMA_VERSION
+    projected["attention"] = attention
+    validate_machine_index(projected, supported_major=2)
+    return projected
+
+
+def serialize_machine_index(
+    data: Mapping[str, Any], *, supported_major: int = MACHINE_INDEX_SCHEMA_MAJOR
+) -> str:
     """Serialize a valid index with the canonical UTF-8 JSON representation."""
 
-    validate_machine_index(data)
+    validate_machine_index(data, supported_major=supported_major)
     try:
         encoded = json.dumps(
             data,
@@ -448,11 +481,16 @@ def load_machine_index(
     return data
 
 
-def write_machine_index(path: Path, data: Mapping[str, Any]) -> None:
+def write_machine_index(
+    path: Path,
+    data: Mapping[str, Any],
+    *,
+    supported_major: int = MACHINE_INDEX_SCHEMA_MAJOR,
+) -> None:
     """Atomically write a canonical machine index beside its destination."""
 
     destination = Path(path)
-    payload = serialize_machine_index(data)
+    payload = serialize_machine_index(data, supported_major=supported_major)
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     temporary_name: str | None = None
@@ -491,8 +529,10 @@ __all__ = [
     "MACHINE_INDEX_SCHEMA_MAJOR",
     "MACHINE_INDEX_SCHEMA_VERSION",
     "MACHINE_INDEX_TOP_LEVEL_FIELDS",
+    "MACHINE_INDEX_V2_SCHEMA_VERSION",
     "MachineIndexContractError",
     "build_machine_index_v1",
+    "build_machine_index_v2",
     "load_machine_index",
     "serialize_machine_index",
     "validate_machine_index",

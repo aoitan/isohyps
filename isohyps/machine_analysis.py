@@ -6,13 +6,27 @@ import re
 import json
 import fnmatch
 import hashlib
+import stat as stat_module
 import subprocess
+import tomllib
+from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from isohyps.analysis_helpers import detect_language, is_probably_binary, extract_symbols
+from isohyps.attention import (
+    AttentionContractError,
+    AttentionDiagnostic,
+    AttentionSignalSnapshot,
+    DOC_STATUSES,
+    DocStatus,
+    AttentionEntry,
+    SEVERITY_ORDER,
+    classify_attention,
+    validate_repository_relative_path,
+)
 from isohyps.machine_index import (
-    build_machine_index_v1,
+    build_machine_index_v2,
     validate_machine_index,
     write_machine_index_atomic,
 )
@@ -161,13 +175,16 @@ def extract_file_metadata(path: Path, root: Path, previous_meta: dict[str, Any] 
         else:
             status = "added"
 
+    readable = file_hash not in ("binary_skipped", "error")
+    line_count: int | None = None
     todo_count = 0
-    if kind == "source" and not is_probably_binary(abs_path):
+    if kind == "source" and readable and not is_probably_binary(abs_path):
         try:
             content = abs_path.read_text(encoding="utf-8", errors="ignore")
+            line_count = len(content.splitlines())
             todo_count = len(re.findall(r'(?:TODO|FIXME)[:\s]+(.*)', content, re.IGNORECASE))
         except Exception:
-            pass
+            readable = False
 
     return {
         "path": rel_path,
@@ -179,6 +196,8 @@ def extract_file_metadata(path: Path, root: Path, previous_meta: dict[str, Any] 
         "last_seen_commit": last_commit,
         "status": status,
         "todo_count": todo_count,
+        "line_count": line_count,
+        "readable": readable,
     }
 
 
@@ -480,6 +499,698 @@ def detect_attention_points(
     return attention
 
 
+_MISSING = object()
+
+
+def _append_attention_diagnostic(
+    diagnostics: list[AttentionDiagnostic],
+    detector: str,
+    code: str,
+    path: str | None = None,
+) -> None:
+    """Append one stable diagnostic unless the same failure was already seen."""
+
+    diagnostic = AttentionDiagnostic(detector=detector, code=code, path=path)  # type: ignore[arg-type]
+    if diagnostic not in diagnostics:
+        diagnostics.append(diagnostic)
+
+
+def _sort_attention_diagnostics(
+    diagnostics: Sequence[AttentionDiagnostic],
+) -> list[AttentionDiagnostic]:
+    return sorted(
+        set(diagnostics),
+        key=lambda diagnostic: (
+            diagnostic.detector,
+            diagnostic.path or "",
+            diagnostic.code,
+        ),
+    )
+
+
+def _normalise_metadata_path(
+    value: Any,
+    diagnostics: list[AttentionDiagnostic],
+    *,
+    detector: str = "metadata",
+) -> str | None:
+    if isinstance(value, Path):
+        value = value.as_posix()
+    if not isinstance(value, str):
+        _append_attention_diagnostic(diagnostics, detector, "invalid_path")
+        return None
+    try:
+        return validate_repository_relative_path(value)
+    except AttentionContractError:
+        _append_attention_diagnostic(diagnostics, detector, "invalid_path", value)
+        return None
+
+
+def _ordered_attention_metadata(
+    files_meta: Sequence[Mapping[str, Any]],
+    diagnostics: list[AttentionDiagnostic],
+) -> list[tuple[str, Mapping[str, Any]]]:
+    entries: list[tuple[str, Mapping[str, Any]]] = []
+    for metadata in files_meta:
+        if not isinstance(metadata, Mapping):
+            _append_attention_diagnostic(diagnostics, "metadata", "invalid_metadata")
+            continue
+        path = _normalise_metadata_path(metadata.get("path"), diagnostics)
+        if path is not None:
+            entries.append((path, metadata))
+
+    entries.sort(key=lambda entry: entry[0])
+    unique_entries: list[tuple[str, Mapping[str, Any]]] = []
+    seen_paths: set[str] = set()
+    for path, metadata in entries:
+        if path in seen_paths:
+            _append_attention_diagnostic(diagnostics, "metadata", "duplicate_path", path)
+            continue
+        seen_paths.add(path)
+        unique_entries.append((path, metadata))
+    return unique_entries
+
+
+def _metadata_integer(
+    metadata: Mapping[str, Any],
+    key: str,
+    diagnostics: list[AttentionDiagnostic],
+    path: str,
+    *,
+    missing_is_none: bool = True,
+    missing_code: str | None = None,
+) -> int | None:
+    value = metadata.get(key, _MISSING)
+    if value is _MISSING or (value is None and missing_is_none):
+        if missing_code is not None:
+            _append_attention_diagnostic(diagnostics, "metadata", missing_code, path)
+        return None
+    if type(value) is not int or value < 0:
+        _append_attention_diagnostic(diagnostics, "metadata", f"invalid_{key}", path)
+        return None
+    return value
+
+
+def _metadata_boolean(
+    metadata: Mapping[str, Any],
+    key: str,
+    diagnostics: list[AttentionDiagnostic],
+    path: str,
+) -> bool | None:
+    value = metadata.get(key, _MISSING)
+    if value is _MISSING:
+        return None
+    if type(value) is not bool:
+        _append_attention_diagnostic(diagnostics, "metadata", f"invalid_{key}", path)
+        return None
+    return value
+
+
+def _previous_attention_metadata(
+    previous_meta: Mapping[str, Any] | Sequence[Mapping[str, Any]] | None,
+    diagnostics: list[AttentionDiagnostic],
+) -> dict[str, Mapping[str, Any]]:
+    """Normalize both the old path map and a previous ``files`` array."""
+
+    if previous_meta is None:
+        return {}
+
+    raw_entries: list[tuple[Any, Any]] = []
+    if isinstance(previous_meta, Mapping):
+        files = previous_meta.get("files")
+        if isinstance(files, Sequence) and not isinstance(files, (str, bytes, bytearray)):
+            raw_entries = [
+                (entry.get("path") if isinstance(entry, Mapping) else None, entry)
+                for entry in files
+            ]
+        else:
+            raw_entries = list(previous_meta.items())
+    elif isinstance(previous_meta, Sequence) and not isinstance(
+        previous_meta, (str, bytes, bytearray)
+    ):
+        raw_entries = [
+            (entry.get("path") if isinstance(entry, Mapping) else None, entry)
+            for entry in previous_meta
+        ]
+    else:
+        _append_attention_diagnostic(diagnostics, "metadata", "invalid_previous_metadata")
+        return {}
+
+    result: dict[str, Mapping[str, Any]] = {}
+    for raw_path, entry in raw_entries:
+        path = _normalise_metadata_path(raw_path, diagnostics)
+        if path is None:
+            continue
+        if not isinstance(entry, Mapping):
+            _append_attention_diagnostic(
+                diagnostics, "metadata", "invalid_previous_metadata", path
+            )
+            continue
+        if path in result:
+            _append_attention_diagnostic(diagnostics, "metadata", "duplicate_previous_path", path)
+            continue
+        result[path] = entry
+    return result
+
+
+def _attention_coverage_target(metadata: Mapping[str, Any]) -> bool:
+    return (
+        metadata.get("kind") == "source"
+        and metadata.get("language") != "unknown"
+        and metadata.get("hash") not in ("binary_skipped", "error")
+        and metadata.get("readable", True) is not False
+    )
+
+
+def _doc_status_snapshot_for_entries(
+    root: Path | None,
+    entries: Sequence[tuple[str, Mapping[str, Any]]],
+    output_dir: Path,
+    diagnostics: list[AttentionDiagnostic],
+) -> dict[str, DocStatus]:
+    """Calculate deterministic document status for already-normalized metadata."""
+
+    statuses: dict[str, DocStatus] = {path: "current" for path, _ in entries}
+    output_root = Path(output_dir).resolve()
+
+    for path, metadata in entries:
+        if metadata.get("kind") == "source" and (
+            metadata.get("readable") is False
+            or metadata.get("hash") in ("binary_skipped", "error")
+        ):
+            statuses[path] = "unavailable"
+            _append_attention_diagnostic(
+                diagnostics,
+                "metadata",
+                "binary_skipped"
+                if metadata.get("hash") == "binary_skipped"
+                else "read_unavailable",
+                path,
+            )
+            continue
+        if not _attention_coverage_target(metadata):
+            continue
+
+        found_doc_stat: os.stat_result | None = None
+        for candidate in (
+            output_root / f"{path}.md",
+            output_root / Path(path).with_suffix(".md"),
+        ):
+            try:
+                candidate_stat = candidate.stat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                statuses[path] = "unavailable"
+                _append_attention_diagnostic(
+                    diagnostics, "doc_status", "stat_failed", path
+                )
+                break
+            if stat_module.S_ISREG(candidate_stat.st_mode):
+                found_doc_stat = candidate_stat
+                break
+        else:
+            statuses[path] = "missing"
+
+        if statuses[path] == "unavailable" or found_doc_stat is None:
+            continue
+
+        # Preserve the existing behavior: an unchanged source is not stale
+        # merely because the previous documentation has an older mtime.
+        if metadata.get("status") == "unchanged":
+            continue
+
+        source_mtime = metadata.get("mtime", _MISSING)
+        if type(source_mtime) not in (int, float):
+            if root is not None:
+                try:
+                    source_mtime = (root / path).stat().st_mtime
+                except OSError:
+                    source_mtime = _MISSING
+            else:
+                source_mtime = _MISSING
+
+        if source_mtime is _MISSING or type(source_mtime) is bool:
+            statuses[path] = "unavailable"
+            _append_attention_diagnostic(
+                diagnostics, "doc_status", "source_mtime_unavailable", path
+            )
+            continue
+
+        doc_mtime = found_doc_stat.st_mtime
+        if type(doc_mtime) is bool or type(doc_mtime) not in (int, float):
+            statuses[path] = "unavailable"
+            _append_attention_diagnostic(
+                diagnostics, "doc_status", "doc_mtime_unavailable", path
+            )
+            continue
+
+        if source_mtime > doc_mtime + 2.0:
+            statuses[path] = "stale"
+
+    return statuses
+
+
+def build_doc_status_snapshot(
+    root: Path,
+    files_meta: Sequence[Mapping[str, Any]],
+    output_dir: Path,
+) -> tuple[dict[str, DocStatus], list[AttentionDiagnostic]]:
+    """Return per-path doc status and stable diagnostics for a scan."""
+
+    diagnostics: list[AttentionDiagnostic] = []
+    try:
+        metadata = list(files_meta)
+    except TypeError:
+        _append_attention_diagnostic(diagnostics, "metadata", "invalid_metadata")
+        return {}, _sort_attention_diagnostics(diagnostics)
+    entries = _ordered_attention_metadata(metadata, diagnostics)
+    statuses = _doc_status_snapshot_for_entries(
+        Path(root).resolve(), entries, Path(output_dir), diagnostics
+    )
+    return statuses, _sort_attention_diagnostics(diagnostics)
+
+
+def _normalise_doc_statuses(
+    entries: Sequence[tuple[str, Mapping[str, Any]]],
+    supplied: Mapping[str, Any],
+    diagnostics: list[AttentionDiagnostic],
+) -> dict[str, DocStatus]:
+    statuses: dict[str, DocStatus] = {path: "current" for path, _ in entries}
+    known_paths = set(statuses)
+    for raw_path, raw_status in supplied.items():
+        path = _normalise_metadata_path(raw_path, diagnostics, detector="doc_status")
+        if path is None or path not in known_paths:
+            continue
+        if raw_status not in DOC_STATUSES:
+            statuses[path] = "unavailable"
+            _append_attention_diagnostic(
+                diagnostics, "doc_status", "invalid_status", path
+            )
+            continue
+        statuses[path] = raw_status
+        if raw_status == "unavailable":
+            _append_attention_diagnostic(
+                diagnostics, "doc_status", "status_unavailable", path
+            )
+    return statuses
+
+
+def _metadata_doc_statuses(
+    entries: Sequence[tuple[str, Mapping[str, Any]]],
+    diagnostics: list[AttentionDiagnostic],
+) -> dict[str, DocStatus]:
+    statuses: dict[str, DocStatus] = {path: "current" for path, _ in entries}
+    for path, metadata in entries:
+        if "doc_status" not in metadata:
+            continue
+        raw_status = metadata["doc_status"]
+        if raw_status not in DOC_STATUSES:
+            statuses[path] = "unavailable"
+            _append_attention_diagnostic(
+                diagnostics, "doc_status", "invalid_status", path
+            )
+            continue
+        statuses[path] = raw_status
+        if raw_status == "unavailable":
+            _append_attention_diagnostic(
+                diagnostics, "doc_status", "status_unavailable", path
+            )
+    return statuses
+
+
+def _normalise_entrypoint_paths(
+    entrypoint_paths: Collection[str] | None,
+    diagnostics: list[AttentionDiagnostic],
+) -> set[str]:
+    if entrypoint_paths is None:
+        return set()
+    values: Collection[Any] = entrypoint_paths
+    if isinstance(entrypoint_paths, str):
+        values = (entrypoint_paths,)
+    result: set[str] = set()
+    for value in values:
+        path = _normalise_metadata_path(value, diagnostics, detector="entrypoint")
+        if path is not None:
+            result.add(path)
+    return result
+
+
+def _source_metrics(
+    root: Path | None,
+    path: str,
+    readable: bool,
+    line_count: int | None,
+    todo_count: int | None,
+    diagnostics: list[AttentionDiagnostic],
+) -> tuple[bool, int | None, int]:
+    """Reuse metadata counts and fill missing counts with one text read."""
+
+    if not readable:
+        return False, None, 0
+
+    needs_line_count = line_count is None
+    needs_todo_count = todo_count is None
+    if not needs_line_count and not needs_todo_count:
+        assert line_count is not None
+        assert todo_count is not None
+        return True, line_count, todo_count
+
+    if root is None:
+        if needs_line_count:
+            _append_attention_diagnostic(
+                diagnostics, "metadata", "line_count_unavailable", path
+            )
+        if needs_todo_count:
+            _append_attention_diagnostic(
+                diagnostics, "metadata", "todo_count_unavailable", path
+            )
+        return True, line_count, todo_count or 0
+
+    try:
+        content = (root / path).read_text(encoding="utf-8", errors="ignore")
+    except (OSError, UnicodeError):
+        _append_attention_diagnostic(diagnostics, "metadata", "read_failed", path)
+        return False, None, 0
+
+    if needs_line_count:
+        line_count = len(content.splitlines())
+    if needs_todo_count:
+        todo_count = len(
+            re.findall(r"(?:TODO|FIXME)[:\s]+(.*)", content, re.IGNORECASE)
+        )
+    return True, line_count, todo_count or 0
+
+
+def build_attention_snapshots(
+    root: Path | None,
+    files_meta: Sequence[Mapping[str, Any]],
+    previous_meta: Mapping[str, Any] | Sequence[Mapping[str, Any]] | None = None,
+    output_dir: Path | None = None,
+    *,
+    doc_status_by_path: Mapping[str, DocStatus] | None = None,
+    entrypoint_paths: Collection[str] | None = None,
+) -> tuple[list[AttentionSignalSnapshot], list[AttentionDiagnostic]]:
+    """Build one normalized attention snapshot per repository-relative path.
+
+    The builder consumes scan metadata and optional precomputed doc/entrypoint
+    facts.  It does not classify findings or read Git/history.  When a count
+    is absent from metadata, at most one source read is used to fill the
+    missing line/TODO values; an unavailable read is returned as a stable
+    diagnostic and does not become a false finding.
+    """
+
+    diagnostics: list[AttentionDiagnostic] = []
+    try:
+        metadata = list(files_meta)
+    except TypeError:
+        _append_attention_diagnostic(diagnostics, "metadata", "invalid_metadata")
+        return [], _sort_attention_diagnostics(diagnostics)
+
+    entries = _ordered_attention_metadata(metadata, diagnostics)
+    root_path = Path(root).resolve() if root is not None else None
+    previous_by_path = _previous_attention_metadata(previous_meta, diagnostics)
+    test_stems: set[str] = set()
+    for path, item in entries:
+        if item.get("kind") == "test":
+            test_stems.add(PurePosixPath(path).stem)
+
+    if doc_status_by_path is not None:
+        doc_statuses = _normalise_doc_statuses(
+            entries, doc_status_by_path, diagnostics
+        )
+    elif isinstance(output_dir, Mapping):
+        # Accept the compact positional form used by callers that already
+        # computed statuses: ``build_attention_snapshots(root, meta, prev,
+        # statuses)``.  A real output directory is always path-like.
+        doc_statuses = _normalise_doc_statuses(entries, output_dir, diagnostics)
+        output_dir = None
+    elif output_dir is not None:
+        if root_path is None:
+            doc_statuses = {path: "current" for path, _ in entries}
+            for path, item in entries:
+                if _attention_coverage_target(item):
+                    doc_statuses[path] = "unavailable"
+                    _append_attention_diagnostic(
+                        diagnostics, "doc_status", "root_unavailable", path
+                    )
+        else:
+            doc_statuses = _doc_status_snapshot_for_entries(
+                root_path, entries, Path(output_dir), diagnostics
+            )
+    else:
+        doc_statuses = _metadata_doc_statuses(entries, diagnostics)
+
+    # A source whose contents could not be read cannot have a trustworthy
+    # coverage status, even when a caller supplied a stale/missing override.
+    for path, item in entries:
+        if item.get("kind") == "source" and (
+            item.get("readable") is False
+            or item.get("hash") in ("binary_skipped", "error")
+        ):
+            doc_statuses[path] = "unavailable"
+            _append_attention_diagnostic(
+                diagnostics,
+                "metadata",
+                "binary_skipped"
+                if item.get("hash") == "binary_skipped"
+                else "read_unavailable",
+                path,
+            )
+
+    resolved_entrypoints = _normalise_entrypoint_paths(
+        entrypoint_paths, diagnostics
+    )
+    snapshots: list[AttentionSignalSnapshot] = []
+
+    for path, item in entries:
+        kind = item.get("kind", "other")
+        if not isinstance(kind, str) or not kind:
+            _append_attention_diagnostic(diagnostics, "metadata", "invalid_kind", path)
+            kind = "other"
+        language = item.get("language", "unknown")
+        if not isinstance(language, str) or not language:
+            _append_attention_diagnostic(
+                diagnostics, "metadata", "invalid_language", path
+            )
+            language = "unknown"
+
+        readable_value = _metadata_boolean(item, "readable", diagnostics, path)
+        if readable_value is None:
+            readable = item.get("hash") not in ("binary_skipped", "error")
+        else:
+            readable = readable_value
+        if item.get("hash") in ("binary_skipped", "error"):
+            readable = False
+            if kind == "source":
+                _append_attention_diagnostic(
+                    diagnostics,
+                    "metadata",
+                    "binary_skipped" if item.get("hash") == "binary_skipped" else "read_unavailable",
+                    path,
+                )
+        elif kind == "source" and not readable:
+            _append_attention_diagnostic(
+                diagnostics, "metadata", "read_unavailable", path
+            )
+
+        line_count = _metadata_integer(item, "line_count", diagnostics, path)
+        todo_count = _metadata_integer(item, "todo_count", diagnostics, path)
+        if kind == "source":
+            readable, line_count, todo_count = _source_metrics(
+                root_path,
+                path,
+                readable,
+                line_count,
+                todo_count,
+                diagnostics,
+            )
+        else:
+            line_count = None
+            todo_count = 0
+
+        previous_count: int | None = None
+        previous_item = previous_by_path.get(path)
+        previous_entry_exists = previous_item is not None
+        if previous_entry_exists:
+            previous_count = _metadata_integer(
+                previous_item,
+                "todo_count",
+                diagnostics,
+                path,
+                missing_code="previous_todo_count_unavailable",
+            )
+        todo_increased = False
+        if kind == "source" and readable:
+            current_count = todo_count or 0
+            if previous_entry_exists:
+                # An existing but unavailable baseline is not a first scan.
+                todo_increased = (
+                    previous_count is not None and current_count > previous_count
+                )
+            else:
+                todo_increased = current_count > 0
+        else:
+            current_count = 0
+
+        test_missing = False
+        if kind == "source" and language == "python":
+            if PurePosixPath(path).name not in ("__init__.py",):
+                size = _metadata_integer(item, "size", diagnostics, path)
+                if size is None and root_path is not None:
+                    try:
+                        size = (root_path / path).stat().st_size
+                    except OSError:
+                        _append_attention_diagnostic(
+                            diagnostics, "test_index", "size_unavailable", path
+                        )
+                elif size is None:
+                    _append_attention_diagnostic(
+                        diagnostics, "test_index", "size_unavailable", path
+                    )
+                if size is not None and size >= 50:
+                    source_stem = PurePosixPath(path).stem
+                    test_missing = not {
+                        f"test_{source_stem}",
+                        f"{source_stem}_test",
+                    }.intersection(test_stems)
+
+        fan_in = _metadata_integer(
+            item,
+            "fan_in",
+            diagnostics,
+            path,
+            missing_code="fan_in_unavailable",
+        )
+        fan_out = _metadata_integer(
+            item,
+            "fan_out",
+            diagnostics,
+            path,
+            missing_code="fan_out_unavailable",
+        )
+        if fan_in is None or fan_out is None:
+            # The snapshot contract uses integers, so an unavailable graph
+            # metric cannot safely be represented as zero.
+            continue
+        entrypoint_flag = _metadata_boolean(item, "is_entrypoint", diagnostics, path)
+        is_entrypoint = bool(entrypoint_flag) if entrypoint_flag is not None else False
+        is_entrypoint = is_entrypoint or path in resolved_entrypoints
+
+        snapshots.append(
+            AttentionSignalSnapshot(
+                path=path,
+                kind=kind,
+                language=language,
+                readable=readable,
+                line_count=line_count,
+                fan_in=fan_in,
+                fan_out=fan_out,
+                test_missing=test_missing,
+                todo_current=current_count,
+                todo_previous=previous_count,
+                todo_increased=todo_increased,
+                is_entrypoint=is_entrypoint,
+                doc_status=doc_statuses.get(path, "current"),
+            )
+        )
+
+    return snapshots, _sort_attention_diagnostics(diagnostics)
+
+
+# Name used by callers that describe the result as a map of statuses.
+build_doc_statuses = build_doc_status_snapshot
+
+
+def resolve_attention_entrypoints(
+    root: Path, files_meta: Sequence[Mapping[str, Any]]
+) -> tuple[set[str], list[AttentionDiagnostic]]:
+    """Resolve supported configuration entrypoints to known source paths."""
+
+    diagnostics: list[AttentionDiagnostic] = []
+    known_sources = {
+        str(item.get("path"))
+        for item in files_meta
+        if item.get("kind") == "source" and isinstance(item.get("path"), str)
+    }
+    resolved = {
+        path
+        for path in known_sources
+        if PurePosixPath(path).name
+        in ("main.py", "app.py", "index.js", "main.go", "lib.rs")
+    }
+
+    pyproject = root / "pyproject.toml"
+    if pyproject.is_file():
+        try:
+            data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+            project = data.get("project", {})
+            targets: list[Any] = []
+            if isinstance(project, Mapping):
+                for section in ("scripts", "gui-scripts"):
+                    values = project.get(section, {})
+                    if isinstance(values, Mapping):
+                        targets.extend(values.values())
+            for target in targets:
+                if not isinstance(target, str):
+                    _append_attention_diagnostic(
+                        diagnostics, "entrypoint", "target_unresolved", "pyproject.toml"
+                    )
+                    continue
+                module = target.split(":", 1)[0]
+                relative = module.replace(".", "/")
+                candidates = {
+                    candidate
+                    for candidate in (
+                        f"{relative}.py",
+                        f"{relative}/__init__.py",
+                        f"src/{relative}.py",
+                        f"src/{relative}/__init__.py",
+                    )
+                    if candidate in known_sources
+                }
+                if len(candidates) == 1:
+                    resolved.update(candidates)
+                else:
+                    _append_attention_diagnostic(
+                        diagnostics,
+                        "entrypoint",
+                        "target_ambiguous" if candidates else "target_unresolved",
+                        "pyproject.toml",
+                    )
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+            _append_attention_diagnostic(
+                diagnostics, "entrypoint", "parse_failed", "pyproject.toml"
+            )
+
+    package_json = root / "package.json"
+    if package_json.is_file():
+        try:
+            data = json.loads(package_json.read_text(encoding="utf-8"))
+            bin_value = data.get("bin") if isinstance(data, Mapping) else None
+            targets = list(bin_value.values()) if isinstance(bin_value, Mapping) else [bin_value]
+            for target in targets:
+                if not isinstance(target, str):
+                    continue
+                candidate = target.removeprefix("./")
+                try:
+                    validate_repository_relative_path(candidate)
+                except AttentionContractError:
+                    candidate = ""
+                if candidate in known_sources:
+                    resolved.add(candidate)
+                else:
+                    _append_attention_diagnostic(
+                        diagnostics, "entrypoint", "target_unresolved", "package.json"
+                    )
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            _append_attention_diagnostic(
+                diagnostics, "entrypoint", "parse_failed", "package.json"
+            )
+
+    return resolved, _sort_attention_diagnostics(diagnostics)
+
+
 
 def resolve_module_to_path(module_name: str, src_files: list[str], current_file: str) -> str | None:
     # 1. 相対インポートの解決
@@ -692,7 +1403,7 @@ def generate_machine_report(
     root: Path,
     files_meta: list[dict[str, Any]],
     repo_map: dict[str, Any],
-    attention: list[str],
+    attention: list[AttentionEntry],
     forward_graph: dict[str, list[str]]
 ) -> str:
     mermaid_diag = generate_mermaid_graph(forward_graph)
@@ -744,11 +1455,7 @@ def generate_machine_report(
         "## Attention Points",
         "",
     ])
-    if attention:
-        for att in attention:
-            lines.append(f"- {att}")
-    else:
-        lines.append("- No critical risks or attention points detected.")
+    lines.extend(render_attention_markdown(attention).splitlines())
 
     lines.extend([
         "",
@@ -763,6 +1470,37 @@ def generate_machine_report(
         )
 
     return "\n".join(lines)
+
+
+def _markdown_code(value: object) -> str:
+    text = str(value).replace("\r", " ").replace("\n", " ")
+    max_backticks = max((len(m.group(0)) for m in re.finditer(r"`+", text)), default=0)
+    fence = "`" * (max_backticks + 1)
+    return f"{fence}{text}{fence}"
+
+
+def render_attention_markdown(attention: Sequence[Mapping[str, Any]]) -> str:
+    """Render canonical attention entries without reclassifying or reordering."""
+
+    grouped = {severity: [] for severity in SEVERITY_ORDER}
+    for entry in attention:
+        grouped[entry["severity"]].append(entry)
+    lines: list[str] = []
+    for severity in SEVERITY_ORDER:
+        lines.extend([f"### {severity.title()}", ""])
+        entries = grouped[severity]
+        if not entries:
+            lines.append("- (none)")
+        else:
+            for entry in entries:
+                evidence = json.dumps(entry["evidence"], ensure_ascii=False, sort_keys=True)
+                reason = str(entry["reason"]).replace("\r", " ").replace("\n", " ")
+                lines.append(
+                    f"- {_markdown_code(entry['path'])} [{entry['kind']}]: "
+                    f"{reason} — {_markdown_code(evidence)}"
+                )
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 
 def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
@@ -849,9 +1587,6 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
         meta["fan_in"] = len(backward_graph.get(rel_path, []))
         meta["fan_out"] = len(forward_graph.get(rel_path, []))
 
-    # アテンションポイント検出
-    attention = detect_attention_points(root, files_meta, symbols_list, previous_meta)
-
     coverage_targets = _build_coverage_targets(files_meta)
 
     # ドキュメントの存在有無・更新チェックとカバレッジの算出
@@ -910,12 +1645,34 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
         "counts": coverage_summary,
     }
 
+    doc_status_by_path = {path: "missing" for path in missing_docs}
+    doc_status_by_path.update({path: "stale" for path in stale_docs})
+    doc_status_by_path.update({path: "current" for path in valid_docs})
+    resolved_entrypoints, entrypoint_diagnostics = resolve_attention_entrypoints(
+        root, files_meta
+    )
+    snapshots, attention_diagnostics = build_attention_snapshots(
+        root,
+        files_meta,
+        previous_meta,
+        doc_status_by_path=doc_status_by_path,
+        entrypoint_paths=resolved_entrypoints,
+    )
+    attention_diagnostics = _sort_attention_diagnostics(
+        [*attention_diagnostics, *entrypoint_diagnostics]
+    )
+    attention = classify_attention(snapshots)
+
     # 最終データの統合
     result = {
         "files": files_meta,
         "symbols": symbols_list,
         "repo_map": repo_map,
         "attention": attention,
+        "attention_diagnostics": [
+            {"detector": item.detector, "code": item.code, "path": item.path}
+            for item in attention_diagnostics
+        ],
         "dependency_graph": forward_graph,
         "dependency_order": dependency_order,
         "coverage_targets": [meta["path"] for meta in coverage_targets],
@@ -926,14 +1683,15 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
     # 公開機械 index は内部解析結果の allowlist 投影として生成する。
     # 投影は履歴・mtime・Git 状態・coverage/attention を参照せず、契約検証後に
     # 決定的 serializer と atomic writer へ渡す。
-    machine_index = build_machine_index_v1(result)
+    machine_index = build_machine_index_v2(result)
+    validate_machine_index(machine_index, supported_major=2)
 
     # 機械向け JSON 書き出し
     json_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # machine_index.json の書き出し
     index_json_path = output_dir / "machine_index.json"
-    write_machine_index_atomic(index_json_path, machine_index)
+    write_machine_index_atomic(index_json_path, machine_index, supported_major=2)
 
     # 機械向け YAML 書き出し (PyYAML非依存)
     yaml_path = output_dir / "machine_analysis.yaml"
@@ -1067,10 +1825,9 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
         
     index_content += "\n## High Priority Files to Inspect (Attention Points)\nThese files have warnings or high complexity:\n"
     if attention:
-        for att in attention:
-            index_content += f"- {att}\n"
+        index_content += render_attention_markdown(attention) + "\n"
     else:
-        index_content += "- No critical attention points.\n"
+        index_content += "- (none)\n"
         
     index_content += f"\n## Directory Structure Overview\nRefer to [machine_report.md](./machine_report.md) for the full inventory.\n"
     (output_dir / "index.md").write_text(index_content, encoding="utf-8")
