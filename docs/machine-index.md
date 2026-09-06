@@ -134,9 +134,9 @@ producer は一時ファイルを destination と同じ directory に作成し�
 
 - `build_machine_index_v1(analysis)`: 内部 analysis から allowlist projection を作る
 - `build_machine_index_v2(analysis)`: 構造化 attention を含む現行 projection を作る
-- `validate_machine_index(data)`: version、型、path、graph/order、fan metrics を検証する
-- `load_machine_index(path)`: UTF-8 JSON を読み、supported major と契約を検証する
-- `serialize_machine_index(data)`: canonical JSON text を返す
-- `write_machine_index_atomic(path, data)`: canonical JSON を atomic replace で書く
+- `validate_machine_index(data, supported_major=...)`: version、型、path、graph/order、fan metrics を検証する（v2 成果物は `supported_major=2` を指定）
+- `load_machine_index(path, supported_major=...)`: UTF-8 JSON を読み、supported major と契約を検証する（v2 成果物は `supported_major=2` を指定）
+- `serialize_machine_index(data, supported_major=...)`: canonical JSON text を返す（v2 成果物は `supported_major=2` を指定）
+- `write_machine_index_atomic(path, data, supported_major=...)`: canonical JSON を atomic replace で書く（v2 成果物は `supported_major=2` を指定）
 
 契約の回帰テストは [`tests/test_machine_analysis.py`](../tests/test_machine_analysis.py) にあります。ここでは v1 preservation、v2 structured attention、未知 major／不正 field、severity 境界、決定的順序、doc-status 変化、root 内 output の自己混入防止を確認します。
