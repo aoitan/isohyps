@@ -3184,16 +3184,20 @@ def record_doc_provenance(
     doc_observation = safe_hash_regular_file(validated_doc_path, output_root)
     current_doc_hash = _recording_digest(doc_observation, "doc")
 
-    try:
-        existing = load_doc_provenance(destination)
-    except DocProvenanceContractError:
-        if destination.exists():
-            raise
+    existing_result = read_doc_provenance(destination, allowed_root=output_root)
+    if existing_result.valid:
+        existing = existing_result.document
+    elif existing_result.reason == "recorded_source_hash_missing":
         existing = {
             "schema_version": DOC_PROVENANCE_SCHEMA_VERSION,
             "hash_algorithm": DOC_FRESHNESS_HASH_ALGORITHM,
             "assertions": [],
         }
+    else:
+        reason = existing_result.error or existing_result.reason or "provenance_artifact_invalid"
+        raise DocProvenanceContractError(
+            f"provenance_path: cannot load existing provenance safely ({reason})"
+        )
 
     assertions = [
         dict(assertion)
