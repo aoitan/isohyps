@@ -614,6 +614,12 @@ def _resolve_freshness_reference_path(index_path: Path, reference_path: str) -> 
 def _reference_file_identity(stat_result: os.stat_result) -> tuple[Any, ...]:
     """Return metadata used to detect reference replacement or mutation."""
 
+    if stat_module.S_ISDIR(stat_result.st_mode):
+        return (
+            getattr(stat_result, "st_dev", None),
+            getattr(stat_result, "st_ino", None),
+        )
+
     return (
         getattr(stat_result, "st_dev", None),
         getattr(stat_result, "st_ino", None),

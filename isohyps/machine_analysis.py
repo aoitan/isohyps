@@ -1743,6 +1743,13 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
         [*attention_diagnostics, *entrypoint_diagnostics]
     )
     attention = classify_attention(snapshots)
+    freshness_hash = safe_hash_regular_file(output_dir / "doc_freshness.json", output_dir)
+    if freshness_hash.digest is None:
+        reason = freshness_hash.reason or "hash_unavailable"
+        raise DocFreshnessContractError(
+            "doc_freshness.json cannot be hashed safely: "
+            f"{reason} (attempt={freshness_hash.attempt})"
+        )
 
     # 最終データの統合
     result = {
@@ -1762,9 +1769,7 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
         "doc_freshness": {
             "path": "doc_freshness.json",
             "schema_version": freshness_document["schema_version"],
-            "sha256": hashlib.sha256(
-                (output_dir / "doc_freshness.json").read_bytes()
-            ).hexdigest(),
+            "sha256": freshness_hash.digest,
             "counts": freshness_document["counts"],
         },
     }
