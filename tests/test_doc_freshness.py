@@ -161,7 +161,9 @@ class TestDocFreshnessContract(unittest.TestCase):
         self.assertEqual(provenance_path.read_bytes(), provenance_text.encode("utf-8"))
         self.assertEqual(load_doc_freshness(freshness_path), freshness)
         self.assertEqual(load_doc_provenance(provenance_path), provenance)
-        self.assertEqual(list(self.temp_dir.iterdir()), [freshness_path, provenance_path])
+        self.assertEqual(
+            sorted(self.temp_dir.iterdir()), sorted([freshness_path, provenance_path])
+        )
 
     def test_additive_unknown_fields_are_preserved_by_canonical_serialization(self) -> None:
         document = valid_freshness_document()
@@ -642,8 +644,8 @@ class TestDocProvenanceRecorder(unittest.TestCase):
         self.assertEqual(context.exception.reason, "source_hash_unavailable")
         self.assertEqual(provenance_path.read_bytes(), original)
         self.assertEqual(
-            [item.name for item in self.output_root.iterdir()],
-            ["src", "doc_provenance.json"],
+            sorted(item.name for item in self.output_root.iterdir()),
+            ["doc_provenance.json", "src"],
         )
 
     def test_provenance_writer_uses_safe_writer_instead_of_path_based_tempfile(self) -> None:
