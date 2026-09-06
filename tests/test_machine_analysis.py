@@ -2,10 +2,12 @@ import unittest
 import tempfile
 import shutil
 import json
+import hashlib
 import os
+import re
 from copy import deepcopy
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 # 機械解析（Level 0）モジュールの各機能を検証します
 from isohyps.machine_analysis import (
@@ -22,9 +24,12 @@ from isohyps.machine_index import (
     MACHINE_INDEX_FILE_FIELDS,
     MACHINE_INDEX_SCHEMA_VERSION,
     MACHINE_INDEX_TOP_LEVEL_FIELDS,
+    MACHINE_INDEX_V2_LEGACY_SCHEMA_VERSION,
+    MACHINE_INDEX_V2_SCHEMA_VERSION,
     MachineIndexContractError,
     build_machine_index_v1,
     load_machine_index,
+    resolve_machine_index_freshness,
     serialize_machine_index,
     validate_machine_index,
 )
@@ -37,6 +42,14 @@ from isohyps.attention import (
     classify_attention,
     serialize_attention,
     validate_attention,
+)
+from isohyps.doc_freshness import (
+    DOC_FRESHNESS_MAPPING_RULE,
+    DOC_FRESHNESS_SCHEMA_VERSION,
+    expected_doc_paths,
+    load_doc_freshness,
+    write_doc_provenance_atomic,
+    write_doc_freshness_atomic,
 )
 
 class TestMachineAnalysis(unittest.TestCase):
@@ -427,8 +440,8 @@ class TestMachineAnalysis(unittest.TestCase):
         self.assertNotIn("deploy.yml", index_content)
         self.assertNotIn("settings.yaml", index_content)
 
-    def test_coverage_and_stale_detection(self):
-        # 2回目：ダミー解説ドキュメントを配置してカバレッジやStaleを検証するテスト
+    def test_coverage_and_hash_stale_detection(self):
+        # 明示 provenance を基準に、mtime ではなく source bytes の変更を stale と判定する。
         
         # validなドキュメントを作成 (runner.py.md)
         doc_dir = self.output_dir / "src"
@@ -444,8 +457,49 @@ class TestMachineAnalysis(unittest.TestCase):
         config_doc = doc_dir / "config.py.md"
         config_doc.write_text("# Config Doc", encoding="utf-8")
         config_mtime = self.config_file.stat().st_mtime
-        # ソースコードより古く更新時刻を設定
+        # mtime の前後は freshness 判定に影響しない。
         os.utime(config_doc, (config_mtime - 10.0, config_mtime - 10.0))
+
+        write_doc_provenance_atomic(
+            self.output_dir / "doc_provenance.json",
+            {
+                "schema_version": "1.0",
+                "hash_algorithm": "sha256",
+                "assertions": [
+                    {
+                        "source_path": "src/config.py",
+                        "doc_path": "src/config.py.md",
+                        "recorded_source_hash": hashlib.sha256(
+                            self.config_file.read_bytes()
+                        ).hexdigest(),
+                        "recorded_doc_hash": hashlib.sha256(
+                            config_doc.read_bytes()
+                        ).hexdigest(),
+                        "producer": "test.producer",
+                        "producer_version": "1",
+                    },
+                    {
+                        "source_path": "src/runner.py",
+                        "doc_path": "src/runner.py.md",
+                        "recorded_source_hash": hashlib.sha256(
+                            self.runner_file.read_bytes()
+                        ).hexdigest(),
+                        "recorded_doc_hash": hashlib.sha256(
+                            runner_doc.read_bytes()
+                        ).hexdigest(),
+                        "producer": "test.producer",
+                        "producer_version": "1",
+                    },
+                ],
+            },
+        )
+
+        # Source bytes changed after the producer assertion; only this target
+        # should become stale.
+        self.config_file.write_text(
+            self.config_file.read_text(encoding="utf-8") + "\n# changed\n",
+            encoding="utf-8",
+        )
 
         # 再度分析を実行
         analyze_machine_level(self.test_dir, self.output_dir)
@@ -457,14 +511,458 @@ class TestMachineAnalysis(unittest.TestCase):
         # runner.py と config.py にドキュメントが存在するため、
         # カバレッジが 0% より大きくなること
         self.assertNotIn("Coverage: 0.0%", report_content)
+
+        freshness = load_doc_freshness(self.output_dir / "doc_freshness.json")
+        statuses = {
+            entry["source_path"]: (entry["status"], entry["reason"])
+            for entry in freshness["entries"]
+        }
+        self.assertEqual(statuses["src/runner.py"], ("fresh", "source_hash_match"))
+        self.assertEqual(
+            statuses["src/config.py"], ("stale", "source_hash_mismatch")
+        )
         
         index_content = index_path.read_text(encoding="utf-8")
-        # config.py は stale としてリストされること
+        # config.py は source bytes の変更により stale としてリストされること
         self.assertTrue(any("config.py" in line and "stale" in line for line in index_content.splitlines()))
         # runner.py は valid なので、git modified などの別の理由がない限り index.md の「要説明」から除外されること
         self.assertFalse(any("src/runner.py" in line and "missing" in line for line in index_content.splitlines()))
         # テストファイルは missing doc と判定されないため、リストされないこと
         self.assertNotIn("tests/test_runner.py", index_content)
+
+    def test_freshness_is_mtime_independent_and_tracks_content_changes(self):
+        root = self.test_dir / "freshness-root"
+        source = root / "src" / "app.py"
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b"def app():\n    return 1\n")
+
+        output = self.output_dir / "freshness-output"
+        doc = output / "src" / "app.py.md"
+        doc.parent.mkdir(parents=True)
+        doc.write_bytes(b"# App\n")
+        provenance_path = output / "doc_provenance.json"
+        write_doc_provenance_atomic(
+            provenance_path,
+            {
+                "schema_version": "1.0",
+                "hash_algorithm": "sha256",
+                "assertions": [
+                    {
+                        "source_path": "src/app.py",
+                        "doc_path": "src/app.py.md",
+                        "recorded_source_hash": hashlib.sha256(
+                            source.read_bytes()
+                        ).hexdigest(),
+                        "recorded_doc_hash": hashlib.sha256(doc.read_bytes()).hexdigest(),
+                        "producer": "test.producer",
+                        "producer_version": "1",
+                    }
+                ],
+            },
+        )
+
+        analyze_machine_level(root, output)
+        first_freshness = (output / "doc_freshness.json").read_bytes()
+        first_provenance = provenance_path.read_bytes()
+        first_entry = load_doc_freshness(output / "doc_freshness.json")["entries"][0]
+        self.assertEqual((first_entry["status"], first_entry["reason"]), ("fresh", "source_hash_match"))
+
+        source_mtime = source.stat().st_mtime
+        os.utime(source, (source_mtime + 100.0, source_mtime + 100.0))
+        os.utime(doc, (source_mtime - 100.0, source_mtime - 100.0))
+        analyze_machine_level(root, output)
+
+        self.assertEqual(first_freshness, (output / "doc_freshness.json").read_bytes())
+        self.assertEqual(first_provenance, provenance_path.read_bytes())
+        mtime_entry = load_doc_freshness(output / "doc_freshness.json")["entries"][0]
+        self.assertEqual((mtime_entry["status"], mtime_entry["reason"]), ("fresh", "source_hash_match"))
+
+        source.write_bytes(b"def app():\n    return 2\n")
+        analyze_machine_level(root, output)
+        changed_freshness = load_doc_freshness(output / "doc_freshness.json")
+        changed_entry = changed_freshness["entries"][0]
+        self.assertEqual(
+            (changed_entry["status"], changed_entry["reason"]),
+            ("stale", "source_hash_mismatch"),
+        )
+        self.assertNotEqual(first_freshness, (output / "doc_freshness.json").read_bytes())
+
+    def test_machine_analysis_preserves_freshness_reason_diagnostics(self):
+        root = self.test_dir / "freshness-diagnostics-root"
+        source = root / "src" / "app.py"
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b"def app():\n    return 1\n")
+
+        output = self.output_dir / "freshness-diagnostics-output"
+        doc = output / "src" / "app.py.md"
+        doc.parent.mkdir(parents=True)
+        doc.write_bytes(b"# App\n")
+
+        result = analyze_machine_level(root, output)
+        expected_missing = ("doc_status", "recorded_source_hash_missing", "src/app.py")
+        self.assertIn(
+            expected_missing,
+            {
+                (item["detector"], item["code"], item["path"])
+                for item in result["attention_diagnostics"]
+            },
+        )
+        machine_analysis = json.loads(
+            (output / "machine_analysis.json").read_text(encoding="utf-8")
+        )
+        self.assertIn(
+            expected_missing,
+            {
+                (item["detector"], item["code"], item["path"])
+                for item in machine_analysis["attention_diagnostics"]
+            },
+        )
+
+        (output / "doc_provenance.json").write_text("{invalid", encoding="utf-8")
+        result = analyze_machine_level(root, output)
+        expected_invalid = ("doc_status", "provenance_artifact_invalid", "src/app.py")
+        self.assertIn(
+            expected_invalid,
+            {
+                (item["detector"], item["code"], item["path"])
+                for item in result["attention_diagnostics"]
+            },
+        )
+        machine_analysis = json.loads(
+            (output / "machine_analysis.json").read_text(encoding="utf-8")
+        )
+        self.assertIn(
+            expected_invalid,
+            {
+                (item["detector"], item["code"], item["path"])
+                for item in machine_analysis["attention_diagnostics"]
+            },
+        )
+
+    def test_machine_scan_rejects_unsafe_provenance_artifacts(self):
+        root = self.test_dir / "provenance-boundary-root"
+        output = self.output_dir / "provenance-boundary-output"
+        source = root / "src" / "app.py"
+        document = output / "src" / "app.py.md"
+        source.parent.mkdir(parents=True)
+        document.parent.mkdir(parents=True)
+        source_bytes = b"def app():\n    return 1\n"
+        doc_bytes = b"# App\n"
+        source.write_bytes(source_bytes)
+        document.write_bytes(doc_bytes)
+
+        external_provenance = self.test_dir / "external-provenance" / "doc.json"
+        write_doc_provenance_atomic(
+            external_provenance,
+            {
+                "schema_version": "1.0",
+                "hash_algorithm": "sha256",
+                "assertions": [
+                    {
+                        "source_path": "src/app.py",
+                        "doc_path": "src/app.py.md",
+                        "recorded_source_hash": hashlib.sha256(source_bytes).hexdigest(),
+                        "recorded_doc_hash": hashlib.sha256(doc_bytes).hexdigest(),
+                        "producer": "test.producer",
+                        "producer_version": "1",
+                    }
+                ],
+            },
+        )
+        provenance_path = output / "doc_provenance.json"
+        try:
+            provenance_path.symlink_to(external_provenance)
+        except (NotImplementedError, OSError) as exc:
+            self.skipTest(f"symlinks unavailable: {exc}")
+
+        external_bytes = external_provenance.read_bytes()
+        result = analyze_machine_level(root, output)
+        entry = load_doc_freshness(output / "doc_freshness.json")["entries"][0]
+        self.assertEqual(
+            (entry["status"], entry["reason"]),
+            ("unknown", "provenance_artifact_invalid"),
+        )
+        self.assertEqual(result["coverage_summary"]["unknown_docs"], 1)
+        self.assertEqual(external_provenance.read_bytes(), external_bytes)
+
+        provenance_path.unlink()
+        if hasattr(os, "mkfifo"):
+            try:
+                os.mkfifo(provenance_path)
+            except (NotImplementedError, OSError):
+                pass
+            else:
+                result = analyze_machine_level(root, output)
+                entry = load_doc_freshness(output / "doc_freshness.json")["entries"][0]
+                self.assertEqual(
+                    (entry["status"], entry["reason"]),
+                    ("unknown", "provenance_artifact_invalid"),
+                )
+                self.assertEqual(result["coverage_summary"]["unknown_docs"], 1)
+
+    def test_machine_scan_distinguishes_fresh_stale_missing_and_unknown(self):
+        root = self.test_dir / "freshness-boundary-root"
+        output = self.output_dir / "freshness-boundary-output"
+        source_bytes = {
+            "src/fresh.py": b"def fresh():\n    return 1\n",
+            "src/stale.py": b"def stale():\n    return 1\n",
+            "src/missing.py": b"def missing():\n    return 1\n",
+            "src/unknown.py": b"def unknown():\n    return 1\n",
+        }
+        doc_bytes = {
+            "src/fresh.py.md": b"# Fresh\n",
+            "src/stale.py.md": b"# Stale\n",
+            "src/unknown.py.md": b"# Unknown\n",
+        }
+        for relative_path, payload in source_bytes.items():
+            source_path = root / relative_path
+            source_path.parent.mkdir(parents=True, exist_ok=True)
+            source_path.write_bytes(payload)
+        for relative_path, payload in doc_bytes.items():
+            doc_path = output / relative_path
+            doc_path.parent.mkdir(parents=True, exist_ok=True)
+            doc_path.write_bytes(payload)
+
+        digest = lambda payload: hashlib.sha256(payload).hexdigest()
+        write_doc_provenance_atomic(
+            output / "doc_provenance.json",
+            {
+                "schema_version": "1.0",
+                "hash_algorithm": "sha256",
+                "assertions": [
+                    {
+                        "source_path": "src/fresh.py",
+                        "doc_path": "src/fresh.py.md",
+                        "recorded_source_hash": digest(source_bytes["src/fresh.py"]),
+                        "recorded_doc_hash": digest(doc_bytes["src/fresh.py.md"]),
+                        "producer": "test.producer",
+                        "producer_version": "1",
+                    },
+                    {
+                        "source_path": "src/stale.py",
+                        "doc_path": "src/stale.py.md",
+                        "recorded_source_hash": digest(source_bytes["src/stale.py"]),
+                        "recorded_doc_hash": digest(doc_bytes["src/stale.py.md"]),
+                        "producer": "test.producer",
+                        "producer_version": "1",
+                    },
+                ],
+            },
+        )
+        (root / "src/stale.py").write_bytes(b"def stale():\n    return 2\n")
+
+        result = analyze_machine_level(root, output)
+        freshness_path = output / "doc_freshness.json"
+        freshness = load_doc_freshness(freshness_path)
+        entries = {entry["source_path"]: entry for entry in freshness["entries"]}
+        expected = {
+            "src/fresh.py": ("fresh", "source_hash_match", "src/fresh.py.md"),
+            "src/stale.py": ("stale", "source_hash_mismatch", "src/stale.py.md"),
+            "src/missing.py": ("missing", "doc_missing", None),
+            "src/unknown.py": (
+                "unknown",
+                "recorded_source_hash_missing",
+                "src/unknown.py.md",
+            ),
+        }
+        required_fields = {
+            "source_path",
+            "doc_path",
+            "expected_doc_paths",
+            "current_source_hash",
+            "recorded_source_hash",
+            "doc_hash",
+            "status",
+            "reason",
+            "diagnostics",
+        }
+        self.assertEqual(set(entries), set(expected))
+        for source_path, (status, reason, doc_path) in expected.items():
+            with self.subTest(source_path=source_path):
+                entry = entries[source_path]
+                self.assertEqual(set(entry), required_fields)
+                self.assertEqual(
+                    entry["expected_doc_paths"], list(expected_doc_paths(source_path))
+                )
+                self.assertEqual(
+                    (entry["status"], entry["reason"], entry["doc_path"]),
+                    (status, reason, doc_path),
+                )
+                self.assertIsNotNone(entry["current_source_hash"])
+                if doc_path is None:
+                    self.assertIsNone(entry["doc_hash"])
+                    self.assertIsNone(entry["recorded_source_hash"])
+                else:
+                    self.assertIsNotNone(entry["doc_hash"])
+                if status in ("fresh", "stale"):
+                    self.assertIsNotNone(entry["recorded_source_hash"])
+                else:
+                    self.assertIsNone(entry["recorded_source_hash"])
+
+        self.assertEqual(
+            freshness["counts"], {"missing": 1, "fresh": 1, "stale": 1, "unknown": 1}
+        )
+        self.assertEqual(
+            result["coverage_summary"]["unknown_docs"], 1
+        )
+        self.assertEqual(
+            result["coverage_summary"]["missing_docs"], 1
+        )
+        statuses, _diagnostics = build_doc_status_snapshot(
+            root, result["files"], output
+        )
+        self.assertEqual(
+            {
+                path: statuses[path]
+                for path in expected
+            },
+            {
+                "src/fresh.py": "current",
+                "src/stale.py": "stale",
+                "src/missing.py": "missing",
+                "src/unknown.py": "unavailable",
+            },
+        )
+        self.assertIn(
+            "unknown doc (recorded_source_hash_missing)",
+            (output / "index.md").read_text(encoding="utf-8"),
+        )
+
+    def test_machine_scan_rename_does_not_inherit_old_provenance(self):
+        root = self.test_dir / "rename-boundary-root"
+        output = self.output_dir / "rename-boundary-output"
+        old_source = root / "src" / "old.py"
+        old_doc = output / "src" / "old.py.md"
+        new_source = root / "src" / "new.py"
+        new_doc = output / "src" / "new.py.md"
+        source_payload = b"def value():\n    return 1\n"
+        doc_payload = b"# Value\n"
+        old_source.parent.mkdir(parents=True)
+        old_source.write_bytes(source_payload)
+        old_doc.parent.mkdir(parents=True)
+        old_doc.write_bytes(doc_payload)
+        write_doc_provenance_atomic(
+            output / "doc_provenance.json",
+            {
+                "schema_version": "1.0",
+                "hash_algorithm": "sha256",
+                "assertions": [
+                    {
+                        "source_path": "src/old.py",
+                        "doc_path": "src/old.py.md",
+                        "recorded_source_hash": hashlib.sha256(source_payload).hexdigest(),
+                        "recorded_doc_hash": hashlib.sha256(doc_payload).hexdigest(),
+                        "producer": "test.producer",
+                        "producer_version": "1",
+                    }
+                ],
+            },
+        )
+
+        old_source.rename(new_source)
+        new_doc.write_bytes(doc_payload)
+        result = analyze_machine_level(root, output)
+        freshness = load_doc_freshness(output / "doc_freshness.json")
+        self.assertEqual(
+            [entry["source_path"] for entry in freshness["entries"]],
+            ["src/new.py"],
+        )
+        entry = freshness["entries"][0]
+        self.assertEqual(
+            (entry["status"], entry["reason"], entry["doc_path"]),
+            ("unknown", "recorded_source_hash_missing", "src/new.py.md"),
+        )
+        self.assertIsNone(entry["recorded_source_hash"])
+        self.assertIn("orphan_provenance_assertion", freshness["diagnostics"])
+        self.assertEqual(result["coverage_summary"]["fresh_docs"], 0)
+        self.assertEqual(result["coverage_summary"]["unknown_docs"], 1)
+
+    def test_machine_scan_mapping_collisions_and_unsafe_docs_never_become_current(self):
+        root = self.test_dir / "mapping-boundary-root"
+        output = self.output_dir / "mapping-boundary-output"
+        source_payloads = {
+            "src/ambiguous.py": b"def ambiguous():\n    return 1\n",
+            "src/shared.py": b"def shared_py():\n    return 1\n",
+            "src/shared.js": b"function sharedJs() { return 1; }\n",
+            "src/unsafe.py": b"def unsafe():\n    return 1\n",
+        }
+        for relative_path, payload in source_payloads.items():
+            source_path = root / relative_path
+            source_path.parent.mkdir(parents=True, exist_ok=True)
+            source_path.write_bytes(payload)
+
+        docs = {
+            "src/ambiguous.py.md": b"# first candidate\n",
+            "src/ambiguous.md": b"# second candidate\n",
+            "src/shared.md": b"# shared candidate\n",
+        }
+        for relative_path, payload in docs.items():
+            doc_path = output / relative_path
+            doc_path.parent.mkdir(parents=True, exist_ok=True)
+            doc_path.write_bytes(payload)
+
+        outside = self.test_dir / "outside-doc.md"
+        outside.write_bytes(b"outside\n")
+        unsafe_doc = output / "src" / "unsafe.py.md"
+        try:
+            unsafe_doc.symlink_to(outside)
+        except (NotImplementedError, OSError) as exc:
+            self.skipTest(f"symlinks unavailable: {exc}")
+
+        result = analyze_machine_level(root, output)
+        freshness = load_doc_freshness(output / "doc_freshness.json")
+        entries = {entry["source_path"]: entry for entry in freshness["entries"]}
+        expected_reasons = {
+            "src/ambiguous.py": "ambiguous_doc_mapping",
+            "src/shared.py": "doc_identity_collision",
+            "src/shared.js": "doc_identity_collision",
+            "src/unsafe.py": "unsafe_doc_path",
+        }
+        self.assertEqual(set(entries), set(expected_reasons))
+        for source_path, reason in expected_reasons.items():
+            with self.subTest(source_path=source_path):
+                entry = entries[source_path]
+                self.assertEqual((entry["status"], entry["reason"]), ("unknown", reason))
+                self.assertIsNone(entry["doc_path"])
+                self.assertIsNone(entry["doc_hash"])
+                self.assertIsNone(entry["recorded_source_hash"])
+
+        self.assertEqual(freshness["counts"], {"missing": 0, "fresh": 0, "stale": 0, "unknown": 4})
+        statuses, _diagnostics = build_doc_status_snapshot(
+            root, result["files"], output
+        )
+        self.assertEqual(
+            {path: statuses[path] for path in expected_reasons},
+            {path: "unavailable" for path in expected_reasons},
+        )
+        self.assertNotIn("source_hash_match", freshness["diagnostics"])
+
+    def test_machine_scan_freshness_bytes_are_stable_for_creation_order(self):
+        logical_files = [
+            ("src/root.py", b"from src.alpha import Alpha\n"),
+            ("src/alpha.py", b"class Alpha: pass\n"),
+            ("src/zed.py", b"class Zed: pass\n"),
+            ("src/root.py.md", b"# Root\n"),
+            ("src/alpha.py.md", b"# Alpha\n"),
+            ("src/zed.py.md", b"# Zed\n"),
+        ]
+        freshness_bytes = []
+        for suffix, creation_order in (
+            ("forward", logical_files),
+            ("reverse", list(reversed(logical_files))),
+        ):
+            root = self.test_dir / f"freshness-order-{suffix}-root"
+            output = self.output_dir / f"freshness-order-{suffix}-output"
+            for relative_path, payload in creation_order:
+                destination_root = root if not relative_path.endswith(".md") else output
+                path = destination_root / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(payload)
+
+            analyze_machine_level(root, output)
+            freshness_bytes.append((output / "doc_freshness.json").read_bytes())
+
+        self.assertEqual(freshness_bytes[0], freshness_bytes[1])
 
     def test_dependency_graph_building(self):
         # 依存関係抽出と Mermaid グラフ生成、トポロジカルソートの統合検証テスト
@@ -801,9 +1299,9 @@ class TestMachineAnalysis(unittest.TestCase):
         analyze_machine_level(root, output)
         self.assertEqual(first_bytes, index_path.read_bytes())
 
-    def test_machine_index_is_byte_stable_across_prior_analysis_and_stale_docs(self):
-        # 初回の added/stale 状態と、前回解析を読んだ2回目の unchanged 状態を跨いでも、
-        # history-aware な内部 result が公開 index の bytes を変えないことを確認する。
+    def test_machine_index_is_byte_stable_across_prior_analysis_and_unknown_docs(self):
+        # provenance のない既存 doc は scan 回数や mtime により current/stale に
+        # 遷移せず、公開 index の bytes も変わらないことを確認する。
         root = self.test_dir / "repeat-scan-root"
         source = root / "src" / "app.py"
         source.parent.mkdir(parents=True)
@@ -822,7 +1320,7 @@ class TestMachineAnalysis(unittest.TestCase):
             file for file in first_result["files"] if file["path"] == "src/app.py"
         )
         self.assertNotEqual(first_file["status"], "unchanged")
-        self.assertGreater(first_result["coverage_summary"]["stale_docs"], 0)
+        self.assertEqual(first_result["coverage_summary"]["unknown_docs"], 1)
 
         second_result = analyze_machine_level(root, self.output_dir)
         second_bytes = index_path.read_bytes()
@@ -832,15 +1330,150 @@ class TestMachineAnalysis(unittest.TestCase):
 
         self.assertEqual(second_file["status"], "unchanged")
         self.assertNotEqual(first_file["status"], second_file["status"])
-        # v2 includes normalized history/doc attention.  The first snapshot is
-        # stale while the second is current, so the public bytes intentionally
-        # differ; determinism is guaranteed for an identical analysis snapshot.
-        self.assertNotEqual(first_bytes, second_bytes)
+        self.assertEqual(first_bytes, second_bytes)
         first_index = json.loads(first_bytes)
         second_index = json.loads(second_bytes)
-        self.assertEqual(first_index["schema_version"], "2.0")
-        self.assertTrue(any(entry["kind"] == "doc_stale" for entry in first_index["attention"]))
+        self.assertEqual(first_index["schema_version"], MACHINE_INDEX_V2_SCHEMA_VERSION)
+        self.assertFalse(any(entry["kind"] == "doc_stale" for entry in first_index["attention"]))
         self.assertFalse(any(entry["kind"] == "doc_stale" for entry in second_index["attention"]))
+
+    def test_machine_index_v21_binds_and_resolves_freshness_artifact(self):
+        root = self.test_dir / "index-freshness-root"
+        source = root / "src" / "app.py"
+        source.parent.mkdir(parents=True)
+        source.write_text("def app():\n    return 1\n", encoding="utf-8")
+
+        output = self.output_dir / "index-freshness-output"
+        analyze_machine_level(root, output)
+
+        index_path = output / "machine_index.json"
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        freshness_path = output / "doc_freshness.json"
+        freshness = load_doc_freshness(freshness_path)
+
+        self.assertEqual(index["schema_version"], MACHINE_INDEX_V2_SCHEMA_VERSION)
+        self.assertEqual(
+            index["doc_freshness"],
+            {
+                "path": "doc_freshness.json",
+                "schema_version": freshness["schema_version"],
+                "sha256": hashlib.sha256(freshness_path.read_bytes()).hexdigest(),
+                "counts": freshness["counts"],
+            },
+        )
+        self.assertEqual(resolve_machine_index_freshness(index_path), freshness)
+
+    def test_machine_index_v20_remains_readable_without_freshness_reference(self):
+        legacy = build_machine_index_v1(self._valid_machine_index_fixture())
+        legacy["schema_version"] = MACHINE_INDEX_V2_LEGACY_SCHEMA_VERSION
+        legacy["attention"] = []
+
+        index_path = self.output_dir / "machine-index-v20.json"
+        index_path.write_text(
+            serialize_machine_index(legacy, supported_major=2),
+            encoding="utf-8",
+        )
+
+        loaded = load_machine_index(index_path, supported_major=2)
+        self.assertEqual(
+            loaded["schema_version"], MACHINE_INDEX_V2_LEGACY_SCHEMA_VERSION
+        )
+        self.assertIsNone(resolve_machine_index_freshness(index_path))
+
+    def test_machine_index_freshness_reference_fails_closed_on_mismatch(self):
+        root = self.test_dir / "index-reference-root"
+        source = root / "src" / "app.py"
+        source.parent.mkdir(parents=True)
+        source.write_text("def app():\n    return 1\n", encoding="utf-8")
+        output = self.output_dir / "index-reference-output"
+        analyze_machine_level(root, output)
+
+        index_path = output / "machine_index.json"
+        original_index_bytes = index_path.read_bytes()
+        original_index = json.loads(original_index_bytes)
+
+        unsafe_path = deepcopy(original_index)
+        unsafe_path["doc_freshness"]["path"] = "../doc_freshness.json"
+        with self.assertRaises(MachineIndexContractError):
+            validate_machine_index(unsafe_path, supported_major=2)
+
+        for field, value in (
+            ("sha256", "0" * 64),
+            ("schema_version", "1.1"),
+            (
+                "counts",
+                {
+                    **original_index["doc_freshness"]["counts"],
+                    "unknown": original_index["doc_freshness"]["counts"]["unknown"] + 1,
+                },
+            ),
+        ):
+            with self.subTest(reference_field=field):
+                mismatched = deepcopy(original_index)
+                mismatched["doc_freshness"][field] = value
+                index_path.write_text(
+                    serialize_machine_index(mismatched, supported_major=2),
+                    encoding="utf-8",
+                )
+                with self.assertRaises(MachineIndexContractError):
+                    resolve_machine_index_freshness(index_path)
+
+        # Simulate the crash window in which a new freshness artifact is
+        # published but the old index is still visible to a reader.
+        index_path.write_bytes(original_index_bytes)
+        source.write_text("def app():\n    return 2\n", encoding="utf-8")
+        analyze_machine_level(root, output)
+        new_freshness_bytes = (output / "doc_freshness.json").read_bytes()
+        self.assertNotEqual(
+            hashlib.sha256(new_freshness_bytes).hexdigest(),
+            original_index["doc_freshness"]["sha256"],
+        )
+        index_path.write_bytes(original_index_bytes)
+        with self.assertRaises(MachineIndexContractError):
+            resolve_machine_index_freshness(index_path)
+
+    def test_machine_index_freshness_reader_rejects_replaced_symlink(self):
+        root = self.test_dir / "index-reference-race-root"
+        source = root / "src" / "app.py"
+        source.parent.mkdir(parents=True)
+        source.write_text("def app():\n    return 1\n", encoding="utf-8")
+        output = self.output_dir / "index-reference-race-output"
+        analyze_machine_level(root, output)
+
+        index_path = output / "machine_index.json"
+        freshness_path = output / "doc_freshness.json"
+        replacement = output / "replaced-freshness.json"
+        try:
+            replacement.symlink_to(freshness_path)
+        except (NotImplementedError, OSError) as exc:
+            self.skipTest(f"symlinks unavailable: {exc}")
+
+        # Bypass the pre-read path inspection to model a replacement between
+        # that check and the old path-based read_bytes() call.
+        with patch(
+            "isohyps.machine_index._resolve_freshness_reference_path",
+            return_value=replacement,
+        ):
+            with self.assertRaises(MachineIndexContractError):
+                resolve_machine_index_freshness(index_path)
+
+    def test_machine_index_schema_and_runtime_reject_noncanonical_versions(self):
+        schema_path = (
+            Path(__file__).resolve().parents[1]
+            / "schemas"
+            / "machine-index.schema.json"
+        )
+        with schema_path.open(encoding="utf-8") as handle:
+            schema = json.load(handle)
+
+        schema_pattern = re.compile(schema["properties"]["schema_version"]["pattern"])
+        for version in ("2.01", "02.1"):
+            with self.subTest(version=version):
+                self.assertIsNone(schema_pattern.fullmatch(version))
+                fixture = self._valid_machine_index_fixture()
+                fixture["schema_version"] = version
+                with self.assertRaises(MachineIndexContractError):
+                    validate_machine_index(fixture)
 
     def test_machine_index_is_byte_stable_when_files_are_created_in_different_orders(self):
         logical_files = [
@@ -931,6 +1564,20 @@ class TestMachineAnalysis(unittest.TestCase):
         for field, expected_type in top_level_types.items():
             with self.subTest(top_level_field=field):
                 self.assertEqual(schema["properties"][field]["type"], expected_type)
+
+        self.assertEqual(
+            schema["properties"]["doc_freshness"]["$ref"],
+            "#/$defs/docFreshnessReference",
+        )
+        freshness_reference = schema["$defs"]["docFreshnessReference"]
+        self.assertEqual(
+            freshness_reference["required"],
+            ["path", "schema_version", "sha256", "counts"],
+        )
+        self.assertEqual(
+            freshness_reference["properties"]["counts"]["required"],
+            ["missing", "fresh", "stale", "unknown"],
+        )
 
         file_schema = schema["$defs"]["fileEntry"]
         self.assertEqual(file_schema["required"], list(MACHINE_INDEX_FILE_FIELDS))
@@ -1295,7 +1942,7 @@ class TestAttentionSnapshotBuilder(unittest.TestCase):
             },
         )
 
-    def test_doc_status_snapshot_keeps_missing_current_stale_and_two_second_boundary(self):
+    def test_doc_status_snapshot_uses_freshness_artifact_not_mtime(self):
         root = Path(tempfile.mkdtemp())
         output = Path(tempfile.mkdtemp())
         try:
@@ -1315,6 +1962,78 @@ class TestAttentionSnapshotBuilder(unittest.TestCase):
                 doc.write_text("# doc", encoding="utf-8")
                 os.utime(doc, (mtime, mtime))
 
+            def entry(
+                path: str,
+                *,
+                doc_path: str | None,
+                current: str,
+                recorded: str | None,
+                doc_hash: str | None,
+                status: str,
+                reason: str,
+            ) -> dict[str, object]:
+                return {
+                    "source_path": path,
+                    "doc_path": doc_path,
+                    "expected_doc_paths": list(expected_doc_paths(path)),
+                    "current_source_hash": current,
+                    "recorded_source_hash": recorded,
+                    "doc_hash": doc_hash,
+                    "status": status,
+                    "reason": reason,
+                    "diagnostics": [],
+                }
+
+            hash_a = "a" * 64
+            hash_b = "b" * 64
+            hash_c = "c" * 64
+            freshness_document = {
+                "schema_version": DOC_FRESHNESS_SCHEMA_VERSION,
+                "hash_algorithm": "sha256",
+                "mapping_rule": DOC_FRESHNESS_MAPPING_RULE,
+                "counts": {"missing": 1, "fresh": 2, "stale": 1, "unknown": 0},
+                "entries": [
+                    entry(
+                        "src/exact.py",
+                        doc_path="src/exact.py.md",
+                        current=hash_a,
+                        recorded=hash_a,
+                        doc_hash=hash_c,
+                        status="fresh",
+                        reason="source_hash_match",
+                    ),
+                    entry(
+                        "src/missing.py",
+                        doc_path=None,
+                        current=hash_a,
+                        recorded=None,
+                        doc_hash=None,
+                        status="missing",
+                        reason="doc_missing",
+                    ),
+                    entry(
+                        "src/stale.py",
+                        doc_path="src/stale.py.md",
+                        current=hash_a,
+                        recorded=hash_b,
+                        doc_hash=hash_c,
+                        status="stale",
+                        reason="source_hash_mismatch",
+                    ),
+                    entry(
+                        "src/unchanged.py",
+                        doc_path="src/unchanged.py.md",
+                        current=hash_a,
+                        recorded=hash_a,
+                        doc_hash=hash_c,
+                        status="fresh",
+                        reason="source_hash_match",
+                    ),
+                ],
+                "diagnostics": [],
+            }
+            write_doc_freshness_atomic(output / "doc_freshness.json", freshness_document)
+
             statuses, diagnostics = build_doc_status_snapshot(root, files_meta, output)
             self.assertEqual(diagnostics, [])
             self.assertEqual(statuses["src/exact.py"], "current")
@@ -1331,6 +2050,58 @@ class TestAttentionSnapshotBuilder(unittest.TestCase):
             self.assertEqual(by_path["src/stale.py"].doc_status, "stale")
             self.assertEqual(by_path["src/missing.py"].doc_status, "missing")
             self.assertEqual(by_path["src/unchanged.py"].doc_status, "current")
+        finally:
+            shutil.rmtree(root)
+            shutil.rmtree(output)
+
+    def test_doc_status_snapshot_fails_closed_for_omitted_coverage_target(self):
+        root = Path(tempfile.mkdtemp())
+        output = Path(tempfile.mkdtemp())
+        try:
+            files_meta = [
+                self.metadata("src/included.py"),
+                self.metadata("src/omitted.py"),
+                self.metadata("README.md", kind="doc", language="unknown"),
+            ]
+            freshness_document = {
+                "schema_version": DOC_FRESHNESS_SCHEMA_VERSION,
+                "hash_algorithm": "sha256",
+                "mapping_rule": DOC_FRESHNESS_MAPPING_RULE,
+                "counts": {"missing": 0, "fresh": 1, "stale": 0, "unknown": 0},
+                "entries": [
+                    {
+                        "source_path": "src/included.py",
+                        "doc_path": "src/included.py.md",
+                        "expected_doc_paths": list(
+                            expected_doc_paths("src/included.py")
+                        ),
+                        "current_source_hash": "a" * 64,
+                        "recorded_source_hash": "a" * 64,
+                        "doc_hash": "b" * 64,
+                        "status": "fresh",
+                        "reason": "source_hash_match",
+                        "diagnostics": [],
+                    }
+                ],
+                "diagnostics": [],
+            }
+            write_doc_freshness_atomic(
+                output / "doc_freshness.json", freshness_document
+            )
+
+            statuses, diagnostics = build_doc_status_snapshot(
+                root, files_meta, output
+            )
+
+            self.assertEqual(statuses["src/included.py"], "current")
+            self.assertEqual(statuses["src/omitted.py"], "unavailable")
+            self.assertEqual(statuses["README.md"], "current")
+            self.assertIn(
+                ("doc_status", "freshness_target_missing", "src/omitted.py"),
+                {
+                    (item.detector, item.code, item.path) for item in diagnostics
+                },
+            )
         finally:
             shutil.rmtree(root)
             shutil.rmtree(output)

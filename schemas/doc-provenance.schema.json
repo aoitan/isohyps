@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/aoitan/isohyps/schemas/doc-provenance.schema.json",
+  "title": "isohyps document producer provenance",
+  "description": "Producer-owned source/document byte assertions consumed by the freshness evaluator.",
+  "type": "object",
+  "required": ["schema_version", "hash_algorithm", "assertions"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^1\\.[0-9]+$",
+      "description": "Decimal major.minor version. Major 1 is the provenance contract defined here."
+    },
+    "hash_algorithm": {
+      "const": "sha256"
+    },
+    "assertions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/assertion" }
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/diagnosticCode" }
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "repositoryRelativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!.*\\u0000)(?!.*//)(?!.*(?:^|/)(?:\\.|\\.\\.)(?:/|$))(?!.*\\/$).+$",
+      "description": "Normalized repository-relative POSIX path."
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Lowercase SHA-256 digest of exact file bytes."
+    },
+    "diagnosticCode": {
+      "enum": [
+        "ambiguous_doc_mapping",
+        "doc_changed_during_scan",
+        "doc_hash_unavailable",
+        "doc_identity_collision",
+        "doc_missing",
+        "duplicate_source_identity",
+        "invalid_source_identity",
+        "orphan_provenance_assertion",
+        "provenance_artifact_invalid",
+        "provenance_assertion_invalid",
+        "provenance_binding_mismatch",
+        "provenance_doc_hash_mismatch",
+        "recorded_source_hash_missing",
+        "source_changed_during_scan",
+        "source_hash_match",
+        "source_hash_mismatch",
+        "source_hash_unavailable",
+        "unsafe_doc_path",
+        "unsafe_source_path"
+      ]
+    },
+    "assertion": {
+      "type": "object",
+      "required": [
+        "source_path",
+        "doc_path",
+        "recorded_source_hash",
+        "recorded_doc_hash",
+        "producer",
+        "producer_version"
+      ],
+      "properties": {
+        "source_path": { "$ref": "#/$defs/repositoryRelativePath" },
+        "doc_path": { "$ref": "#/$defs/repositoryRelativePath" },
+        "recorded_source_hash": { "$ref": "#/$defs/sha256" },
+        "recorded_doc_hash": { "$ref": "#/$defs/sha256" },
+        "producer": { "type": "string", "minLength": 1 },
+        "producer_version": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": true
+    }
+  }
+}
