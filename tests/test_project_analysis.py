@@ -1,3 +1,4 @@
+import hashlib
 import shutil
 import tempfile
 import tomllib
@@ -22,6 +23,11 @@ from isohyps.project_analysis import (
     validate_analysis_result,
     validate_project_analysis_finish,
     write_analysis_docs,
+)
+from isohyps.doc_freshness import (
+    DocProvenanceContractError,
+    load_doc_provenance,
+    write_text_regular_file,
 )
 from isohyps.rlm_runtime import BudgetSnapshot, ChildQueryConfig, ControllerResult, ExecutionObservation
 from tests.test_utils import ScriptedClient
@@ -1065,6 +1071,162 @@ class TestAnalysisDocBuilder(unittest.TestCase):
         fallback_doc = (self.output_dir / "app.py.md").read_text(encoding="utf-8")
         self.assertIn("# Source: app.py", fallback_doc)
         self.assertIn("def hello", fallback_doc)
+
+    def test_build_records_provenance_for_fallback_source_doc(self):
+        root = Path(self.temp_dir) / "repo"
+        root.mkdir()
+        source = root / "app.py"
+        source_bytes = b"def hello(): pass\n"
+        source.write_bytes(source_bytes)
+        builder = AnalysisDocBuilder(self.output_dir)
+        result = self._make_result(result={"summary": "all good", "documents": []})
+
+        builder.build(root, result, backend="test", model="fake")
+
+        provenance = load_doc_provenance(self.output_dir / "doc_provenance.json")
+        self.assertEqual(
+            provenance["assertions"],
+            [
+                {
+                    "source_path": "app.py",
+                    "doc_path": "app.py.md",
+                    "recorded_source_hash": hashlib.sha256(source_bytes).hexdigest(),
+                    "recorded_doc_hash": hashlib.sha256(
+                        (self.output_dir / "app.py.md").read_bytes()
+                    ).hexdigest(),
+                    "producer": "isohyps.project_analysis",
+                    "producer_version": "1",
+                }
+            ],
+        )
+
+    def test_build_records_controller_source_doc_but_not_index_report_or_extra_docs(self):
+        root = Path(self.temp_dir) / "repo"
+        root.mkdir()
+        (root / "app.py").write_text("def hello(): pass\n", encoding="utf-8")
+        builder = AnalysisDocBuilder(self.output_dir)
+        result = self._make_result(
+            result={
+                "summary": "all good",
+                "documents": [
+                    {"path": "index.md", "title": "Index", "content": "overview"},
+                    {"path": "app.py.md", "title": "App", "content": "app details"},
+                    {"path": "notes.md", "title": "Notes", "content": "extra details"},
+                    {"path": "analysis_report.md", "title": "Report", "content": "extra report"},
+                ],
+            }
+        )
+
+        builder.build(root, result, backend="test", model="fake")
+
+        provenance = load_doc_provenance(self.output_dir / "doc_provenance.json")
+        self.assertEqual(
+            [(item["source_path"], item["doc_path"]) for item in provenance["assertions"]],
+            [("app.py", "app.py.md")],
+        )
+
+    def test_build_records_actual_collision_adjusted_path_for_source_identity(self):
+        root = Path(self.temp_dir) / "repo"
+        root.mkdir()
+        (root / "app.py").write_text("def hello(): pass\n", encoding="utf-8")
+        builder = AnalysisDocBuilder(self.output_dir)
+        result = self._make_result(
+            result={
+                "summary": "all good",
+                "documents": [
+                    {"path": "app.py.md", "title": "App", "content": "first"},
+                    {"path": "app.py.md", "title": "App duplicate", "content": "second"},
+                ],
+            }
+        )
+
+        builder.build(root, result, backend="test", model="fake")
+
+        provenance = load_doc_provenance(self.output_dir / "doc_provenance.json")
+        self.assertEqual(
+            [(item["source_path"], item["doc_path"]) for item in provenance["assertions"]],
+            [("app.py", "app.py.md"), ("app.py", "app.py_1.md")],
+        )
+        self.assertEqual(
+            provenance["assertions"][1]["recorded_doc_hash"],
+            hashlib.sha256((self.output_dir / "app.py_1.md").read_bytes()).hexdigest(),
+        )
+
+    def test_failed_source_doc_write_does_not_advance_existing_provenance(self):
+        root = Path(self.temp_dir) / "repo"
+        root.mkdir()
+        (root / "app.py").write_text("def hello(): pass\n", encoding="utf-8")
+        builder = AnalysisDocBuilder(self.output_dir)
+        result = self._make_result(
+            result={
+                "summary": "all good",
+                "documents": [{"path": "app.py.md", "title": "App", "content": "first"}],
+            }
+        )
+        builder.build(root, result, backend="test", model="fake")
+        provenance_path = self.output_dir / "doc_provenance.json"
+        original = provenance_path.read_bytes()
+
+        real_write_text = write_text_regular_file
+
+        def fail_source_doc_write(path, data, *args, **kwargs):
+            if path == self.output_dir / "app.py.md":
+                raise OSError("simulated document write failure")
+            return real_write_text(path, data, *args, **kwargs)
+
+        with patch("isohyps.project_analysis.write_text_regular_file", new=fail_source_doc_write):
+            with self.assertRaises(OSError):
+                AnalysisDocBuilder(self.output_dir).build(root, result, backend="test", model="fake")
+
+        self.assertEqual(provenance_path.read_bytes(), original)
+
+    def test_build_refuses_symlink_source_doc_destination_before_external_write(self):
+        root = Path(self.temp_dir) / "repo"
+        root.mkdir()
+        (root / "app.py").write_text("def hello(): pass\n", encoding="utf-8")
+        self.output_dir.mkdir()
+        outside = Path(self.temp_dir) / "outside.md"
+        outside.write_text("keep this file\n", encoding="utf-8")
+        destination = self.output_dir / "app.py.md"
+        destination.symlink_to(outside)
+        builder = AnalysisDocBuilder(self.output_dir)
+        result = self._make_result(
+            result={
+                "summary": "all good",
+                "documents": [
+                    {"path": "app.py.md", "title": "App", "content": "replacement"}
+                ],
+            }
+        )
+
+        with self.assertRaises(DocProvenanceContractError):
+            builder.build(root, result, backend="test", model="fake")
+
+        self.assertEqual(outside.read_text(encoding="utf-8"), "keep this file\n")
+        self.assertTrue(destination.is_symlink())
+
+    def test_build_refuses_symlink_parent_before_external_write(self):
+        root = Path(self.temp_dir) / "repo"
+        (root / "nested").mkdir(parents=True)
+        (root / "nested" / "app.py").write_text("def hello(): pass\n", encoding="utf-8")
+        self.output_dir.mkdir()
+        outside_dir = Path(self.temp_dir) / "outside"
+        outside_dir.mkdir()
+        destination_parent = self.output_dir / "nested"
+        destination_parent.symlink_to(outside_dir, target_is_directory=True)
+        builder = AnalysisDocBuilder(self.output_dir)
+        result = self._make_result(
+            result={
+                "summary": "all good",
+                "documents": [],
+            }
+        )
+
+        with self.assertRaises(DocProvenanceContractError):
+            builder.build(root, result, backend="test", model="fake")
+
+        self.assertFalse((outside_dir / "app.py.md").exists())
+        self.assertTrue(destination_parent.is_symlink())
 
     def test_build_counts_source_doc_with_md_suffix_as_covered(self):
         root = Path(self.temp_dir) / "repo"

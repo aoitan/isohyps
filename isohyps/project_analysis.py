@@ -6,6 +6,13 @@ from pathlib import Path, PurePosixPath
 from typing import Any, TypedDict
 
 from isohyps.analysis_helpers import detect_language, extract_symbols, is_probably_binary
+from isohyps.doc_freshness import (
+    DOC_PROVENANCE_PRODUCER,
+    DOC_PROVENANCE_PRODUCER_VERSION,
+    expected_doc_paths,
+    record_doc_provenance,
+    write_text_regular_file,
+)
 from isohyps.rlm_runtime import (
     BudgetLimits,
     ChildQueryConfig,
@@ -602,6 +609,9 @@ class AnalysisDocBuilder:
     """Generate project-analysis documents from a controller result."""
 
     RESERVED_NAMES: frozenset[str] = frozenset({"analysis_report.md"})
+    PROVENANCE_EXCLUDED_NAMES: frozenset[str] = frozenset(
+        {"index.md", "analysis_report.md"}
+    )
     MAX_FILENAME_LENGTH = 255
     IGNORED_SOURCE_DIRS: frozenset[str] = frozenset(
         {
@@ -630,6 +640,7 @@ class AnalysisDocBuilder:
         model: str,
     ) -> StructuredAnalysis:
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        provenance_source_owners = self._build_provenance_source_owners(root_path)
 
         report_path = self.output_dir / "analysis_report.md"
         self._written_paths.add(report_path)
@@ -658,21 +669,39 @@ class AnalysisDocBuilder:
 
         for document in structured.documents:
             sanitized = self._sanitize_path(document.path)
+            provenance_source_path = self._provenance_source_for_path(
+                sanitized, provenance_source_owners
+            )
             target = self._avoid_collision(sanitized)
             self._written_paths.add(target)
-            target.parent.mkdir(parents=True, exist_ok=True)
             body = document.content
             if body and not body.lstrip().startswith("#"):
                 body = f"# {document.title}\n\n{body}"
-            target.write_text(body or f"# {document.title}\n", encoding="utf-8")
-            document.path = str(target.relative_to(self.output_dir))
+            write_text_regular_file(
+                target,
+                body or f"# {document.title}\n",
+                self.output_dir,
+            )
+            document.path = target.relative_to(self.output_dir).as_posix()
+            if provenance_source_path is not None:
+                self._record_document_provenance(
+                    root_path,
+                    provenance_source_path,
+                    document.path,
+                )
 
         coverage = self._build_source_coverage(root_path, structured.documents)
         fallback_generated_files = list(coverage.missing_files)
         if fallback_generated_files:
-            self._write_fallback_source_docs(root_path, structured.documents, fallback_generated_files)
+            self._write_fallback_source_docs(
+                root_path,
+                structured.documents,
+                fallback_generated_files,
+                provenance_source_owners,
+            )
             coverage = self._build_source_coverage(root_path, structured.documents)
-        report_path.write_text(
+        write_text_regular_file(
+            report_path,
             "\n".join(
                 [
                     f"# Project Analysis Report: {root_path.name}",
@@ -704,7 +733,7 @@ class AnalysisDocBuilder:
                     "",
                 ]
             ),
-            encoding="utf-8",
+            self.output_dir,
         )
         return structured
 
@@ -713,6 +742,7 @@ class AnalysisDocBuilder:
         root_path: Path,
         documents: list[AnalysisDocument],
         missing_files: list[str],
+        provenance_source_owners: dict[str, tuple[str, ...]],
     ) -> None:
         for source_path in missing_files:
             source_doc = AnalysisDocument(
@@ -720,12 +750,65 @@ class AnalysisDocBuilder:
                 title=f"Source: {source_path}",
                 content=self._render_fallback_source_doc(root_path, source_path),
             )
-            target = self._avoid_collision(self._sanitize_path(source_doc.path))
+            sanitized = self._sanitize_path(source_doc.path)
+            target = self._avoid_collision(sanitized)
             self._written_paths.add(target)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(source_doc.content, encoding="utf-8")
-            source_doc.path = str(target.relative_to(self.output_dir))
+            write_text_regular_file(target, source_doc.content, self.output_dir)
+            source_doc.path = target.relative_to(self.output_dir).as_posix()
             documents.append(source_doc)
+            provenance_source_path = self._provenance_source_for_path(
+                sanitized, provenance_source_owners
+            )
+            if provenance_source_path is not None:
+                self._record_document_provenance(
+                    root_path,
+                    provenance_source_path,
+                    source_doc.path,
+                )
+
+    def _build_provenance_source_owners(self, root_path: Path) -> dict[str, tuple[str, ...]]:
+        owners: dict[str, set[str]] = {}
+        for source_path in self._collect_source_files(root_path):
+            for candidate in dict.fromkeys(expected_doc_paths(source_path)):
+                if candidate in self.PROVENANCE_EXCLUDED_NAMES:
+                    continue
+                owners.setdefault(candidate, set()).add(source_path)
+        return {
+            candidate: tuple(sorted(source_paths))
+            for candidate, source_paths in owners.items()
+        }
+
+    def _provenance_source_for_path(
+        self,
+        path: Path,
+        provenance_source_owners: dict[str, tuple[str, ...]],
+    ) -> str | None:
+        try:
+            relative_path = path.relative_to(self.output_dir).as_posix()
+        except ValueError:
+            return None
+        if relative_path in self.PROVENANCE_EXCLUDED_NAMES:
+            return None
+        source_paths = provenance_source_owners.get(relative_path, ())
+        if len(source_paths) != 1:
+            return None
+        return source_paths[0]
+
+    def _record_document_provenance(
+        self,
+        root_path: Path,
+        source_path: str,
+        doc_path: str,
+    ) -> None:
+        record_doc_provenance(
+            self.output_dir / "doc_provenance.json",
+            source_root=root_path,
+            output_root=self.output_dir,
+            source_path=source_path,
+            doc_path=doc_path,
+            producer=DOC_PROVENANCE_PRODUCER,
+            producer_version=DOC_PROVENANCE_PRODUCER_VERSION,
+        )
 
     def _render_fallback_source_doc(self, root_path: Path, source_path: str) -> str:
         absolute_path = root_path / source_path

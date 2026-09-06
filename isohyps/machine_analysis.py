@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import os
 import ast
 import re
 import json
 import fnmatch
 import hashlib
-import stat as stat_module
 import subprocess
 import tomllib
 from collections.abc import Collection, Mapping, Sequence
@@ -24,6 +22,17 @@ from isohyps.attention import (
     SEVERITY_ORDER,
     classify_attention,
     validate_repository_relative_path,
+)
+from isohyps.doc_freshness import (
+    CoverageTarget,
+    DocFreshnessContractError,
+    evaluate_doc_freshness,
+    load_doc_freshness,
+    project_freshness,
+    read_doc_provenance,
+    resolve_doc_mappings,
+    safe_hash_regular_file,
+    write_doc_freshness_atomic,
 )
 from isohyps.machine_index import (
     build_machine_index_v2,
@@ -662,115 +671,6 @@ def _attention_coverage_target(metadata: Mapping[str, Any]) -> bool:
     )
 
 
-def _doc_status_snapshot_for_entries(
-    root: Path | None,
-    entries: Sequence[tuple[str, Mapping[str, Any]]],
-    output_dir: Path,
-    diagnostics: list[AttentionDiagnostic],
-) -> dict[str, DocStatus]:
-    """Calculate deterministic document status for already-normalized metadata."""
-
-    statuses: dict[str, DocStatus] = {path: "current" for path, _ in entries}
-    output_root = Path(output_dir).resolve()
-
-    for path, metadata in entries:
-        if metadata.get("kind") == "source" and (
-            metadata.get("readable") is False
-            or metadata.get("hash") in ("binary_skipped", "error")
-        ):
-            statuses[path] = "unavailable"
-            _append_attention_diagnostic(
-                diagnostics,
-                "metadata",
-                "binary_skipped"
-                if metadata.get("hash") == "binary_skipped"
-                else "read_unavailable",
-                path,
-            )
-            continue
-        if not _attention_coverage_target(metadata):
-            continue
-
-        found_doc_stat: os.stat_result | None = None
-        for candidate in (
-            output_root / f"{path}.md",
-            output_root / Path(path).with_suffix(".md"),
-        ):
-            try:
-                candidate_stat = candidate.stat()
-            except FileNotFoundError:
-                continue
-            except OSError:
-                statuses[path] = "unavailable"
-                _append_attention_diagnostic(
-                    diagnostics, "doc_status", "stat_failed", path
-                )
-                break
-            if stat_module.S_ISREG(candidate_stat.st_mode):
-                found_doc_stat = candidate_stat
-                break
-        else:
-            statuses[path] = "missing"
-
-        if statuses[path] == "unavailable" or found_doc_stat is None:
-            continue
-
-        # Preserve the existing behavior: an unchanged source is not stale
-        # merely because the previous documentation has an older mtime.
-        if metadata.get("status") == "unchanged":
-            continue
-
-        source_mtime = metadata.get("mtime", _MISSING)
-        if type(source_mtime) not in (int, float):
-            if root is not None:
-                try:
-                    source_mtime = (root / path).stat().st_mtime
-                except OSError:
-                    source_mtime = _MISSING
-            else:
-                source_mtime = _MISSING
-
-        if source_mtime is _MISSING or type(source_mtime) is bool:
-            statuses[path] = "unavailable"
-            _append_attention_diagnostic(
-                diagnostics, "doc_status", "source_mtime_unavailable", path
-            )
-            continue
-
-        doc_mtime = found_doc_stat.st_mtime
-        if type(doc_mtime) is bool or type(doc_mtime) not in (int, float):
-            statuses[path] = "unavailable"
-            _append_attention_diagnostic(
-                diagnostics, "doc_status", "doc_mtime_unavailable", path
-            )
-            continue
-
-        if source_mtime > doc_mtime + 2.0:
-            statuses[path] = "stale"
-
-    return statuses
-
-
-def build_doc_status_snapshot(
-    root: Path,
-    files_meta: Sequence[Mapping[str, Any]],
-    output_dir: Path,
-) -> tuple[dict[str, DocStatus], list[AttentionDiagnostic]]:
-    """Return per-path doc status and stable diagnostics for a scan."""
-
-    diagnostics: list[AttentionDiagnostic] = []
-    try:
-        metadata = list(files_meta)
-    except TypeError:
-        _append_attention_diagnostic(diagnostics, "metadata", "invalid_metadata")
-        return {}, _sort_attention_diagnostics(diagnostics)
-    entries = _ordered_attention_metadata(metadata, diagnostics)
-    statuses = _doc_status_snapshot_for_entries(
-        Path(root).resolve(), entries, Path(output_dir), diagnostics
-    )
-    return statuses, _sort_attention_diagnostics(diagnostics)
-
-
 def _normalise_doc_statuses(
     entries: Sequence[tuple[str, Mapping[str, Any]]],
     supplied: Mapping[str, Any],
@@ -817,6 +717,133 @@ def _metadata_doc_statuses(
                 diagnostics, "doc_status", "status_unavailable", path
             )
     return statuses
+
+
+def _load_freshness_document(
+    output_dir: Path | None,
+    diagnostics: list[AttentionDiagnostic],
+) -> Mapping[str, Any] | None:
+    """Load the scan-owned freshness artifact without falling back to mtime."""
+
+    if output_dir is None:
+        return None
+    freshness_path = Path(output_dir) / "doc_freshness.json"
+    try:
+        if not freshness_path.exists():
+            _append_attention_diagnostic(
+                diagnostics, "doc_status", "freshness_unavailable"
+            )
+            return None
+        return load_doc_freshness(freshness_path)
+    except (OSError, DocFreshnessContractError, TypeError, ValueError):
+        _append_attention_diagnostic(
+            diagnostics, "doc_status", "freshness_artifact_invalid"
+        )
+    return None
+
+
+def _freshness_projection_diagnostics(
+    document: Mapping[str, Any],
+    diagnostics: list[AttentionDiagnostic],
+) -> None:
+    """Project freshness diagnostics into the existing attention channel."""
+
+    try:
+        projection = project_freshness(document)
+    except (DocFreshnessContractError, TypeError, ValueError):
+        _append_attention_diagnostic(
+            diagnostics, "doc_status", "freshness_artifact_invalid"
+        )
+        return
+    for item in projection["attention_diagnostics"]:
+        _append_attention_diagnostic(
+            diagnostics,
+            "doc_status",
+            str(item["code"]),
+            item["path"],
+        )
+
+
+def _unavailable_doc_statuses(
+    entries: Sequence[tuple[str, Mapping[str, Any]]],
+    diagnostics: list[AttentionDiagnostic],
+) -> dict[str, DocStatus]:
+    """Return safe statuses when no validated freshness artifact is available."""
+
+    statuses: dict[str, DocStatus] = {path: "current" for path, _ in entries}
+    for path, metadata in entries:
+        if _attention_coverage_target(metadata):
+            statuses[path] = "unavailable"
+            _append_attention_diagnostic(
+                diagnostics, "doc_status", "freshness_unavailable", path
+            )
+    return statuses
+
+
+def build_doc_status_snapshot(
+    root: Path,
+    files_meta: Sequence[Mapping[str, Any]],
+    output_dir: Path | Mapping[str, Any] | None = None,
+    *,
+    freshness_document: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, DocStatus], list[AttentionDiagnostic]]:
+    """Return statuses projected from ``doc_freshness.json``.
+
+    The compatibility boundary intentionally has no filesystem timestamp
+    fallback.  Callers may pass an already evaluated freshness document, or
+    the document is loaded from ``output_dir``.  Without one, coverage targets
+    are marked unavailable instead of being treated as current.
+    """
+
+    del root  # retained in the public signature for caller compatibility
+    diagnostics: list[AttentionDiagnostic] = []
+    try:
+        metadata = list(files_meta)
+    except TypeError:
+        _append_attention_diagnostic(diagnostics, "metadata", "invalid_metadata")
+        return {}, _sort_attention_diagnostics(diagnostics)
+
+    entries = _ordered_attention_metadata(metadata, diagnostics)
+    document = freshness_document
+    if document is None and isinstance(output_dir, Mapping):
+        # Accept the document itself as a compact compatibility form while
+        # keeping the existing path -> status form for attention callers.
+        if "entries" in output_dir:
+            document = output_dir
+    if document is None and output_dir is not None and not isinstance(output_dir, Mapping):
+        document = _load_freshness_document(Path(output_dir), diagnostics)
+
+    if document is None:
+        statuses = _unavailable_doc_statuses(entries, diagnostics)
+    else:
+        try:
+            projection = project_freshness(document)
+        except (DocFreshnessContractError, TypeError, ValueError):
+            _append_attention_diagnostic(
+                diagnostics, "doc_status", "freshness_artifact_invalid"
+            )
+            statuses = _unavailable_doc_statuses(entries, diagnostics)
+        else:
+            projected_statuses = projection["doc_status_by_path"]
+            statuses = _normalise_doc_statuses(
+                entries, projected_statuses, diagnostics
+            )
+            # A validated freshness artifact is generation-scoped evidence.
+            # Do not let an omitted current coverage target inherit the
+            # compatibility helper's historical ``current`` default.
+            projected_paths = set(projected_statuses)
+            for path, metadata_item in entries:
+                if (
+                    _attention_coverage_target(metadata_item)
+                    and path not in projected_paths
+                ):
+                    statuses[path] = "unavailable"
+                    _append_attention_diagnostic(
+                        diagnostics, "doc_status", "freshness_target_missing", path
+                    )
+            _freshness_projection_diagnostics(document, diagnostics)
+
+    return statuses, _sort_attention_diagnostics(diagnostics)
 
 
 def _normalise_entrypoint_paths(
@@ -919,25 +946,26 @@ def build_attention_snapshots(
         doc_statuses = _normalise_doc_statuses(
             entries, doc_status_by_path, diagnostics
         )
-    elif isinstance(output_dir, Mapping):
+    elif isinstance(output_dir, Mapping) and "entries" not in output_dir:
         # Accept the compact positional form used by callers that already
         # computed statuses: ``build_attention_snapshots(root, meta, prev,
         # statuses)``.  A real output directory is always path-like.
         doc_statuses = _normalise_doc_statuses(entries, output_dir, diagnostics)
         output_dir = None
+    elif isinstance(output_dir, Mapping):
+        doc_statuses, freshness_diagnostics = build_doc_status_snapshot(
+            root_path or Path("."),
+            [item for _path, item in entries],
+            output_dir,
+        )
+        diagnostics.extend(freshness_diagnostics)
     elif output_dir is not None:
-        if root_path is None:
-            doc_statuses = {path: "current" for path, _ in entries}
-            for path, item in entries:
-                if _attention_coverage_target(item):
-                    doc_statuses[path] = "unavailable"
-                    _append_attention_diagnostic(
-                        diagnostics, "doc_status", "root_unavailable", path
-                    )
-        else:
-            doc_statuses = _doc_status_snapshot_for_entries(
-                root_path, entries, Path(output_dir), diagnostics
-            )
+        doc_statuses, freshness_diagnostics = build_doc_status_snapshot(
+            root_path or Path("."),
+            [item for _path, item in entries],
+            Path(output_dir),
+        )
+        diagnostics.extend(freshness_diagnostics)
     else:
         doc_statuses = _metadata_doc_statuses(entries, diagnostics)
 
@@ -1404,7 +1432,8 @@ def generate_machine_report(
     files_meta: list[dict[str, Any]],
     repo_map: dict[str, Any],
     attention: list[AttentionEntry],
-    forward_graph: dict[str, list[str]]
+    forward_graph: dict[str, list[str]],
+    freshness_projection: Mapping[str, Any] | None = None,
 ) -> str:
     mermaid_diag = generate_mermaid_graph(forward_graph)
 
@@ -1457,6 +1486,9 @@ def generate_machine_report(
     ])
     lines.extend(render_attention_markdown(attention).splitlines())
 
+    if freshness_projection is not None:
+        lines.extend(["", *_freshness_report_lines(freshness_projection)])
+
     lines.extend([
         "",
         "## File Inventory",
@@ -1501,6 +1533,66 @@ def render_attention_markdown(attention: Sequence[Mapping[str, Any]]) -> str:
                 )
         lines.append("")
     return "\n".join(lines).rstrip()
+
+
+def _build_doc_freshness(
+    root: Path,
+    output_dir: Path,
+    coverage_targets: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Evaluate and publish one freshness document for the scan targets."""
+
+    targets = [CoverageTarget(source_path=meta["path"]) for meta in coverage_targets]
+    mappings = resolve_doc_mappings(targets, output_dir)
+
+    source_observations = {
+        target.source_path: safe_hash_regular_file(
+            root / target.source_path, root
+        )
+        for target in targets
+    }
+    doc_observations = {
+        mapping.doc_path: safe_hash_regular_file(
+            output_dir / mapping.doc_path, output_dir
+        )
+        for mapping in mappings.entries
+        if mapping.doc_path is not None
+    }
+    provenance = read_doc_provenance(
+        output_dir / "doc_provenance.json",
+        allowed_root=output_dir,
+        targets=targets,
+        mappings=mappings,
+    )
+    document = evaluate_doc_freshness(
+        targets,
+        mappings,
+        provenance,
+        source_observations=source_observations,
+        doc_observations=doc_observations,
+    )
+    write_doc_freshness_atomic(output_dir / "doc_freshness.json", document)
+    return document, project_freshness(document)
+
+
+def _freshness_report_lines(projection: Mapping[str, Any]) -> list[str]:
+    """Render the shared freshness projection for human-readable reports."""
+
+    summary = projection["coverage_summary"]
+    lines = [
+        "## Document Freshness",
+        "",
+        f"- Fresh source docs: {summary['fresh_docs']}",
+        f"- Stale source docs: {summary['stale_docs']}",
+        f"- Missing source docs: {summary['missing_docs']}",
+        f"- Unknown source docs: {summary['unknown_docs']}",
+    ]
+    unknown_entries = projection.get("unknown_docs", [])
+    if unknown_entries:
+        lines.extend(["", "### Unknown Source Docs", ""])
+        for path in unknown_entries:
+            lines.append(f"- `{path}`")
+    return lines
 
 
 def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
@@ -1589,40 +1681,21 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
 
     coverage_targets = _build_coverage_targets(files_meta)
 
-    # ドキュメントの存在有無・更新チェックとカバレッジの算出
-    missing_docs = []
-    stale_docs = []
-    valid_docs = []
+    # Freshness is evaluated once from exact-byte observations and producer
+    # provenance.  All legacy coverage/attention/report views below are
+    # projections of this document; no mtime-based decision remains here.
+    freshness_document, freshness_projection = _build_doc_freshness(
+        root, output_dir, coverage_targets
+    )
+    missing_docs = freshness_projection["missing_docs"]
+    stale_docs = freshness_projection["stale_docs"]
+    valid_docs = freshness_projection["valid_docs"]
+    unknown_docs = freshness_projection["unknown_docs"]
 
-    for meta in coverage_targets:
-        rel_path = meta["path"]
-        doc_candidates = [
-            output_dir / f"{rel_path}.md",
-            output_dir / Path(rel_path).with_suffix(".md")
-        ]
-        
-        found_doc = None
-        for candidate in doc_candidates:
-            if candidate.exists() and candidate.is_file():
-                found_doc = candidate
-                break
-                
-        if not found_doc:
-            missing_docs.append(rel_path)
-        else:
-            source_mtime = meta["mtime"]
-            doc_mtime = found_doc.stat().st_mtime
-            is_unchanged = (meta["status"] == "unchanged")
-            
-            # ソースコード更新日時がドキュメント更新日時 + 2.0秒より新しく、かつ内容に変更がある場合を stale と判定
-            if source_mtime > doc_mtime + 2.0 and not is_unchanged:
-                stale_docs.append(rel_path)
-            else:
-                valid_docs.append(rel_path)
-                
     total_targets = len(coverage_targets)
-    documented_count = total_targets - len(missing_docs)
-    coverage_percent = (documented_count / total_targets * 100) if total_targets > 0 else 100.0
+    freshness_coverage = freshness_projection["coverage_summary"]
+    documented_count = freshness_coverage["documented_files"]
+    coverage_percent = freshness_coverage["coverage_percent"]
     coverage_summary = {
         "all_files_discovered": len(all_files),
         "ignored_files": ignored_count,
@@ -1630,6 +1703,9 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
         "documented_files": documented_count,
         "missing_docs": len(missing_docs),
         "stale_docs": len(stale_docs),
+        "fresh_docs": len(valid_docs),
+        "valid_docs": len(valid_docs),
+        "unknown_docs": len(unknown_docs),
         "coverage_percent": coverage_percent,
     }
     coverage_contract = {
@@ -1645,9 +1721,7 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
         "counts": coverage_summary,
     }
 
-    doc_status_by_path = {path: "missing" for path in missing_docs}
-    doc_status_by_path.update({path: "stale" for path in stale_docs})
-    doc_status_by_path.update({path: "current" for path in valid_docs})
+    doc_status_by_path = freshness_projection["doc_status_by_path"]
     resolved_entrypoints, entrypoint_diagnostics = resolve_attention_entrypoints(
         root, files_meta
     )
@@ -1658,10 +1732,24 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
         doc_status_by_path=doc_status_by_path,
         entrypoint_paths=resolved_entrypoints,
     )
+    for item in freshness_projection["attention_diagnostics"]:
+        _append_attention_diagnostic(
+            attention_diagnostics,
+            str(item["detector"]),
+            str(item["code"]),
+            item["path"],
+        )
     attention_diagnostics = _sort_attention_diagnostics(
         [*attention_diagnostics, *entrypoint_diagnostics]
     )
     attention = classify_attention(snapshots)
+    freshness_hash = safe_hash_regular_file(output_dir / "doc_freshness.json", output_dir)
+    if freshness_hash.digest is None:
+        reason = freshness_hash.reason or "hash_unavailable"
+        raise DocFreshnessContractError(
+            "doc_freshness.json cannot be hashed safely: "
+            f"{reason} (attempt={freshness_hash.attempts})"
+        )
 
     # 最終データの統合
     result = {
@@ -1678,6 +1766,12 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
         "coverage_targets": [meta["path"] for meta in coverage_targets],
         "coverage_summary": coverage_summary,
         "coverage_contract": coverage_contract,
+        "doc_freshness": {
+            "path": "doc_freshness.json",
+            "schema_version": freshness_document["schema_version"],
+            "sha256": freshness_hash.digest,
+            "counts": freshness_document["counts"],
+        },
     }
 
     # 公開機械 index は内部解析結果の allowlist 投影として生成する。
@@ -1699,7 +1793,14 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
 
     # 人間向け Markdown 書き出し
     report_path = output_dir / "machine_report.md"
-    report_content = generate_machine_report(root, files_meta, repo_map, attention, forward_graph)
+    report_content = generate_machine_report(
+        root,
+        files_meta,
+        repo_map,
+        attention,
+        forward_graph,
+        freshness_projection,
+    )
     report_path.write_text(report_content, encoding="utf-8")
 
     # analysis_report.md の自動合成 (コントローラー互換フォーマット)
@@ -1726,8 +1827,10 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
         f"- Source files discovered: {total_targets}\n"
         f"- Source files with matching docs: {documented_count}\n"
         f"- Source files missing matching docs: {len(missing_docs)}\n"
+        f"- Source files with stale docs: {len(stale_docs)}\n"
+        f"- Source files with unknown freshness: {len(unknown_docs)}\n"
         f"- Extra docs without matching source: 0\n"
-        f"- Weak or failed docs: 0\n"
+        f"- Weak or failed docs: {len(unknown_docs)}\n"
         f"- Fallback docs generated: 0\n"
         f"- Coverage: {percent_str}\n\n"
         f"### Fallback Generated Source Docs\n\n"
@@ -1743,7 +1846,16 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
         f"### Extra Docs Without Matching Source\n\n"
         f"- (none)\n\n"
         f"### Weak Or Failed Docs\n\n"
-        f"- (none)\n\n"
+    )
+    if unknown_docs:
+        analysis_report += "\n".join(
+            f"- `{path}` ({next(entry['reason'] for entry in freshness_document['entries'] if entry['source_path'] == path)})"
+            for path in unknown_docs
+        ) + "\n\n"
+    else:
+        analysis_report += "- (none)\n\n"
+
+    analysis_report += (
         f"## Step History\n\n"
         f"| Step | Kind | Status | Summary |\n"
         f"| :--- | :--- | :--- | :--- |\n"
@@ -1755,7 +1867,17 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
     changed_files = [m["path"] for m in files_meta if m["status"] in ("changed", "added") and m["kind"] == "source" and m["language"] != "unknown"]
     git_changed = [m["path"] for m in files_meta if m.get("git_status") is not None and m["kind"] == "source" and m["language"] != "unknown"]
     # 解説が必要なファイル（新規・変更されたファイル、解説欠損、陳腐化ドキュメント、Git変更検知されたファイル）
-    needs_explanation = set(changed_files) | set(missing_docs) | set(stale_docs) | set(git_changed)
+    needs_explanation = (
+        set(changed_files)
+        | set(missing_docs)
+        | set(stale_docs)
+        | set(unknown_docs)
+        | set(git_changed)
+    )
+    freshness_reason_by_path = {
+        entry["source_path"]: entry["reason"]
+        for entry in freshness_document["entries"]
+    }
     
     # トポロジカルソート順（Bottom-up）で並べ替え
     sorted_needs_explanation = []
@@ -1784,6 +1906,10 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
                 reasons.append("missing doc")
             elif cf in stale_docs:
                 reasons.append("stale doc")
+            elif cf in unknown_docs:
+                reasons.append(
+                    f"unknown doc ({freshness_reason_by_path.get(cf, 'unknown')})"
+                )
             
             m_status = next((m["status"] for m in files_meta if m["path"] == cf), None)
             if m_status in ("changed", "added"):

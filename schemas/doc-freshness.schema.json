@@ -1,0 +1,228 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/aoitan/isohyps/schemas/doc-freshness.schema.json",
+  "title": "isohyps document freshness",
+  "description": "Versioned, hash-based evidence for the relationship between source files and analysis documents.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "hash_algorithm",
+    "mapping_rule",
+    "counts",
+    "entries",
+    "diagnostics"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^1\\.[0-9]+$",
+      "description": "Decimal major.minor version. Major 1 is the freshness contract defined here."
+    },
+    "hash_algorithm": {
+      "const": "sha256"
+    },
+    "mapping_rule": {
+      "const": "source-suffix-and-replaced-suffix-v1"
+    },
+    "counts": {
+      "type": "object",
+      "required": ["missing", "fresh", "stale", "unknown"],
+      "properties": {
+        "missing": { "type": "integer", "minimum": 0 },
+        "fresh": { "type": "integer", "minimum": 0 },
+        "stale": { "type": "integer", "minimum": 0 },
+        "unknown": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "entries": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/freshnessEntry" }
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/diagnosticCode" }
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "repositoryRelativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!.*\\u0000)(?!.*//)(?!.*(?:^|/)(?:\\.|\\.\\.)(?:/|$))(?!.*\\/$).+$",
+      "description": "Normalized repository-relative POSIX path; runtime validation additionally checks identity and ordering invariants."
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Lowercase SHA-256 digest of exact file bytes."
+    },
+    "nullableSha256": {
+      "anyOf": [
+        { "$ref": "#/$defs/sha256" },
+        { "type": "null" }
+      ]
+    },
+    "status": {
+      "enum": ["missing", "fresh", "stale", "unknown"]
+    },
+    "reason": {
+      "enum": [
+        "source_hash_match",
+        "source_hash_mismatch",
+        "doc_missing",
+        "recorded_source_hash_missing",
+        "ambiguous_doc_mapping",
+        "source_hash_unavailable",
+        "source_changed_during_scan",
+        "doc_hash_unavailable",
+        "doc_changed_during_scan",
+        "unsafe_source_path",
+        "unsafe_doc_path",
+        "doc_identity_collision",
+        "provenance_artifact_invalid",
+        "provenance_assertion_invalid",
+        "provenance_binding_mismatch",
+        "provenance_doc_hash_mismatch",
+        "invalid_source_identity",
+        "duplicate_source_identity"
+      ]
+    },
+    "diagnosticCode": {
+      "enum": [
+        "ambiguous_doc_mapping",
+        "doc_changed_during_scan",
+        "doc_hash_unavailable",
+        "doc_identity_collision",
+        "doc_missing",
+        "duplicate_source_identity",
+        "invalid_source_identity",
+        "orphan_provenance_assertion",
+        "provenance_artifact_invalid",
+        "provenance_assertion_invalid",
+        "provenance_binding_mismatch",
+        "provenance_doc_hash_mismatch",
+        "recorded_source_hash_missing",
+        "source_changed_during_scan",
+        "source_hash_match",
+        "source_hash_mismatch",
+        "source_hash_unavailable",
+        "unsafe_doc_path",
+        "unsafe_source_path"
+      ]
+    },
+    "freshnessEntry": {
+      "type": "object",
+      "required": [
+        "source_path",
+        "doc_path",
+        "expected_doc_paths",
+        "current_source_hash",
+        "recorded_source_hash",
+        "doc_hash",
+        "status",
+        "reason",
+        "diagnostics"
+      ],
+      "properties": {
+        "source_path": { "$ref": "#/$defs/repositoryRelativePath" },
+        "doc_path": {
+          "anyOf": [
+            { "$ref": "#/$defs/repositoryRelativePath" },
+            { "type": "null" }
+          ]
+        },
+        "expected_doc_paths": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": { "$ref": "#/$defs/repositoryRelativePath" }
+        },
+        "current_source_hash": { "$ref": "#/$defs/nullableSha256" },
+        "recorded_source_hash": { "$ref": "#/$defs/nullableSha256" },
+        "doc_hash": { "$ref": "#/$defs/nullableSha256" },
+        "status": { "$ref": "#/$defs/status" },
+        "reason": { "$ref": "#/$defs/reason" },
+        "diagnostics": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/diagnosticCode" }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "reason": { "const": "source_hash_match" } } },
+          "then": {
+            "properties": {
+              "status": { "const": "fresh" },
+              "doc_path": { "$ref": "#/$defs/repositoryRelativePath" },
+              "current_source_hash": { "$ref": "#/$defs/sha256" },
+              "recorded_source_hash": { "$ref": "#/$defs/sha256" },
+              "doc_hash": { "$ref": "#/$defs/sha256" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "reason": { "const": "source_hash_mismatch" } } },
+          "then": {
+            "properties": {
+              "status": { "const": "stale" },
+              "doc_path": { "$ref": "#/$defs/repositoryRelativePath" },
+              "current_source_hash": { "$ref": "#/$defs/sha256" },
+              "recorded_source_hash": { "$ref": "#/$defs/sha256" },
+              "doc_hash": { "$ref": "#/$defs/sha256" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "reason": { "const": "doc_missing" } } },
+          "then": {
+            "properties": {
+              "status": { "const": "missing" },
+              "doc_path": { "type": "null" },
+              "doc_hash": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "status": { "const": "unknown" } } },
+          "then": {
+            "properties": {
+              "reason": {
+                "enum": [
+                  "recorded_source_hash_missing",
+                  "ambiguous_doc_mapping",
+                  "source_hash_unavailable",
+                  "source_changed_during_scan",
+                  "doc_hash_unavailable",
+                  "doc_changed_during_scan",
+                  "unsafe_source_path",
+                  "unsafe_doc_path",
+                  "doc_identity_collision",
+                  "provenance_artifact_invalid",
+                  "provenance_assertion_invalid",
+                  "provenance_binding_mismatch",
+                  "provenance_doc_hash_mismatch",
+                  "invalid_source_identity",
+                  "duplicate_source_identity"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "status": { "const": "fresh" } } },
+          "then": { "properties": { "reason": { "const": "source_hash_match" } } }
+        },
+        {
+          "if": { "properties": { "status": { "const": "stale" } } },
+          "then": { "properties": { "reason": { "const": "source_hash_mismatch" } } }
+        },
+        {
+          "if": { "properties": { "status": { "const": "missing" } } },
+          "then": { "properties": { "reason": { "const": "doc_missing" } } }
+        }
+      ],
+      "additionalProperties": true
+    }
+  }
+}
