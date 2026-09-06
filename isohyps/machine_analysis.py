@@ -1748,7 +1748,7 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
         reason = freshness_hash.reason or "hash_unavailable"
         raise DocFreshnessContractError(
             "doc_freshness.json cannot be hashed safely: "
-            f"{reason} (attempt={freshness_hash.attempt})"
+            f"{reason} (attempt={freshness_hash.attempts})"
         )
 
     # 最終データの統合

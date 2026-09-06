@@ -3184,13 +3184,11 @@ def record_doc_provenance(
     doc_observation = safe_hash_regular_file(validated_doc_path, output_root)
     current_doc_hash = _recording_digest(doc_observation, "doc")
 
-    if destination.exists():
-        if not destination.is_file():
-            raise DocProvenanceContractError(
-                f"provenance_path: expected a regular file: {destination}"
-            )
+    try:
         existing = load_doc_provenance(destination)
-    else:
+    except DocProvenanceContractError:
+        if destination.exists():
+            raise
         existing = {
             "schema_version": DOC_PROVENANCE_SCHEMA_VERSION,
             "hash_algorithm": DOC_FRESHNESS_HASH_ALGORITHM,
