@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/aoitan/isohyps/schemas/machine-index.schema.json",
   "title": "isohyps machine index",
-  "description": "Public, versioned machine_index.json contract. The current producer emits v2.1 with structured attention and a digest-bound document-freshness reference; v2.0 and v1 remain readable through the version-aware runtime API.",
+  "description": "Public, versioned machine_index.json contract. The current producer emits v2.2 with structured attention, a digest-bound document-freshness reference, and optional module summaries; v2.0, v2.1, and v1 remain readable through the version-aware runtime API.",
   "type": "object",
   "required": [
     "schema_version",
@@ -65,6 +65,31 @@
         }
       },
       "then": { "required": ["doc_freshness"] }
+    },
+    {
+      "if": {
+        "properties": {
+          "schema_version": {
+            "pattern": "^2\\.(?:[2-9]|[1-9][0-9]+)$"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "files": {
+            "items": {
+              "if": { "required": ["module_summary"] },
+              "then": {
+                "properties": {
+                  "module_summary": {
+                    "$ref": "#/$defs/moduleSummary"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
     }
   ],
   "additionalProperties": true,
@@ -115,6 +140,226 @@
           "additionalProperties": false
         }
       },
+      "additionalProperties": true
+    },
+    "moduleSummaryEvidence": {
+      "type": "object",
+      "required": [
+        "kind",
+        "origin",
+        "line",
+        "value",
+        "value_truncated",
+        "paragraphs_omitted"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "module_docstring",
+            "definition",
+            "entrypoint_candidate"
+          ]
+        },
+        "origin": {
+          "type": "string",
+          "enum": [
+            "python_ast",
+            "tree_sitter",
+            "regex",
+            "attention_entrypoint_resolver_v1"
+          ]
+        },
+        "line": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "maximum": 9223372036854775807
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "value_truncated": {
+          "type": "boolean"
+        },
+        "paragraphs_omitted": {
+          "type": "boolean"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": { "const": "module_docstring" }
+            }
+          },
+          "then": {
+            "properties": {
+              "origin": { "const": "python_ast" },
+              "line": { "type": "integer", "minimum": 1 }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": { "const": "definition" }
+            }
+          },
+          "then": {
+            "properties": {
+              "origin": {
+                "enum": ["python_ast", "tree_sitter", "regex"]
+              },
+              "paragraphs_omitted": { "const": false }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": { "const": "entrypoint_candidate" }
+            }
+          },
+          "then": {
+            "properties": {
+              "origin": {
+                "const": "attention_entrypoint_resolver_v1"
+              },
+              "line": { "const": null },
+              "value": { "const": "Entrypoint candidate detected." },
+              "paragraphs_omitted": { "const": false }
+            }
+          }
+        }
+      ],
+      "additionalProperties": true
+    },
+    "moduleSummary": {
+      "type": "object",
+      "required": [
+        "text",
+        "method",
+        "reason",
+        "parser",
+        "evidence",
+        "omitted_evidence_count",
+        "text_truncated"
+      ],
+      "properties": {
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        },
+        "method": {
+          "type": "string",
+          "enum": ["module_docstring", "structural_facts", "unknown"]
+        },
+        "reason": {
+          "type": ["string", "null"],
+          "enum": [
+            null,
+            "read_error",
+            "decode_error",
+            "parse_error",
+            "unsupported",
+            "binary_skipped",
+            "source_changed",
+            "insufficient_evidence"
+          ]
+        },
+        "parser": {
+          "type": "string",
+          "enum": ["python_ast", "tree_sitter", "regex", "none"]
+        },
+        "evidence": {
+          "type": "array",
+          "maxItems": 6,
+          "items": { "$ref": "#/$defs/moduleSummaryEvidence" }
+        },
+        "omitted_evidence_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "text_truncated": {
+          "type": "boolean"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "method": { "const": "module_docstring" }
+            }
+          },
+          "then": {
+            "properties": {
+              "reason": { "const": null },
+              "parser": { "const": "python_ast" },
+              "evidence": {
+                "minItems": 1,
+                "maxItems": 1,
+                "items": {
+                  "properties": {
+                    "kind": { "const": "module_docstring" }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": { "const": "structural_facts" }
+            }
+          },
+          "then": {
+            "properties": {
+              "reason": { "const": null },
+              "evidence": {
+                "minItems": 1,
+                "contains": {
+                  "properties": {
+                    "kind": {
+                      "enum": ["definition", "entrypoint_candidate"]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": { "const": "unknown" }
+            }
+          },
+          "then": {
+            "properties": {
+              "text": { "const": "unknown" },
+              "reason": {
+                "enum": [
+                  "read_error",
+                  "decode_error",
+                  "parse_error",
+                  "unsupported",
+                  "binary_skipped",
+                  "source_changed",
+                  "insufficient_evidence"
+                ]
+              },
+              "evidence": { "maxItems": 0 },
+              "omitted_evidence_count": { "const": 0 },
+              "text_truncated": { "const": false }
+            }
+          }
+        }
+      ],
       "additionalProperties": true
     },
     "fileEntry": {
@@ -183,6 +428,9 @@
           "type": "integer",
           "minimum": 0,
           "description": "Number of direct dependencies listed for this file."
+        },
+        "module_summary": {
+          "description": "Optional v2.2+ source-module summary. Its contract is version-gated so older readers can preserve unknown fields."
         }
       },
       "additionalProperties": true
