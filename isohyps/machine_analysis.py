@@ -512,7 +512,14 @@ def extract_file_symbols(path: Path, root: Path) -> dict[str, Any]:
                     for symbol in result["symbols"]
                 ],
             )
-    except Exception:
+    except (
+        ImportError,
+        LookupError,
+        AttributeError,
+        TypeError,
+        ValueError,
+        RuntimeError,
+    ):
         # 正規表現による簡易フォールバック
         lines = code.splitlines()
         for i, line in enumerate(lines):
