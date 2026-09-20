@@ -80,6 +80,7 @@
             "items": {
               "if": { "required": ["module_summary"] },
               "then": {
+                "required": ["kind"],
                 "properties": {
                   "kind": { "const": "source" },
                   "module_summary": {

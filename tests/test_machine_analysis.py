@@ -2748,6 +2748,7 @@ class TestMachineAnalysis(unittest.TestCase):
             summary_condition["then"]["properties"]["files"]["items"]
         )
         self.assertEqual(summary_items["if"], {"required": ["module_summary"]})
+        self.assertEqual(summary_items["then"]["required"], ["kind"])
         self.assertEqual(summary_items["then"]["properties"]["kind"]["const"], "source")
         self.assertEqual(
             summary_items["then"]["properties"]["module_summary"]["$ref"],
