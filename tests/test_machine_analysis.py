@@ -841,8 +841,9 @@ class TestNonPythonAndMachineSummaryIntegration(unittest.TestCase):
             "function render() {}\nimport billing\n", encoding="utf-8"
         )
         unknown_result = extract_file_symbols(unknown_path, self.test_dir)
-        self.assertEqual(unknown_result["summary_facts"].parser, "none")
+        self.assertEqual(unknown_result["summary_facts"].parser, "regex")
         self.assertEqual(unknown_result["summary_facts"].outcome, "unsupported")
+        self.assertEqual(unknown_result["summary_facts"].definitions[0]["name"], "render")
         self.assertIn(
             {"module": "billing", "internal": False},
             unknown_result["imports"],

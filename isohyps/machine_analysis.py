@@ -541,9 +541,18 @@ def extract_file_symbols(path: Path, root: Path) -> dict[str, Any]:
         )
 
     if language is None:
-        result["summary_facts"] = SummaryFacts(
-            parser="none", outcome="unsupported"
-        )
+        facts = result.get("summary_facts")
+        if isinstance(facts, SummaryFacts):
+            result["summary_facts"] = SummaryFacts(
+                parser=facts.parser,
+                outcome="unsupported",
+                docstring=facts.docstring,
+                definitions=facts.definitions,
+            )
+        else:
+            result["summary_facts"] = SummaryFacts(
+                parser="none", outcome="unsupported"
+            )
 
     # インポートの簡易正規表現抽出
     for line in code.splitlines()[:250]:  # 冒頭250行に限定
