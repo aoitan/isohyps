@@ -68,10 +68,10 @@ def simple_yaml_dump(data: Any, indent_level: int = 0) -> str:
         lines = []
         for k, v in data.items():
             if isinstance(v, (dict, list)):
-                lines.append(f"{spacing}{k}:")
+                lines.append(f"{spacing}{_yaml_scalar(k)}:")
                 lines.append(simple_yaml_dump(v, indent_level + 1))
             else:
-                lines.append(f"{spacing}{k}: {_yaml_scalar(v)}")
+                lines.append(f"{spacing}{_yaml_scalar(k)}: {_yaml_scalar(v)}")
         return "\n".join(lines)
     elif isinstance(data, list):
         lines = []
@@ -437,12 +437,6 @@ def extract_file_symbols(path: Path, root: Path) -> dict[str, Any]:
         result["summary_facts"] = facts
         return result
 
-    if language is None:
-        result["summary_facts"] = SummaryFacts(
-            parser="none", outcome="unsupported"
-        )
-        return result
-
     try:
         code = source.decode("utf-8")
     except UnicodeDecodeError:
@@ -460,60 +454,64 @@ def extract_file_symbols(path: Path, root: Path) -> dict[str, Any]:
         parser = get_parser(language)
         # Parse the exact bytes already read for this extraction snapshot.
         tree = parser.parse(source)
-        
-        # 簡易的なシンボル抽出（既存のクエリと対応）
-        from isohyps.analysis_helpers import SYMBOL_QUERIES
-        query_str = SYMBOL_QUERIES.get(language, "")
-        if not query_str:
-            raise LookupError(f"no tree-sitter query for {language}")
-        lang_obj = get_language(language)
-        query = lang_obj.query(query_str)
-        captures = query.captures(tree.root_node)
-
-        symbol_nodes = []
-        if isinstance(captures, dict):
-            symbol_nodes = captures.get("symbol", [])
+        if getattr(tree.root_node, "has_error", False):
+            result["summary_facts"] = SummaryFacts(
+                parser="tree_sitter", outcome="parse_error"
+            )
         else:
-            symbol_nodes = [node for node, name in captures if name == "symbol"]
+            # 簡易的なシンボル抽出（既存のクエリと対応）
+            from isohyps.analysis_helpers import SYMBOL_QUERIES
+            query_str = SYMBOL_QUERIES.get(language, "")
+            if not query_str:
+                raise LookupError(f"no tree-sitter query for {language}")
+            lang_obj = get_language(language)
+            query = lang_obj.query(query_str)
+            captures = query.captures(tree.root_node)
 
-        seen = set()
-        for node in symbol_nodes:
-            if node.start_byte in seen:
-                continue
-            seen.add(node.start_byte)
+            symbol_nodes = []
+            if isinstance(captures, dict):
+                symbol_nodes = captures.get("symbol", [])
+            else:
+                symbol_nodes = [node for node, name in captures if name == "symbol"]
 
-            # ノードタイプから種別判定
-            kind = "function"
-            if "class" in node.type:
-                kind = "class"
-            elif "method" in node.type:
-                kind = "method"
-            elif "interface" in node.type:
-                kind = "class"
+            seen = set()
+            for node in symbol_nodes:
+                if node.start_byte in seen:
+                    continue
+                seen.add(node.start_byte)
 
-            # 簡易的な名前抽出（最初の1行からキーワードを探す）
-            line_text = code.splitlines()[node.start_point[0]].strip()
-            name_match = re.search(r'(?:class|def|function|func|fn|interface)\s+([a-zA-Z0-9_]+)', line_text)
-            name = name_match.group(1) if name_match else line_text[:40]
+                # ノードタイプから種別判定
+                kind = "function"
+                if "class" in node.type:
+                    kind = "class"
+                elif "method" in node.type:
+                    kind = "method"
+                elif "interface" in node.type:
+                    kind = "class"
 
-            result["symbols"].append({
-                "name": name,
-                "kind": kind,
-                "line": node.start_point[0] + 1
-            })
+                # 簡易的な名前抽出（最初の1行からキーワードを探す）
+                line_text = code.splitlines()[node.start_point[0]].strip()
+                name_match = re.search(r'(?:class|def|function|func|fn|interface)\s+([a-zA-Z0-9_]+)', line_text)
+                name = name_match.group(1) if name_match else line_text[:40]
 
-        result["summary_facts"] = SummaryFacts(
-            parser="tree_sitter",
-            outcome="ok",
-            definitions=[
-                {
-                    "name": symbol["name"],
-                    "kind": symbol["kind"],
-                    "line": symbol.get("line"),
-                }
-                for symbol in result["symbols"]
-            ],
-        )
+                result["symbols"].append({
+                    "name": name,
+                    "kind": kind,
+                    "line": node.start_point[0] + 1
+                })
+
+            result["summary_facts"] = SummaryFacts(
+                parser="tree_sitter",
+                outcome="ok",
+                definitions=[
+                    {
+                        "name": symbol["name"],
+                        "kind": symbol["kind"],
+                        "line": symbol.get("line"),
+                    }
+                    for symbol in result["symbols"]
+                ],
+            )
     except Exception:
         # 正規表現による簡易フォールバック
         lines = code.splitlines()
@@ -540,6 +538,11 @@ def extract_file_symbols(path: Path, root: Path) -> dict[str, Any]:
                 }
                 for symbol in result["symbols"]
             ],
+        )
+
+    if language is None:
+        result["summary_facts"] = SummaryFacts(
+            parser="none", outcome="unsupported"
         )
 
     # インポートの簡易正規表現抽出

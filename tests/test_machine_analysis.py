@@ -799,6 +799,34 @@ class TestNonPythonAndMachineSummaryIntegration(unittest.TestCase):
             result["summary_source_hash"], hashlib.sha256(source).hexdigest()
         )
 
+    def test_non_python_tree_sitter_error_tree_returns_parse_error(self):
+        source_path = self.source_dir / "broken.js"
+        source_path.write_bytes(b"function broken( {\n")
+        tree = SimpleNamespace(root_node=SimpleNamespace(has_error=True))
+
+        class FakeParser:
+            def parse(self, payload):
+                if not isinstance(payload, bytes):
+                    raise AssertionError("parser payload must be bytes")
+                return tree
+
+        class FakeLanguage:
+            def query(self, _query):
+                raise AssertionError("query should not run for parse-error trees")
+
+        fake_module = SimpleNamespace(
+            get_parser=lambda _language: FakeParser(),
+            get_language=lambda _language: FakeLanguage(),
+        )
+        with patch.dict(sys.modules, {"tree_sitter_languages": fake_module}):
+            result = extract_file_symbols(source_path, self.test_dir)
+
+        facts = result["summary_facts"]
+        self.assertEqual(facts.parser, "tree_sitter")
+        self.assertEqual(facts.outcome, "parse_error")
+        self.assertEqual(list(facts.definitions), [])
+        self.assertEqual(result["symbols"], [])
+
     def test_non_python_regex_unknown_binary_and_decode_outcomes_are_distinct(self):
         regex_path = self.source_dir / "fallback.js"
         regex_path.write_text("function render() {}\n", encoding="utf-8")
@@ -809,10 +837,16 @@ class TestNonPythonAndMachineSummaryIntegration(unittest.TestCase):
         self.assertEqual(regex_result["summary_facts"].definitions[0]["line"], 1)
 
         unknown_path = self.source_dir / "opaque.xyz"
-        unknown_path.write_text("function render() {}\n", encoding="utf-8")
+        unknown_path.write_text(
+            "function render() {}\nimport billing\n", encoding="utf-8"
+        )
         unknown_result = extract_file_symbols(unknown_path, self.test_dir)
         self.assertEqual(unknown_result["summary_facts"].parser, "none")
         self.assertEqual(unknown_result["summary_facts"].outcome, "unsupported")
+        self.assertIn(
+            {"module": "billing", "internal": False},
+            unknown_result["imports"],
+        )
 
         binary_path = self.source_dir / "asset.png"
         binary_path.write_bytes(b"\x89PNG\r\n")
@@ -1363,8 +1397,8 @@ class TestMachineAnalysis(unittest.TestCase):
 
         # YAML の中身の簡易的な検証
         yaml_content = yaml_path.read_text(encoding="utf-8")
-        self.assertIn("files:", yaml_content)
-        self.assertIn("repo_map:", yaml_content)
+        self.assertIn('"files":', yaml_content)
+        self.assertIn('"repo_map":', yaml_content)
 
         # Markdown レポートの検証
         report_content = report_path.read_text(encoding="utf-8")
@@ -1390,10 +1424,24 @@ class TestMachineAnalysis(unittest.TestCase):
         for summary_text in special_values.values():
             with self.subTest(summary_text=summary_text):
                 self.assertIn(
-                    f'value: {json.dumps(summary_text, ensure_ascii=False)}',
+                    f'"value": {json.dumps(summary_text, ensure_ascii=False)}',
                     yaml_content,
                 )
-                self.assertNotIn(f"value: {summary_text}", yaml_content)
+                self.assertNotIn(f'"value": {summary_text}', yaml_content)
+
+    def test_machine_analysis_yaml_quotes_path_keys(self):
+        edge_dir = self.src_dir / "special: [dir]"
+        edge_dir.mkdir()
+        edge_file = edge_dir / "edge.py"
+        edge_file.write_text("import billing\n", encoding="utf-8")
+
+        analyze_machine_level(self.test_dir, self.output_dir)
+        yaml_content = (self.output_dir / "machine_analysis.yaml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(f'{json.dumps("src/special: [dir]")}:', yaml_content)
+        self.assertIn(f'{json.dumps("src/special: [dir]/edge.py")}:', yaml_content)
 
     def test_readme_describes_current_machine_index_contract(self):
         readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(
@@ -2699,6 +2747,7 @@ class TestMachineAnalysis(unittest.TestCase):
             summary_condition["then"]["properties"]["files"]["items"]
         )
         self.assertEqual(summary_items["if"], {"required": ["module_summary"]})
+        self.assertEqual(summary_items["then"]["properties"]["kind"]["const"], "source")
         self.assertEqual(
             summary_items["then"]["properties"]["module_summary"]["$ref"],
             "#/$defs/moduleSummary",
@@ -3014,6 +3063,22 @@ class TestMachineAnalysis(unittest.TestCase):
         index_path.write_text(json.dumps(legacy), encoding="utf-8")
         loaded = load_machine_index(index_path, supported_major=2)
         self.assertEqual(loaded["files"][1]["module_summary"], invalid_summary)
+
+    def test_machine_index_v22_rejects_module_summary_on_non_source_entries(self):
+        fixture = self._valid_machine_index_fixture()
+        fixture["schema_version"] = "2.2"
+        fixture["attention"] = []
+        fixture["doc_freshness"] = {
+            "path": "doc_freshness.json",
+            "schema_version": "1.0",
+            "sha256": "f" * 64,
+            "counts": {"missing": 0, "fresh": 0, "stale": 0, "unknown": 0},
+        }
+        fixture["files"][0]["module_summary"] = TestModuleSummaryContract._docstring_summary()
+
+        with self.assertRaises(MachineIndexContractError) as context:
+            validate_machine_index(fixture, supported_major=2)
+        self.assertIn("files[0].module_summary", str(context.exception))
 
 
 class TestAttentionSnapshotBuilder(unittest.TestCase):

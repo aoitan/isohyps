@@ -257,6 +257,11 @@ def _validate_file_entry(
     )
 
     if validate_summary and "module_summary" in file_entry:
+        if kind != "source":
+            _fail(
+                f"{location}.module_summary",
+                "module_summary is only allowed when kind is 'source'",
+            )
         try:
             validate_module_summary(file_entry["module_summary"])
         except ModuleSummaryContractError as exc:

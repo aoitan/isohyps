@@ -81,6 +81,7 @@
               "if": { "required": ["module_summary"] },
               "then": {
                 "properties": {
+                  "kind": { "const": "source" },
                   "module_summary": {
                     "$ref": "#/$defs/moduleSummary"
                   }
