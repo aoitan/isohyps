@@ -547,7 +547,7 @@ def extract_file_symbols(path: Path, root: Path) -> dict[str, Any]:
             ],
         )
 
-    if language is None:
+    if language in (None, "unknown"):
         facts = result.get("summary_facts")
         if isinstance(facts, SummaryFacts):
             result["summary_facts"] = SummaryFacts(
