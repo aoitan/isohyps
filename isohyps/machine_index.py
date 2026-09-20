@@ -27,12 +27,17 @@ from isohyps.doc_freshness import (
     canonical_doc_freshness_bytes,
     validate_doc_freshness,
 )
+from isohyps.module_summary import (
+    ModuleSummaryContractError,
+    project_module_summary,
+    validate_module_summary,
+)
 
 
 MACHINE_INDEX_SCHEMA_VERSION = "1.0"
 MACHINE_INDEX_SCHEMA_MAJOR = 1
 MACHINE_INDEX_V2_LEGACY_SCHEMA_VERSION = "2.0"
-MACHINE_INDEX_V2_SCHEMA_VERSION = "2.1"
+MACHINE_INDEX_V2_SCHEMA_VERSION = "2.2"
 
 MACHINE_INDEX_TOP_LEVEL_FIELDS = (
     "schema_version",
@@ -219,7 +224,9 @@ def _parse_schema_version(value: Any, location: str) -> tuple[int, int]:
     return int(match.group("major")), int(match.group("minor"))
 
 
-def _validate_file_entry(entry: Any, index: int) -> dict[str, Any]:
+def _validate_file_entry(
+    entry: Any, index: int, *, validate_summary: bool = False
+) -> dict[str, Any]:
     location = f"files[{index}]"
     file_entry = _require_mapping(entry, location)
 
@@ -248,6 +255,17 @@ def _validate_file_entry(entry: Any, index: int) -> dict[str, Any]:
     _require_non_negative_integer(
         _required(file_entry, "fan_out", location), f"{location}.fan_out"
     )
+
+    if validate_summary and "module_summary" in file_entry:
+        if kind != "source":
+            _fail(
+                f"{location}.module_summary",
+                "module_summary is only allowed when kind is 'source'",
+            )
+        try:
+            validate_module_summary(file_entry["module_summary"])
+        except ModuleSummaryContractError as exc:
+            _fail(f"{location}.module_summary", str(exc))
 
     return {"path": path, "kind": kind, "language": file_entry["language"]}
 
@@ -315,7 +333,11 @@ def validate_machine_index(
     seen_paths: set[str] = set()
     file_paths: list[str] = []
     for index, entry in enumerate(files):
-        description = _validate_file_entry(entry, index)
+        description = _validate_file_entry(
+            entry,
+            index,
+            validate_summary=major == 2 and minor >= 2,
+        )
         path = description["path"]
         if path in seen_paths:
             _fail(f"files[{index}].path", f"duplicate path: {path!r}")
@@ -506,10 +528,36 @@ def build_machine_index_v1(analysis: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def build_machine_index_v2(analysis: Mapping[str, Any]) -> dict[str, Any]:
-    """Build the v2.1 projection with attention and freshness reference."""
+    """Build the v2.2 projection with attention, freshness, and summaries."""
 
     projected = build_machine_index_v1(analysis)
     source = _require_mapping(analysis, "analysis")
+
+    # ``build_machine_index_v1`` deliberately remains the historical
+    # allowlist projection.  Add the optional v2 summary by repository path
+    # after that projection so internal analysis fields cannot leak into v1 or
+    # be associated with a different sorted file entry.
+    source_files = _require_list(_required(source, "files", "analysis"), "analysis.files")
+    summaries_by_path: dict[str, tuple[int, Any]] = {}
+    for index, source_entry in enumerate(source_files):
+        entry = _require_mapping(source_entry, f"analysis.files[{index}]")
+        path = _validate_path(
+            _required(entry, "path", f"analysis.files[{index}]"),
+            f"analysis.files[{index}].path",
+        )
+        if entry.get("kind") == "source" and "module_summary" in entry:
+            summaries_by_path[path] = (index, entry["module_summary"])
+
+    for projected_entry in projected["files"]:
+        source_summary = summaries_by_path.get(projected_entry["path"])
+        if source_summary is None:
+            continue
+        source_index, summary = source_summary
+        try:
+            projected_entry["module_summary"] = project_module_summary(summary)
+        except ModuleSummaryContractError as exc:
+            _fail(f"analysis.files[{source_index}].module_summary", str(exc))
+
     attention = copy.deepcopy(
         _require_list(_required(source, "attention", "analysis"), "analysis.attention")
     )

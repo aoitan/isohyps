@@ -223,7 +223,7 @@ analysis_docs/
 
 ## `machine_index.json` の公開契約
 
-`machine_index.json` は、後段の機械処理が依存する versioned artifact です。現在の producer は schema version `2.0` を出力し、file inventory、依存関係に加えて severity 付きの構造化 `attention` を公開します。
+`machine_index.json` は、後段の機械処理が依存する versioned artifact です。現在の producer は schema version `2.2` を出力し、file inventory、依存関係、severity 付きの構造化 `attention`、および source file entry の `module_summary` を公開します。
 
 必須フィールド、型、順序、決定性、未知フィールドの扱い、旧形式からの移行方針は [machine index 公開契約](docs/machine-index.md) にまとめています。言語非依存の shape は [JSON Schema](schemas/machine-index.schema.json) で確認できます。
 

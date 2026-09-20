@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import ast
-import re
-import json
 import fnmatch
 import hashlib
+import io
+import json
+import re
 import subprocess
+import tokenize
 import tomllib
 from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path, PurePosixPath
@@ -39,18 +41,37 @@ from isohyps.machine_index import (
     validate_machine_index,
     write_machine_index_atomic,
 )
+from isohyps.module_summary import (
+    SummaryFacts,
+    build_module_summary,
+    render_module_summary,
+)
 
 # 簡易的なYAML出力のためのシリアライザ
+def _yaml_scalar(value: Any) -> str:
+    """Render a scalar without allowing source text to change YAML syntax."""
+
+    if isinstance(value, str):
+        # JSON double-quoted strings are valid YAML scalars and escape colons,
+        # comment markers, newlines, and other syntax-sensitive characters.
+        return json.dumps(value, ensure_ascii=False)
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
 def simple_yaml_dump(data: Any, indent_level: int = 0) -> str:
     spacing = "  " * indent_level
     if isinstance(data, dict):
         lines = []
         for k, v in data.items():
             if isinstance(v, (dict, list)):
-                lines.append(f"{spacing}{k}:")
+                lines.append(f"{spacing}{_yaml_scalar(k)}:")
                 lines.append(simple_yaml_dump(v, indent_level + 1))
             else:
-                lines.append(f"{spacing}{k}: {v}")
+                lines.append(f"{spacing}{_yaml_scalar(k)}: {_yaml_scalar(v)}")
         return "\n".join(lines)
     elif isinstance(data, list):
         lines = []
@@ -59,10 +80,10 @@ def simple_yaml_dump(data: Any, indent_level: int = 0) -> str:
                 lines.append(f"{spacing}-")
                 lines.append(simple_yaml_dump(item, indent_level + 1))
             else:
-                lines.append(f"{spacing}- {item}")
+                lines.append(f"{spacing}- {_yaml_scalar(item)}")
         return "\n".join(lines)
     else:
-        return f"{spacing}{data}"
+        return f"{spacing}{_yaml_scalar(data)}"
 
 
 def _build_coverage_targets(files_meta: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -134,7 +155,14 @@ def extract_file_metadata(path: Path, root: Path, previous_meta: dict[str, Any] 
     except Exception:
         file_hash = "error"
 
-    stat = abs_path.stat()
+    try:
+        stat = abs_path.stat()
+    except OSError:
+        # Discovery can race with a file being removed or replaced.  Keep a
+        # stable metadata shape so the scan can report an unavailable source
+        # instead of failing the whole analysis.
+        stat = None
+        file_hash = "error"
     language = detect_language(abs_path) or "unknown"
 
     # ファイル種別の判定 (kind)
@@ -184,7 +212,7 @@ def extract_file_metadata(path: Path, root: Path, previous_meta: dict[str, Any] 
         else:
             status = "added"
 
-    readable = file_hash not in ("binary_skipped", "error")
+    readable = stat is not None and file_hash not in ("binary_skipped", "error")
     line_count: int | None = None
     todo_count = 0
     if kind == "source" and readable and not is_probably_binary(abs_path):
@@ -198,8 +226,8 @@ def extract_file_metadata(path: Path, root: Path, previous_meta: dict[str, Any] 
     return {
         "path": rel_path,
         "hash": file_hash,
-        "mtime": int(stat.st_mtime),
-        "size": stat.st_size,
+        "mtime": int(stat.st_mtime) if stat is not None else 0,
+        "size": stat.st_size if stat is not None else 0,
         "language": language,
         "kind": kind,
         "last_seen_commit": last_commit,
@@ -210,15 +238,36 @@ def extract_file_metadata(path: Path, root: Path, previous_meta: dict[str, Any] 
     }
 
 
-def _extract_python_symbols_and_imports(code: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+def _extract_python_from_tree(
+    tree: ast.Module,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[str],
+    SummaryFacts,
+]:
+    """Extract the legacy fields and summary facts from one parsed AST.
+
+    The legacy symbol/import/export fields intentionally retain their
+    existing traversal and ordering.  Summary facts are collected from the
+    same tree so the summary path cannot observe a different parse result.
+    """
+
     symbols = []
     imports = []
     exports = []
+    definitions = []
+    docstring = None
 
-    try:
-        tree = ast.parse(code)
-    except SyntaxError:
-        return symbols, imports, exports
+    if tree.body:
+        first_statement = tree.body[0]
+        if isinstance(first_statement, ast.Expr):
+            value = first_statement.value
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                docstring = {
+                    "text": value.value,
+                    "line": first_statement.lineno,
+                }
 
     # インポートの解析
     for node in ast.walk(tree):
@@ -235,12 +284,14 @@ def _extract_python_symbols_and_imports(code: str) -> tuple[list[dict[str, Any]]
     for node in tree.body:
         if isinstance(node, ast.ClassDef):
             symbols.append({"name": node.name, "kind": "class", "line": node.lineno})
+            definitions.append({"name": node.name, "kind": "class", "line": node.lineno})
             # クラス内メソッド
             for subnode in node.body:
                 if isinstance(subnode, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     symbols.append({"name": f"{node.name}.{subnode.name}", "kind": "method", "line": subnode.lineno})
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             symbols.append({"name": node.name, "kind": "function", "line": node.lineno})
+            definitions.append({"name": node.name, "kind": "function", "line": node.lineno})
         elif isinstance(node, ast.Assign):
             # __all__ 定義の解析
             for target in node.targets:
@@ -262,6 +313,80 @@ def _extract_python_symbols_and_imports(code: str) -> tuple[list[dict[str, Any]]
                     if isinstance(target, ast.Name) and not target.id.startswith("_"):
                         exports.append(target.id)
 
+    facts = SummaryFacts(
+        parser="python_ast",
+        outcome="ok",
+        docstring=docstring,
+        definitions=definitions,
+    )
+    return symbols, imports, exports, facts
+
+
+def _extract_python_from_code(
+    code: str,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[str],
+    SummaryFacts,
+]:
+    """Parse Python source once and extract all machine-analysis facts."""
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return (
+            [],
+            [],
+            [],
+            SummaryFacts(parser="python_ast", outcome="parse_error"),
+        )
+    return _extract_python_from_tree(tree)
+
+
+def _decode_python_bytes(source: bytes) -> str:
+    """Decode Python bytes using the source's standard encoding cookie."""
+
+    try:
+        encoding, _ = tokenize.detect_encoding(io.BytesIO(source).readline)
+    except (LookupError, SyntaxError) as exc:
+        # An unknown or malformed cookie prevents a trustworthy decode.  Keep
+        # it in the same failure class as a codec-level decode error.
+        raise UnicodeError("invalid Python source encoding declaration") from exc
+    try:
+        return source.decode(encoding)
+    except (LookupError, UnicodeError) as exc:
+        raise UnicodeError(f"could not decode Python source as {encoding}") from exc
+
+
+def _extract_python_from_bytes(
+    source: bytes,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[str],
+    SummaryFacts,
+]:
+    """Decode and parse one Python byte snapshot without a second read."""
+
+    try:
+        code = _decode_python_bytes(source)
+    except UnicodeError:
+        return (
+            [],
+            [],
+            [],
+            SummaryFacts(parser="python_ast", outcome="decode_error"),
+        )
+    return _extract_python_from_code(code)
+
+
+def _extract_python_symbols_and_imports(
+    code: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    """Preserve the historical tuple API over the shared AST extractor."""
+
+    symbols, imports, exports, _facts = _extract_python_from_code(code)
     return symbols, imports, exports
 
 
@@ -280,37 +405,69 @@ def extract_file_symbols(path: Path, root: Path) -> dict[str, Any]:
     }
 
     if is_probably_binary(abs_path):
+        result["summary_facts"] = SummaryFacts(
+            parser="none", outcome="binary_skipped"
+        )
         return result
 
     try:
-        code = abs_path.read_text(encoding="utf-8", errors="ignore")
+        source = abs_path.read_bytes()
     except Exception:
+        result["summary_facts"] = SummaryFacts(
+            parser="python_ast" if language == "python" else "none",
+            outcome="read_error",
+        )
         return result
+
+    # The scan compares this digest with metadata captured before extraction.
+    # Keep it internal so the public analysis never exposes a second snapshot
+    # identifier beside the file metadata hash.
+    result["summary_source_hash"] = hashlib.sha256(source).hexdigest()
 
     # Python の場合は AST を使用
     if language == "python":
-        symbols, imports, exports = _extract_python_symbols_and_imports(code)
+        symbols, imports, exports, facts = _extract_python_from_bytes(source)
         result["symbols"] = symbols
         result["imports"] = imports
         result["exports"] = exports
         result["classes"] = [s["name"] for s in symbols if s.get("kind") == "class"]
         result["functions"] = [s["name"] for s in symbols if s.get("kind") == "function"]
+        # This is an internal hand-off for the summary integration.  The scan
+        # loop removes it before internal analysis is serialized.
+        result["summary_facts"] = facts
+        return result
+
+    try:
+        code = source.decode("utf-8")
+    except UnicodeDecodeError:
+        # Ignoring malformed bytes would make the reported definitions refer
+        # to a lossy snapshot.  Preserve the distinction for the summary and
+        # leave the legacy symbol fields empty.
+        result["summary_facts"] = SummaryFacts(
+            parser="none", outcome="decode_error"
+        )
         return result
 
     # Python 以外は、tree_sitter があれば試み、なければ簡易的な正規表現
     try:
         from tree_sitter_languages import get_language, get_parser
         parser = get_parser(language)
-        tree = parser.parse(code.encode("utf-8"))
-        
-        # 簡易的なシンボル抽出（既存のクエリと対応）
-        from isohyps.analysis_helpers import SYMBOL_QUERIES
-        query_str = SYMBOL_QUERIES.get(language, "")
-        if query_str:
+        # Parse the exact bytes already read for this extraction snapshot.
+        tree = parser.parse(source)
+        if getattr(tree.root_node, "has_error", False):
+            result["summary_facts"] = SummaryFacts(
+                parser="tree_sitter", outcome="parse_error"
+            )
+        else:
+            # 簡易的なシンボル抽出（既存のクエリと対応）
+            from isohyps.analysis_helpers import SYMBOL_QUERIES
+            query_str = SYMBOL_QUERIES.get(language, "")
+            if not query_str:
+                raise LookupError(f"no tree-sitter query for {language}")
             lang_obj = get_language(language)
             query = lang_obj.query(query_str)
             captures = query.captures(tree.root_node)
-            
+
             symbol_nodes = []
             if isinstance(captures, dict):
                 symbol_nodes = captures.get("symbol", [])
@@ -322,7 +479,7 @@ def extract_file_symbols(path: Path, root: Path) -> dict[str, Any]:
                 if node.start_byte in seen:
                     continue
                 seen.add(node.start_byte)
-                
+
                 # ノードタイプから種別判定
                 kind = "function"
                 if "class" in node.type:
@@ -342,7 +499,27 @@ def extract_file_symbols(path: Path, root: Path) -> dict[str, Any]:
                     "kind": kind,
                     "line": node.start_point[0] + 1
                 })
-    except Exception:
+
+            result["summary_facts"] = SummaryFacts(
+                parser="tree_sitter",
+                outcome="ok",
+                definitions=[
+                    {
+                        "name": symbol["name"],
+                        "kind": symbol["kind"],
+                        "line": symbol.get("line"),
+                    }
+                    for symbol in result["symbols"]
+                ],
+            )
+    except (
+        ImportError,
+        LookupError,
+        AttributeError,
+        TypeError,
+        ValueError,
+        RuntimeError,
+    ):
         # 正規表現による簡易フォールバック
         lines = code.splitlines()
         for i, line in enumerate(lines):
@@ -356,6 +533,33 @@ def extract_file_symbols(path: Path, root: Path) -> dict[str, Any]:
             fn_match = re.match(r'^\s*(?:def|function|func|fn)\s+([a-zA-Z0-9_]+)', line_strip)
             if fn_match:
                 result["symbols"].append({"name": fn_match.group(1), "kind": "function", "line": i + 1})
+
+        result["summary_facts"] = SummaryFacts(
+            parser="regex",
+            outcome="ok",
+            definitions=[
+                {
+                    "name": symbol["name"],
+                    "kind": symbol["kind"],
+                    "line": symbol.get("line"),
+                }
+                for symbol in result["symbols"]
+            ],
+        )
+
+    if language in (None, "unknown"):
+        facts = result.get("summary_facts")
+        if isinstance(facts, SummaryFacts):
+            result["summary_facts"] = SummaryFacts(
+                parser=facts.parser,
+                outcome="unsupported",
+                docstring=facts.docstring,
+                definitions=facts.definitions,
+            )
+        else:
+            result["summary_facts"] = SummaryFacts(
+                parser="none", outcome="unsupported"
+            )
 
     # インポートの簡易正規表現抽出
     for line in code.splitlines()[:250]:  # 冒頭250行に限定
@@ -1427,6 +1631,41 @@ def _is_path_within(path: Path, directory: Path) -> bool:
     return True
 
 
+def _module_summary_lines(
+    file_entries: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    """Render every source entry's already-projected summary in path order.
+
+    The caller may provide either the public machine-index projection or the
+    richer internal file metadata.  In both cases the summary is rendered as
+    data; this helper never regenerates it.  ``None`` is intentionally passed
+    through for legacy entries that predate the optional summary field.
+    """
+
+    source_entries = sorted(
+        (
+            entry
+            for entry in file_entries
+            if entry.get("kind") == "source"
+        ),
+        key=lambda entry: str(entry["path"]),
+    )
+    lines = [
+        "## Module Summaries",
+        "",
+        "Deterministic summaries for every discovered source file.",
+        "",
+    ]
+    for entry in source_entries:
+        rendered = render_module_summary(
+            entry.get("module_summary"),
+            path=str(entry["path"]),
+        ).rstrip("\n")
+        lines.extend(rendered.splitlines())
+        lines.append("")
+    return lines
+
+
 def generate_machine_report(
     root: Path,
     files_meta: list[dict[str, Any]],
@@ -1434,7 +1673,10 @@ def generate_machine_report(
     attention: list[AttentionEntry],
     forward_graph: dict[str, list[str]],
     freshness_projection: Mapping[str, Any] | None = None,
+    *,
+    summary_files: Sequence[Mapping[str, Any]] | None = None,
 ) -> str:
+    summary_entries = files_meta if summary_files is None else summary_files
     mermaid_diag = generate_mermaid_graph(forward_graph)
 
     lines = [
@@ -1500,6 +1742,8 @@ def generate_machine_report(
         lines.append(
             f"| `{meta['path']}` | {meta['kind']} | {meta['language']} | {meta['size']} | `{meta['hash'][:10]}` | {meta['status']} |"
         )
+
+    lines.extend(["", *_module_summary_lines(summary_entries)])
 
     return "\n".join(lines)
 
@@ -1636,8 +1880,17 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
 
     # シンボル抽出
     symbols_list = []
+    summary_facts_by_path: dict[str, SummaryFacts] = {}
+    summary_source_hash_by_path: dict[str, str] = {}
     for f in all_files:
-        symbols_list.append(extract_file_symbols(f, root))
+        symbol_info = extract_file_symbols(f, root)
+        summary_facts = symbol_info.pop("summary_facts", None)
+        summary_source_hash = symbol_info.pop("summary_source_hash", None)
+        if isinstance(summary_facts, SummaryFacts):
+            summary_facts_by_path[symbol_info["path"]] = summary_facts
+        if isinstance(summary_source_hash, str):
+            summary_source_hash_by_path[symbol_info["path"]] = summary_source_hash
+        symbols_list.append(symbol_info)
 
     # シンボルとアウトライン情報を files_meta にマージ
     symbols_by_path = {sym["path"]: sym for sym in symbols_list}
@@ -1725,6 +1978,34 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
     resolved_entrypoints, entrypoint_diagnostics = resolve_attention_entrypoints(
         root, files_meta
     )
+
+    # Build summaries only for source entries.  Extraction keeps its facts and
+    # digest private; the public internal analysis receives only the bounded
+    # summary after the metadata snapshot has been checked.
+    for meta in files_meta:
+        if meta["kind"] != "source":
+            continue
+
+        path = meta["path"]
+        facts = summary_facts_by_path.get(path)
+        if facts is None:
+            facts = SummaryFacts(parser="none", outcome="unsupported")
+
+        metadata_hash = meta.get("hash")
+        extracted_hash = summary_source_hash_by_path.get(path)
+        if metadata_hash in (None, "error") or extracted_hash is None:
+            facts = SummaryFacts(parser=facts.parser, outcome="read_error")
+        elif extracted_hash != metadata_hash:
+            # The facts came from a different byte snapshot than the metadata
+            # used for this file entry.  Do not expose either snapshot's
+            # definitions or docstring as evidence.
+            facts = SummaryFacts(parser=facts.parser, outcome="source_changed")
+
+        meta["module_summary"] = build_module_summary(
+            facts,
+            entrypoint_candidate=path in resolved_entrypoints,
+        )
+
     snapshots, attention_diagnostics = build_attention_snapshots(
         root,
         files_meta,
@@ -1800,6 +2081,7 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
         attention,
         forward_graph,
         freshness_projection,
+        summary_files=machine_index["files"],
     )
     report_path.write_text(report_content, encoding="utf-8")
 
@@ -1949,6 +2231,8 @@ def analyze_machine_level(root_path: Path, output_dir: Path) -> dict[str, Any]:
     else:
         index_content += "- No modified or added files detected. All files are unchanged.\n"
         
+    index_content += "\n"
+    index_content += "\n".join(_module_summary_lines(machine_index["files"]))
     index_content += "\n## High Priority Files to Inspect (Attention Points)\nThese files have warnings or high complexity:\n"
     if attention:
         index_content += render_attention_markdown(attention) + "\n"

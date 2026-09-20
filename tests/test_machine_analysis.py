@@ -1,3 +1,5 @@
+import ast
+from html.parser import HTMLParser
 import unittest
 import tempfile
 import shutil
@@ -5,12 +7,17 @@ import json
 import hashlib
 import os
 import re
+import sys
+import subprocess
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 # 機械解析（Level 0）モジュールの各機能を検証します
+import isohyps.machine_analysis as machine_analysis
 from isohyps.machine_analysis import (
+    _extract_python_symbols_and_imports,
     analyze_machine_level,
     build_attention_snapshots,
     build_doc_status_snapshot,
@@ -28,10 +35,31 @@ from isohyps.machine_index import (
     MACHINE_INDEX_V2_SCHEMA_VERSION,
     MachineIndexContractError,
     build_machine_index_v1,
+    build_machine_index_v2,
     load_machine_index,
     resolve_machine_index_freshness,
     serialize_machine_index,
     validate_machine_index,
+)
+from isohyps.module_summary import (
+    ENTRYPOINT_EVIDENCE_VALUE,
+    MODULE_SUMMARY_EVIDENCE_FIELDS,
+    MODULE_SUMMARY_FIELDS,
+    MODULE_SUMMARY_MAX_BYTES,
+    MODULE_SUMMARY_MAX_DEFINITIONS,
+    MODULE_SUMMARY_MAX_EVIDENCE,
+    MODULE_SUMMARY_MAX_EVIDENCE_VALUE_LENGTH,
+    MODULE_SUMMARY_MAX_INTEGER,
+    MODULE_SUMMARY_MAX_TEXT_LENGTH,
+    ModuleSummaryContractError,
+    SummaryFacts,
+    build_module_summary,
+    canonical_module_summary_bytes,
+    normalize_summary_text,
+    project_module_summary,
+    render_module_summary,
+    serialize_module_summary,
+    validate_module_summary,
 )
 from isohyps.attention import (
     AttentionContractError,
@@ -51,6 +79,1039 @@ from isohyps.doc_freshness import (
     write_doc_provenance_atomic,
     write_doc_freshness_atomic,
 )
+
+
+class TestModuleSummaryContract(unittest.TestCase):
+    @staticmethod
+    def _docstring_summary() -> dict[str, object]:
+        evidence = {
+            "kind": "module_docstring",
+            "origin": "python_ast",
+            "line": 1,
+            "value": "Read contour records.",
+            "value_truncated": False,
+            "paragraphs_omitted": False,
+        }
+        return {
+            "text": evidence["value"],
+            "method": "module_docstring",
+            "reason": None,
+            "parser": "python_ast",
+            "evidence": [evidence],
+            "omitted_evidence_count": 0,
+            "text_truncated": False,
+        }
+
+    @staticmethod
+    def _structural_summary() -> dict[str, object]:
+        return {
+            "text": "Non-underscore top-level definitions: Reader.",
+            "method": "structural_facts",
+            "reason": None,
+            "parser": "python_ast",
+            "evidence": [
+                {
+                    "kind": "definition",
+                    "origin": "python_ast",
+                    "line": None,
+                    "value": "Reader",
+                    "value_truncated": False,
+                    "paragraphs_omitted": False,
+                }
+            ],
+            "omitted_evidence_count": 0,
+            "text_truncated": False,
+        }
+
+    def test_summary_contract_shape_and_projection_are_bounded_and_non_mutating(self):
+        summary = self._docstring_summary()
+        summary["future_summary_field"] = {"kept_by": "reader only"}
+        summary["evidence"][0]["future_evidence_field"] = ["ignored"]
+        original = deepcopy(summary)
+
+        projected = project_module_summary(summary)
+
+        self.assertEqual(summary, original)
+        self.assertEqual(set(projected), set(MODULE_SUMMARY_FIELDS))
+        self.assertEqual(
+            set(projected["evidence"][0]), set(MODULE_SUMMARY_EVIDENCE_FIELDS)
+        )
+        self.assertNotIn("future_summary_field", projected)
+        self.assertNotIn("future_evidence_field", projected["evidence"][0])
+        validate_module_summary(projected)
+
+        canonical = canonical_module_summary_bytes(summary)
+        serialized = serialize_module_summary(summary)
+        self.assertEqual(serialized.encode("utf-8"), canonical)
+        self.assertTrue(serialized.endswith("\n"))
+        self.assertLessEqual(len(canonical), MODULE_SUMMARY_MAX_BYTES)
+        self.assertEqual(json.loads(serialized), projected)
+
+    def test_normalization_folds_whitespace_and_replaces_remaining_controls(self):
+        raw = "\t  Read\u00a0contours.\n\u200b\x00\ud800  "
+        self.assertEqual(normalize_summary_text(raw), "Read contours. ���")
+
+        summary = self._docstring_summary()
+        summary["text"] = "\tRead\u00a0contour records.\n"
+        summary["evidence"][0]["value"] = "Read contour records."
+        projected = project_module_summary(summary)
+        self.assertEqual(projected["text"], "Read contour records.")
+        self.assertEqual(
+            projected["evidence"][0]["value"], "Read contour records."
+        )
+        validate_module_summary(projected)
+
+    def test_summary_facts_is_internal_fact_shape(self):
+        facts = SummaryFacts(
+            parser="python_ast",
+            outcome="ok",
+            docstring={"text": "Read contours.", "line": 1},
+            definitions=[],
+        )
+        self.assertEqual(facts.parser, "python_ast")
+        self.assertEqual(facts.outcome, "ok")
+        self.assertEqual(facts.docstring["line"], 1)
+        self.assertEqual(facts.definitions, [])
+
+    def test_valid_structural_and_unknown_shapes(self):
+        structural = self._structural_summary()
+        structural["evidence"][0]["line"] = MODULE_SUMMARY_MAX_INTEGER
+        structural["omitted_evidence_count"] = MODULE_SUMMARY_MAX_INTEGER
+        validate_module_summary(structural)
+
+        unknown = {
+            "text": "unknown",
+            "method": "unknown",
+            "reason": "insufficient_evidence",
+            "parser": "python_ast",
+            "evidence": [],
+            "omitted_evidence_count": 0,
+            "text_truncated": False,
+        }
+        validate_module_summary(unknown)
+
+    def test_invalid_summary_shapes_are_rejected(self):
+        cases: list[tuple[str, dict[str, object]]] = []
+
+        missing_field = self._docstring_summary()
+        del missing_field["text"]
+        cases.append(("missing field", missing_field))
+
+        wrong_text_type = self._docstring_summary()
+        wrong_text_type["text"] = {"not": "text"}
+        cases.append(("text type", wrong_text_type))
+
+        too_long_text = self._docstring_summary()
+        too_long_text["text"] = "x" * (MODULE_SUMMARY_MAX_TEXT_LENGTH + 1)
+        cases.append(("text length", too_long_text))
+
+        invalid_method = self._docstring_summary()
+        invalid_method["method"] = "llm"
+        cases.append(("method enum", invalid_method))
+
+        invalid_parser = self._docstring_summary()
+        invalid_parser["parser"] = "guess"
+        cases.append(("parser enum", invalid_parser))
+
+        too_many_evidence = self._structural_summary()
+        too_many_evidence["evidence"] = [
+            deepcopy(too_many_evidence["evidence"][0])
+            for _ in range(MODULE_SUMMARY_MAX_EVIDENCE + 1)
+        ]
+        cases.append(("evidence count", too_many_evidence))
+
+        too_long_value = self._structural_summary()
+        too_long_value["evidence"][0]["value"] = "x" * (
+            MODULE_SUMMARY_MAX_EVIDENCE_VALUE_LENGTH + 1
+        )
+        cases.append(("evidence value length", too_long_value))
+
+        invalid_line = self._structural_summary()
+        invalid_line["evidence"][0]["line"] = 0
+        cases.append(("line lower bound", invalid_line))
+
+        boolean_line = self._structural_summary()
+        boolean_line["evidence"][0]["line"] = True
+        cases.append(("boolean line", boolean_line))
+
+        boolean_count = self._structural_summary()
+        boolean_count["omitted_evidence_count"] = True
+        cases.append(("boolean count", boolean_count))
+
+        count_overflow = self._structural_summary()
+        count_overflow["omitted_evidence_count"] = MODULE_SUMMARY_MAX_INTEGER + 1
+        cases.append(("count upper bound", count_overflow))
+
+        wrong_docstring_origin = self._docstring_summary()
+        wrong_docstring_origin["evidence"][0]["origin"] = "regex"
+        cases.append(("docstring origin", wrong_docstring_origin))
+
+        wrong_docstring_line = self._docstring_summary()
+        wrong_docstring_line["evidence"][0]["line"] = None
+        cases.append(("docstring line", wrong_docstring_line))
+
+        mismatched_docstring_text = self._docstring_summary()
+        mismatched_docstring_text["text"] = "Different text."
+        cases.append(("docstring text evidence", mismatched_docstring_text))
+
+        structural_without_evidence = self._structural_summary()
+        structural_without_evidence["evidence"] = []
+        cases.append(("structural evidence", structural_without_evidence))
+
+        structural_with_reason = self._structural_summary()
+        structural_with_reason["reason"] = "insufficient_evidence"
+        cases.append(("known reason", structural_with_reason))
+
+        unknown_with_success_reason = {
+            "text": "unknown",
+            "method": "unknown",
+            "reason": "ok",
+            "parser": "none",
+            "evidence": [],
+            "omitted_evidence_count": 0,
+            "text_truncated": False,
+        }
+        cases.append(("unknown success reason", unknown_with_success_reason))
+
+        unknown_with_evidence = {
+            "text": "unknown",
+            "method": "unknown",
+            "reason": "parse_error",
+            "parser": "python_ast",
+            "evidence": [
+                {
+                    "kind": "definition",
+                    "origin": "python_ast",
+                    "line": 1,
+                    "value": "ignored",
+                    "value_truncated": False,
+                    "paragraphs_omitted": False,
+                }
+            ],
+            "omitted_evidence_count": 0,
+            "text_truncated": False,
+        }
+        cases.append(("unknown evidence", unknown_with_evidence))
+
+        for label, value in cases:
+            with self.subTest(case=label):
+                with self.assertRaises(ModuleSummaryContractError):
+                    validate_module_summary(value)
+
+    def test_structural_evidence_requires_parser_origin_and_entrypoint_shape(self):
+        wrong_definition_origin = self._structural_summary()
+        wrong_definition_origin["parser"] = "regex"
+        with self.assertRaises(ModuleSummaryContractError):
+            validate_module_summary(wrong_definition_origin)
+
+        entrypoint = {
+            "text": ENTRYPOINT_EVIDENCE_VALUE,
+            "method": "structural_facts",
+            "reason": None,
+            "parser": "none",
+            "evidence": [
+                {
+                    "kind": "entrypoint_candidate",
+                    "origin": "attention_entrypoint_resolver_v1",
+                    "line": None,
+                    "value": ENTRYPOINT_EVIDENCE_VALUE,
+                    "value_truncated": False,
+                    "paragraphs_omitted": False,
+                }
+            ],
+            "omitted_evidence_count": 0,
+            "text_truncated": False,
+        }
+        validate_module_summary(entrypoint)
+
+        invalid_entrypoint = deepcopy(entrypoint)
+        invalid_entrypoint["evidence"][0]["line"] = 1
+        with self.assertRaises(ModuleSummaryContractError):
+            validate_module_summary(invalid_entrypoint)
+
+
+class TestModuleSummaryGeneration(unittest.TestCase):
+    @staticmethod
+    def _definition(name: str, kind: str = "function", line: int | None = 1):
+        return {"name": name, "kind": kind, "line": line}
+
+    def test_module_docstring_has_priority_and_records_omitted_paragraphs(self):
+        summary = build_module_summary(
+            SummaryFacts(
+                parser="python_ast",
+                docstring={
+                    "text": (
+                        "  Process payments.  \n\n"
+                        "Deprecated; this module only draws contours."
+                    ),
+                    "line": 4,
+                },
+                definitions=[self._definition("draw_contours", line=8)],
+            ),
+            entrypoint_candidate=True,
+        )
+
+        self.assertEqual(summary["method"], "module_docstring")
+        self.assertEqual(summary["text"], "Process payments.")
+        self.assertFalse(summary["text_truncated"])
+        self.assertEqual(summary["omitted_evidence_count"], 0)
+        self.assertEqual(len(summary["evidence"]), 1)
+        self.assertEqual(summary["evidence"][0]["kind"], "module_docstring")
+        self.assertEqual(summary["evidence"][0]["line"], 4)
+        self.assertTrue(summary["evidence"][0]["paragraphs_omitted"])
+        self.assertFalse(summary["evidence"][0]["value_truncated"])
+        validate_module_summary(summary)
+
+
+    def test_blank_docstring_falls_back_to_limited_structural_facts(self):
+        summary = build_module_summary(
+            SummaryFacts(
+                parser="python_ast",
+                docstring={"text": " \n\t ", "line": 1},
+                definitions=[self._definition("run", line=3)],
+            )
+        )
+
+        self.assertEqual(
+            summary["text"], "Non-underscore top-level definitions: run."
+        )
+        self.assertEqual(summary["method"], "structural_facts")
+        self.assertEqual(summary["evidence"][0]["kind"], "definition")
+        self.assertEqual(summary["evidence"][0]["origin"], "python_ast")
+
+    def test_structural_facts_are_sorted_deduplicated_and_deterministic(self):
+        definitions = [
+            self._definition("zebra", "function", 7),
+            self._definition("run", "function", 4),
+            self._definition("_private", "function", 2),
+            self._definition("Alpha", "class", 3),
+            self._definition("run", "function", 4),
+            self._definition("run", "function", 8),
+        ]
+        first = build_module_summary(
+            SummaryFacts(parser="python_ast", definitions=definitions)
+        )
+        second = build_module_summary(
+            SummaryFacts(parser="python_ast", definitions=list(reversed(definitions)))
+        )
+
+        self.assertEqual(first, second)
+        self.assertEqual(
+            first["text"],
+            "Non-underscore top-level definitions: Alpha, run, run, zebra.",
+        )
+        self.assertEqual(
+            [(item["value"], item["line"]) for item in first["evidence"]],
+            [("Alpha", 3), ("run", 4), ("run", 8), ("zebra", 7)],
+        )
+        self.assertLessEqual(len(canonical_module_summary_bytes(first)), MODULE_SUMMARY_MAX_BYTES)
+
+    def test_structural_summary_is_stable_across_hash_seeds_in_subprocesses(self):
+        script = """
+from isohyps.module_summary import (
+    SummaryFacts,
+    build_module_summary,
+    canonical_module_summary_bytes,
+)
+
+line_by_name = {"zebra": 7, "Alpha": 3, "run": 4, "load": 9}
+definitions = [
+    {"name": name, "kind": "function", "line": line_by_name[name]}
+    for name in set(line_by_name)
+]
+summary = build_module_summary(
+    SummaryFacts(parser="python_ast", definitions=definitions)
+)
+print(canonical_module_summary_bytes(summary).decode("utf-8"), end="")
+"""
+        outputs = []
+        for seed in ("1", "42"):
+            environment = os.environ.copy()
+            environment["PYTHONHASHSEED"] = seed
+            outputs.append(
+                subprocess.check_output(
+                    [sys.executable, "-c", script],
+                    cwd=Path(__file__).resolve().parents[1],
+                    env=environment,
+                    text=True,
+                )
+            )
+
+        self.assertEqual(outputs[0], outputs[1])
+        summary = json.loads(outputs[0])
+        self.assertEqual(
+            [item["value"] for item in summary["evidence"]],
+            ["Alpha", "load", "run", "zebra"],
+        )
+
+    def test_entrypoint_is_limited_observation_and_unsupported_only_allows_it(self):
+        with_definitions = build_module_summary(
+            SummaryFacts(
+                parser="python_ast",
+                definitions=[self._definition("main", line=9)],
+            ),
+            entrypoint_candidate=True,
+        )
+        self.assertEqual(
+            with_definitions["text"],
+            "Entrypoint candidate detected. Non-underscore top-level definitions: main.",
+        )
+        self.assertEqual(
+            [item["kind"] for item in with_definitions["evidence"]],
+            ["entrypoint_candidate", "definition"],
+        )
+        self.assertEqual(
+            with_definitions["evidence"][0]["origin"],
+            "attention_entrypoint_resolver_v1",
+        )
+
+        unsupported = SummaryFacts(
+            parser="none",
+            outcome="unsupported",
+            definitions=[self._definition("main")],
+        )
+        self.assertEqual(
+            build_module_summary(unsupported)["reason"], "unsupported"
+        )
+        entrypoint_only = build_module_summary(
+            unsupported, entrypoint_candidate=True
+        )
+        self.assertEqual(entrypoint_only["method"], "structural_facts")
+        self.assertEqual(entrypoint_only["parser"], "none")
+        self.assertEqual(entrypoint_only["text"], ENTRYPOINT_EVIDENCE_VALUE)
+        validate_module_summary(entrypoint_only)
+
+    def test_failures_and_import_only_facts_never_get_a_structural_summary(self):
+        for outcome in (
+            "read_error",
+            "decode_error",
+            "parse_error",
+            "binary_skipped",
+            "source_changed",
+        ):
+            with self.subTest(outcome=outcome):
+                summary = build_module_summary(
+                    SummaryFacts(
+                        parser="python_ast",
+                        outcome=outcome,
+                        docstring={"text": "Observed text.", "line": 1},
+                        definitions=[self._definition("main")],
+                    ),
+                    entrypoint_candidate=True,
+                )
+                self.assertEqual(summary["method"], "unknown")
+                self.assertEqual(summary["reason"], outcome)
+                self.assertEqual(summary["text"], "unknown")
+                self.assertEqual(summary["evidence"], [])
+
+        import_only = build_module_summary(SummaryFacts(parser="python_ast"))
+        self.assertEqual(import_only["text"], "unknown")
+        self.assertEqual(import_only["reason"], "insufficient_evidence")
+
+    def test_definition_and_summary_text_truncation_are_independent_and_bounded(self):
+        long_name = "x" * (MODULE_SUMMARY_MAX_EVIDENCE_VALUE_LENGTH + 40)
+        summary = build_module_summary(
+            SummaryFacts(
+                parser="python_ast",
+                definitions=[self._definition(long_name, line=2)],
+            )
+        )
+
+        evidence = summary["evidence"][0]
+        self.assertEqual(len(evidence["value"]), MODULE_SUMMARY_MAX_EVIDENCE_VALUE_LENGTH)
+        self.assertTrue(evidence["value"].endswith("…"))
+        self.assertTrue(evidence["value_truncated"])
+        self.assertTrue(summary["text"].endswith("…."))
+        self.assertTrue(summary["text_truncated"])
+        self.assertLessEqual(len(summary["text"]), MODULE_SUMMARY_MAX_TEXT_LENGTH)
+        self.assertLessEqual(len(canonical_module_summary_bytes(summary)), MODULE_SUMMARY_MAX_BYTES)
+
+    def test_many_definitions_are_bounded_and_report_omitted_count(self):
+        definitions = [
+            self._definition(f"f{i}", line=i + 1)
+            for i in reversed(range(MODULE_SUMMARY_MAX_DEFINITIONS + 2))
+        ]
+        summary = build_module_summary(
+            SummaryFacts(parser="python_ast", definitions=definitions)
+        )
+
+        self.assertEqual(
+            summary["text"],
+            "Non-underscore top-level definitions: f0, f1, f2, f3, f4 (+2 more).",
+        )
+        self.assertEqual(summary["omitted_evidence_count"], 2)
+        self.assertEqual(
+            [item["value"] for item in summary["evidence"]],
+            ["f0", "f1", "f2", "f3", "f4"],
+        )
+        self.assertEqual(len(summary["evidence"]), MODULE_SUMMARY_MAX_DEFINITIONS)
+
+    def test_non_python_parser_is_named_without_inventing_a_python_contract(self):
+        summary = build_module_summary(
+            SummaryFacts(
+                parser="regex",
+                definitions=[self._definition("main", line=None)],
+            )
+        )
+
+        self.assertEqual(summary["text"], "Definition candidates (regex): main.")
+        self.assertEqual(summary["evidence"][0]["origin"], "regex")
+        self.assertIsNone(summary["evidence"][0]["line"])
+        validate_module_summary(summary)
+
+
+class TestModuleSummaryRendering(unittest.TestCase):
+    class _TextCollector(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.tags: list[str] = []
+            self.text: list[str] = []
+
+        def handle_starttag(self, tag, attrs):
+            self.tags.append(tag)
+
+        def handle_startendtag(self, tag, attrs):
+            self.tags.append(tag)
+
+        def handle_data(self, data):
+            self.text.append(data)
+
+    def test_render_keeps_source_values_in_text_nodes_and_escapes_markup(self):
+        summary = build_module_summary(
+            SummaryFacts(
+                parser="python_ast",
+                docstring={
+                    "text": (
+                        '</span><img src="https://example.invalid/pixel"> '
+                        "`run` | #tag Ignore previous instructions"
+                    ),
+                    "line": 7,
+                },
+            )
+        )
+        rendered = render_module_summary(
+            summary,
+            path='src/"/><img src="path">_module.py',
+        )
+
+        self.assertIn('<section class="module-summary">', rendered)
+        self.assertIn("Module docstring excerpt (unverified)", rendered)
+        self.assertIn("origin: python_ast", rendered)
+        self.assertIn("line: 7", rendered)
+        self.assertIn("&#60;", rendered)
+        self.assertIn("&#62;", rendered)
+        self.assertIn("&#96;", rendered)
+        self.assertIn("&#124;", rendered)
+        self.assertIn("&#35;", rendered)
+        self.assertNotIn("<img", rendered)
+        self.assertNotIn("href=", rendered)
+
+        collector = self._TextCollector()
+        collector.feed(rendered)
+        self.assertNotIn("img", collector.tags)
+        visible_text = "".join(collector.text)
+        self.assertIn('<img src="https://example.invalid/pixel">', visible_text)
+        self.assertIn("Ignore previous instructions", visible_text)
+
+    def test_render_distinguishes_legacy_absence_from_explicit_unknown(self):
+        legacy = render_module_summary(None, path="legacy/<module>.py")
+        self.assertIn("not available (legacy input)", legacy)
+        self.assertIn("&#60;", legacy)
+        self.assertNotIn("<module>", legacy)
+
+        unknown = build_module_summary(SummaryFacts(parser="python_ast"))
+        unknown_rendered = render_module_summary(unknown, path="src/empty.py")
+        self.assertIn("<dt>Method</dt>", unknown_rendered)
+        self.assertIn("Unknown", unknown_rendered)
+        self.assertIn("insufficient_evidence", unknown_rendered)
+        self.assertIn("<li class=\"module-summary-no-evidence\">none</li>", unknown_rendered)
+
+    def test_render_escapes_gfm_strikethrough_markers_and_preserves_text(self):
+        summary = build_module_summary(
+            SummaryFacts(
+                parser="python_ast",
+                docstring={"text": "~~redacted~~", "line": 1},
+            )
+        )
+        rendered = render_module_summary(summary, path="src/example.py")
+
+        self.assertIn("&#126;&#126;redacted&#126;&#126;", rendered)
+        self.assertNotIn("~~redacted~~", rendered)
+
+        collector = self._TextCollector()
+        collector.feed(rendered)
+        self.assertIn("~~redacted~~", "".join(collector.text))
+
+
+class TestPythonSummaryFactExtraction(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+        self.source_dir = self.test_dir / "src"
+        self.source_dir.mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    def test_extracts_encoding_cookie_docstring_and_top_level_definitions_once(self):
+        source_path = self.source_dir / "encoded.py"
+        source_path.write_bytes(
+            b"# -*- coding: latin-1 -*-\n"
+            b'"""caf\xe9 module."""\n'
+            b"import os\n"
+            b"class Public:\n"
+            b"    def method(self):\n"
+            b"        pass\n"
+            b"async def fetch():\n"
+            b"    pass\n"
+            b"def outer():\n"
+            b"    class Nested:\n"
+            b"        pass\n"
+            b"    def nested():\n"
+            b"        pass\n"
+        )
+
+        with patch(
+            "isohyps.machine_analysis.ast.parse",
+            wraps=ast.parse,
+        ) as parse:
+            result = extract_file_symbols(source_path, self.test_dir)
+
+        self.assertEqual(parse.call_count, 1)
+        self.assertEqual(
+            [symbol["name"] for symbol in result["symbols"]],
+            ["Public", "Public.method", "fetch", "outer"],
+        )
+        self.assertEqual([item["module"] for item in result["imports"]], ["os"])
+        self.assertEqual(result["exports"], ["Public", "fetch", "outer"])
+
+        facts = result["summary_facts"]
+        self.assertIsInstance(facts, SummaryFacts)
+        self.assertEqual(facts.parser, "python_ast")
+        self.assertEqual(facts.outcome, "ok")
+        self.assertEqual(facts.docstring, {"text": "café module.", "line": 2})
+        self.assertEqual(
+            [
+                (item["name"], item["kind"], item["line"])
+                for item in facts.definitions
+            ],
+            [
+                ("Public", "class", 4),
+                ("fetch", "function", 7),
+                ("outer", "function", 9),
+            ],
+        )
+        self.assertNotIn("Nested", [item["name"] for item in facts.definitions])
+        self.assertNotIn("nested", [item["name"] for item in facts.definitions])
+        self.assertFalse(hasattr(facts, "source"))
+        self.assertFalse(hasattr(facts, "tree"))
+
+    def test_existing_python_tuple_wrapper_uses_the_shared_extractor(self):
+        symbols, imports, exports = _extract_python_symbols_and_imports(
+            '"""module"""\n'
+            "class Reader:\n"
+            "    pass\n"
+            "async def load():\n"
+            "    pass\n"
+        )
+
+        self.assertEqual([item["name"] for item in symbols], ["Reader", "load"])
+        self.assertEqual(imports, [])
+        self.assertEqual(exports, ["Reader", "load"])
+
+    def test_python_extraction_distinguishes_read_decode_parse_and_empty_outcomes(self):
+        cases = {
+            "empty.py": (b"", "ok"),
+            "bad_syntax.py": (b"def broken(\n", "parse_error"),
+            "bad_decode.py": (b'"""\xff"""\n', "decode_error"),
+            "bad_cookie.py": (b"# coding: no_such_codec\n", "decode_error"),
+        }
+        for name, (source, outcome) in cases.items():
+            with self.subTest(file=name):
+                path = self.source_dir / name
+                path.write_bytes(source)
+                result = extract_file_symbols(path, self.test_dir)
+                facts = result["summary_facts"]
+                self.assertIsInstance(facts, SummaryFacts)
+                self.assertEqual(facts.outcome, outcome)
+                self.assertEqual(result["symbols"], [])
+                self.assertEqual(result["imports"], [])
+                self.assertEqual(result["exports"], [])
+
+        missing = extract_file_symbols(
+            self.source_dir / "missing.py", self.test_dir
+        )
+        self.assertEqual(missing["summary_facts"].outcome, "read_error")
+        self.assertEqual(missing["summary_facts"].docstring, None)
+
+
+class TestNonPythonAndMachineSummaryIntegration(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = Path(tempfile.mkdtemp())
+        self.source_dir = self.test_dir / "src"
+        self.source_dir.mkdir()
+        self.output_dir = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+        shutil.rmtree(self.output_dir)
+
+    def test_non_python_tree_sitter_facts_use_the_read_bytes_snapshot(self):
+        source_path = self.source_dir / "widget.js"
+        source = b"// header\nfunction render() {}\n"
+        source_path.write_bytes(source)
+        node = SimpleNamespace(
+            start_byte=10,
+            start_point=(1, 0),
+            type="function_declaration",
+        )
+        tree = SimpleNamespace(root_node=object())
+        seen_sources: list[bytes] = []
+
+        class FakeParser:
+            def parse(self, payload):
+                seen_sources.append(payload)
+                return tree
+
+        class FakeQuery:
+            def captures(self, _root):
+                return [(node, "symbol")]
+
+        class FakeLanguage:
+            def query(self, _query):
+                return FakeQuery()
+
+        fake_module = SimpleNamespace(
+            get_parser=lambda _language: FakeParser(),
+            get_language=lambda _language: FakeLanguage(),
+        )
+        with patch.dict(sys.modules, {"tree_sitter_languages": fake_module}):
+            result = extract_file_symbols(source_path, self.test_dir)
+
+        facts = result["summary_facts"]
+        self.assertEqual(seen_sources, [source])
+        self.assertEqual(facts.parser, "tree_sitter")
+        self.assertEqual(facts.outcome, "ok")
+        self.assertEqual(
+            [(item["name"], item["kind"], item["line"]) for item in facts.definitions],
+            [("render", "function", 2)],
+        )
+        self.assertEqual(
+            result["summary_source_hash"], hashlib.sha256(source).hexdigest()
+        )
+
+    def test_non_python_tree_sitter_error_tree_returns_parse_error(self):
+        source_path = self.source_dir / "broken.js"
+        source_path.write_bytes(b"function broken( {\n")
+        tree = SimpleNamespace(root_node=SimpleNamespace(has_error=True))
+
+        class FakeParser:
+            def parse(self, payload):
+                if not isinstance(payload, bytes):
+                    raise AssertionError("parser payload must be bytes")
+                return tree
+
+        class FakeLanguage:
+            def query(self, _query):
+                raise AssertionError("query should not run for parse-error trees")
+
+        fake_module = SimpleNamespace(
+            get_parser=lambda _language: FakeParser(),
+            get_language=lambda _language: FakeLanguage(),
+        )
+        with patch.dict(sys.modules, {"tree_sitter_languages": fake_module}):
+            result = extract_file_symbols(source_path, self.test_dir)
+
+        facts = result["summary_facts"]
+        self.assertEqual(facts.parser, "tree_sitter")
+        self.assertEqual(facts.outcome, "parse_error")
+        self.assertEqual(list(facts.definitions), [])
+        self.assertEqual(result["symbols"], [])
+
+    def test_non_python_regex_unknown_binary_and_decode_outcomes_are_distinct(self):
+        regex_path = self.source_dir / "fallback.js"
+        regex_path.write_text("function render() {}\n", encoding="utf-8")
+        with patch.dict(sys.modules, {"tree_sitter_languages": None}):
+            regex_result = extract_file_symbols(regex_path, self.test_dir)
+        self.assertEqual(regex_result["summary_facts"].parser, "regex")
+        self.assertEqual(regex_result["summary_facts"].outcome, "ok")
+        self.assertEqual(regex_result["summary_facts"].definitions[0]["line"], 1)
+
+        unknown_path = self.source_dir / "opaque.xyz"
+        unknown_path.write_text(
+            "function render() {}\nimport billing\n", encoding="utf-8"
+        )
+        unknown_result = extract_file_symbols(unknown_path, self.test_dir)
+        self.assertEqual(unknown_result["summary_facts"].parser, "regex")
+        self.assertEqual(unknown_result["summary_facts"].outcome, "unsupported")
+        self.assertEqual(unknown_result["summary_facts"].definitions[0]["name"], "render")
+        self.assertIn(
+            {"module": "billing", "internal": False},
+            unknown_result["imports"],
+        )
+
+        binary_path = self.source_dir / "asset.png"
+        binary_path.write_bytes(b"\x89PNG\r\n")
+        binary_result = extract_file_symbols(binary_path, self.test_dir)
+        self.assertEqual(binary_result["summary_facts"].parser, "none")
+        self.assertEqual(binary_result["summary_facts"].outcome, "binary_skipped")
+
+        invalid_path = self.source_dir / "invalid.js"
+        invalid_path.write_bytes(b"function render() {}\n\xff")
+        invalid_result = extract_file_symbols(invalid_path, self.test_dir)
+        self.assertEqual(invalid_result["summary_facts"].parser, "none")
+        self.assertEqual(invalid_result["summary_facts"].outcome, "decode_error")
+
+    def test_missing_metadata_is_fail_closed_without_raising(self):
+        missing = self.source_dir / "gone.py"
+        metadata = extract_file_metadata(missing, self.test_dir)
+        self.assertEqual(metadata["hash"], "error")
+        self.assertEqual(metadata["mtime"], 0)
+        self.assertEqual(metadata["size"], 0)
+        self.assertFalse(metadata["readable"])
+
+    def test_scan_adds_summary_to_all_source_entries_and_hides_internal_facts(self):
+        (self.source_dir / "good.py").write_text(
+            '"""Read contour records."""\n\n'
+            "def read_records():\n    pass\n",
+            encoding="utf-8",
+        )
+        (self.source_dir / "app.py").write_text(
+            "def main():\n    pass\n", encoding="utf-8"
+        )
+        (self.source_dir / "widget.js").write_text(
+            "function render() {}\n", encoding="utf-8"
+        )
+        (self.source_dir / "opaque.xyz").write_text(
+            "import billing\n", encoding="utf-8"
+        )
+        (self.source_dir / "__init__.py").write_text("", encoding="utf-8")
+        (self.test_dir / "tests").mkdir()
+        (self.test_dir / "tests" / "test_widget.py").write_text(
+            "def test_widget():\n    pass\n", encoding="utf-8"
+        )
+        (self.test_dir / "settings.toml").write_text("enabled = true\n", encoding="utf-8")
+
+        with patch.dict(sys.modules, {"tree_sitter_languages": None}):
+            result = analyze_machine_level(self.test_dir, self.output_dir)
+
+        entries = {entry["path"]: entry for entry in result["files"]}
+        source_entries = {
+            path: entry for path, entry in entries.items() if entry["kind"] == "source"
+        }
+        self.assertEqual(
+            set(source_entries),
+            {"src/app.py", "src/good.py", "src/opaque.xyz", "src/widget.js"},
+        )
+        for entry in source_entries.values():
+            self.assertIn("module_summary", entry)
+
+        good_summary = source_entries["src/good.py"]["module_summary"]
+        self.assertEqual(good_summary["method"], "module_docstring")
+        self.assertEqual(good_summary["text"], "Read contour records.")
+        self.assertEqual(good_summary["evidence"][0]["line"], 1)
+
+        app_summary = source_entries["src/app.py"]["module_summary"]
+        self.assertEqual(app_summary["method"], "structural_facts")
+        self.assertEqual(
+            [item["kind"] for item in app_summary["evidence"]],
+            ["entrypoint_candidate", "definition"],
+        )
+        self.assertEqual(
+            app_summary["evidence"][0]["origin"],
+            "attention_entrypoint_resolver_v1",
+        )
+
+        unknown_summary = source_entries["src/opaque.xyz"]["module_summary"]
+        self.assertEqual(unknown_summary["text"], "unknown")
+        self.assertEqual(unknown_summary["reason"], "unsupported")
+        self.assertEqual(unknown_summary["evidence"], [])
+
+        self.assertNotIn("module_summary", entries["src/__init__.py"])
+        self.assertNotIn("module_summary", entries["tests/test_widget.py"])
+        self.assertNotIn("module_summary", entries["settings.toml"])
+        self.assertTrue(all("summary_facts" not in item for item in result["symbols"]))
+        self.assertTrue(all("summary_source_hash" not in item for item in result["symbols"]))
+        self.assertNotIn("SummaryFacts", (self.output_dir / "machine_analysis.json").read_text())
+        self.assertNotIn("summary_facts", (self.output_dir / "machine_analysis.yaml").read_text())
+
+    def test_markdown_indexes_render_all_public_source_summaries_in_path_order(self):
+        (self.source_dir / "zeta.py").write_text(
+            '"""Zeta module.\n\nAdditional context is omitted from the excerpt."""\n\n'
+            "def run():\n    pass\n",
+            encoding="utf-8",
+        )
+        (self.source_dir / "alpha.py").write_text(
+            "def load_records():\n    pass\n", encoding="utf-8"
+        )
+        # Unknown-language files remain source entries and must not disappear
+        # from the human-readable summary inventory.
+        (self.source_dir / "opaque.xyz").write_text(
+            "import billing\n", encoding="utf-8"
+        )
+
+        with patch.dict(sys.modules, {"tree_sitter_languages": None}):
+            first_result = analyze_machine_level(self.test_dir, self.output_dir)
+            first_index_bytes = (self.output_dir / "machine_index.json").read_bytes()
+            second_result = analyze_machine_level(self.test_dir, self.output_dir)
+
+        public_index = json.loads(
+            (self.output_dir / "machine_index.json").read_text(encoding="utf-8")
+        )
+        public_sources = sorted(
+            (
+                entry
+                for entry in public_index["files"]
+                if entry["kind"] == "source"
+            ),
+            key=lambda entry: entry["path"],
+        )
+        expected_paths = [
+            "src/alpha.py",
+            "src/opaque.xyz",
+            "src/zeta.py",
+        ]
+        self.assertEqual(
+            [entry["path"] for entry in public_sources], expected_paths
+        )
+
+        index_content = (self.output_dir / "index.md").read_text(encoding="utf-8")
+        report_content = (
+            self.output_dir / "machine_report.md"
+        ).read_text(encoding="utf-8")
+        for document, content in (
+            ("index", index_content),
+            ("report", report_content),
+        ):
+            with self.subTest(document=document):
+                summary_section = content.split("## Module Summaries", 1)[1]
+                self.assertLess(
+                    summary_section.index("src/alpha.py"),
+                    summary_section.index("src/opaque.xyz"),
+                )
+                self.assertLess(
+                    summary_section.index("src/opaque.xyz"),
+                    summary_section.index("src/zeta.py"),
+                )
+                self.assertIn(
+                    "Deterministic summaries for every discovered source file.",
+                    content,
+                )
+                self.assertIn("Zeta module.", content)
+                self.assertIn("paragraphs omitted: true", content)
+                self.assertIn(
+                    "Non-underscore top-level definitions: load&#95;records.",
+                    content,
+                )
+                self.assertIn("unknown", content)
+                self.assertIn("unsupported", content)
+                self.assertIn("Omitted evidence</dt><dd>0</dd>", content)
+
+        public_by_path = {entry["path"]: entry for entry in public_sources}
+        self.assertEqual(
+            public_by_path["src/zeta.py"]["module_summary"]["text"],
+            "Zeta module.",
+        )
+        self.assertEqual(
+            public_by_path["src/zeta.py"]["module_summary"]["method"],
+            "module_docstring",
+        )
+        self.assertTrue(
+            public_by_path["src/zeta.py"]["module_summary"]["evidence"][0][
+                "paragraphs_omitted"
+            ]
+        )
+        self.assertEqual(
+            public_by_path["src/opaque.xyz"]["module_summary"]["reason"],
+            "unsupported",
+        )
+
+        # The second scan marks the files unchanged, but the all-source
+        # summary inventory remains present and uses the same public values.
+        second_paths = [
+            entry["path"]
+            for entry in second_result["files"]
+            if entry["kind"] == "source"
+        ]
+        self.assertEqual(sorted(second_paths), expected_paths)
+        self.assertTrue(
+            all(
+                entry["status"] == "unchanged"
+                for entry in second_result["files"]
+                if entry["path"] in expected_paths
+            )
+        )
+        first_summaries = {
+            entry["path"]: entry["module_summary"]
+            for entry in first_result["files"]
+            if entry["path"] in expected_paths
+        }
+        second_summaries = {
+            entry["path"]: entry["module_summary"]
+            for entry in second_result["files"]
+            if entry["path"] in expected_paths
+        }
+        self.assertEqual(first_summaries, second_summaries)
+        self.assertEqual(
+            first_index_bytes,
+            (self.output_dir / "machine_index.json").read_bytes(),
+        )
+        self.assertIn("## High Priority Files to Inspect", index_content)
+        self.assertIn("Refer to [machine_report.md](./machine_report.md)", index_content)
+
+    def test_hash_mismatch_discards_entrypoint_and_definition_evidence(self):
+        app = self.source_dir / "app.py"
+        app.write_text("def main():\n    pass\n", encoding="utf-8")
+        real_extract_metadata = machine_analysis.extract_file_metadata
+
+        def mismatching_metadata(path, root, previous_meta=None):
+            metadata = real_extract_metadata(path, root, previous_meta)
+            if metadata["path"] == "src/app.py":
+                metadata["hash"] = "0" * 64
+            return metadata
+
+        with (
+            patch.object(
+                machine_analysis,
+                "extract_file_metadata",
+                side_effect=mismatching_metadata,
+            ),
+            patch.dict(sys.modules, {"tree_sitter_languages": None}),
+        ):
+            result = analyze_machine_level(self.test_dir, self.output_dir)
+
+        summary = next(
+            item["module_summary"]
+            for item in result["files"]
+            if item["path"] == "src/app.py"
+        )
+        self.assertEqual(summary["method"], "unknown")
+        self.assertEqual(summary["reason"], "source_changed")
+        self.assertEqual(summary["evidence"], [])
+
+    def test_scan_survives_file_removed_between_metadata_and_extraction(self):
+        transient = self.source_dir / "transient.py"
+        transient.write_text("def run():\n    pass\n", encoding="utf-8")
+        real_extract_symbols = machine_analysis.extract_file_symbols
+
+        def remove_before_extract(path, root):
+            if path == transient:
+                path.unlink()
+            return real_extract_symbols(path, root)
+
+        with patch.object(
+            machine_analysis,
+            "extract_file_symbols",
+            side_effect=remove_before_extract,
+        ):
+            result = analyze_machine_level(self.test_dir, self.output_dir)
+
+        summary = next(
+            item["module_summary"]
+            for item in result["files"]
+            if item["path"] == "src/transient.py"
+        )
+        self.assertEqual(summary["method"], "unknown")
+        self.assertEqual(summary["reason"], "read_error")
 
 class TestMachineAnalysis(unittest.TestCase):
     def setUp(self):
@@ -337,14 +1398,65 @@ class TestMachineAnalysis(unittest.TestCase):
 
         # YAML の中身の簡易的な検証
         yaml_content = yaml_path.read_text(encoding="utf-8")
-        self.assertIn("files:", yaml_content)
-        self.assertIn("repo_map:", yaml_content)
+        self.assertIn('"files":', yaml_content)
+        self.assertIn('"repo_map":', yaml_content)
 
         # Markdown レポートの検証
         report_content = report_path.read_text(encoding="utf-8")
         self.assertIn("# Project Machine Analysis Report", report_content)
         self.assertIn("## Repo Map Summary", report_content)
         self.assertIn("## Attention Points", report_content)
+
+    def test_machine_analysis_yaml_quotes_source_summary_scalars(self):
+        special_values = {
+            "colon_comment.py": "key: value # not a comment",
+            "yaml_special.py": "- [special]: true",
+        }
+        for filename, summary_text in special_values.items():
+            (self.src_dir / filename).write_text(
+                f'"""{summary_text}"""\n', encoding="utf-8"
+            )
+
+        analyze_machine_level(self.test_dir, self.output_dir)
+        yaml_content = (self.output_dir / "machine_analysis.yaml").read_text(
+            encoding="utf-8"
+        )
+
+        for summary_text in special_values.values():
+            with self.subTest(summary_text=summary_text):
+                self.assertIn(
+                    f'"value": {json.dumps(summary_text, ensure_ascii=False)}',
+                    yaml_content,
+                )
+                self.assertNotIn(f'"value": {summary_text}', yaml_content)
+
+    def test_machine_analysis_yaml_quotes_path_keys(self):
+        edge_dir = self.src_dir / "special: [dir]"
+        edge_dir.mkdir()
+        edge_file = edge_dir / "edge.py"
+        edge_file.write_text("import billing\n", encoding="utf-8")
+
+        analyze_machine_level(self.test_dir, self.output_dir)
+        yaml_content = (self.output_dir / "machine_analysis.yaml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(f'{json.dumps("src/special: [dir]")}:', yaml_content)
+        self.assertIn(f'{json.dumps("src/special: [dir]/edge.py")}:', yaml_content)
+
+    def test_readme_describes_current_machine_index_contract(self):
+        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(
+            encoding="utf-8"
+        )
+        contract_intro = next(
+            line
+            for line in readme.splitlines()
+            if line.startswith("`machine_index.json` は")
+        )
+
+        self.assertIn("schema version `2.2`", contract_intro)
+        self.assertIn("`module_summary`", contract_intro)
+        self.assertNotIn("schema version `2.0`", contract_intro)
 
     def test_gitignore_filtering(self):
         # .gitignore ファイルの作成
@@ -1603,6 +2715,90 @@ class TestMachineAnalysis(unittest.TestCase):
             "#/$defs/repositoryRelativePath",
         )
 
+    def test_machine_index_schema_gates_module_summary_at_v22(self):
+        schema_path = (
+            Path(__file__).resolve().parents[1]
+            / "schemas"
+            / "machine-index.schema.json"
+        )
+        with schema_path.open(encoding="utf-8") as handle:
+            schema = json.load(handle)
+
+        file_schema = schema["$defs"]["fileEntry"]
+        self.assertIn("module_summary", file_schema["properties"])
+        self.assertNotIn("module_summary", file_schema["required"])
+        # The property remains an unconstrained additive field on legacy
+        # versions; the root-level conditional below applies its definition
+        # only to 2.2 and newer.
+        self.assertNotIn("$ref", file_schema["properties"]["module_summary"])
+
+        summary_pattern = r"^2\.(?:[2-9]|[1-9][0-9]+)$"
+        summary_conditions = [
+            condition
+            for condition in schema["allOf"]
+            if condition.get("if", {})
+            .get("properties", {})
+            .get("schema_version", {})
+            .get("pattern")
+            == summary_pattern
+        ]
+        self.assertEqual(len(summary_conditions), 1)
+        summary_condition = summary_conditions[0]
+        summary_items = (
+            summary_condition["then"]["properties"]["files"]["items"]
+        )
+        self.assertEqual(summary_items["if"], {"required": ["module_summary"]})
+        self.assertEqual(summary_items["then"]["required"], ["kind"])
+        self.assertEqual(summary_items["then"]["properties"]["kind"]["const"], "source")
+        self.assertEqual(
+            summary_items["then"]["properties"]["module_summary"]["$ref"],
+            "#/$defs/moduleSummary",
+        )
+
+        applies_to = ("2.2", "2.9", "2.10", "2.100")
+        does_not_apply_to = ("1.0", "1.7", "2.0", "2.1")
+        for version in applies_to:
+            with self.subTest(version=version, applies=True):
+                self.assertIsNotNone(re.fullmatch(summary_pattern, version))
+        for version in does_not_apply_to:
+            with self.subTest(version=version, applies=False):
+                self.assertIsNone(re.fullmatch(summary_pattern, version))
+
+        summary_schema = schema["$defs"]["moduleSummary"]
+        self.assertEqual(summary_schema["required"], list(MODULE_SUMMARY_FIELDS))
+        self.assertTrue(summary_schema["additionalProperties"])
+        self.assertEqual(
+            summary_schema["properties"]["text"]["maxLength"],
+            MODULE_SUMMARY_MAX_TEXT_LENGTH,
+        )
+        self.assertEqual(
+            summary_schema["properties"]["evidence"]["maxItems"],
+            MODULE_SUMMARY_MAX_EVIDENCE,
+        )
+        self.assertEqual(
+            summary_schema["properties"]["omitted_evidence_count"]["maximum"],
+            MODULE_SUMMARY_MAX_INTEGER,
+        )
+
+        evidence_schema = schema["$defs"]["moduleSummaryEvidence"]
+        self.assertEqual(
+            evidence_schema["required"], list(MODULE_SUMMARY_EVIDENCE_FIELDS)
+        )
+        self.assertTrue(evidence_schema["additionalProperties"])
+        self.assertEqual(
+            evidence_schema["properties"]["value"]["maxLength"],
+            MODULE_SUMMARY_MAX_EVIDENCE_VALUE_LENGTH,
+        )
+        self.assertEqual(
+            evidence_schema["properties"]["line"]["maximum"],
+            MODULE_SUMMARY_MAX_INTEGER,
+        )
+
+        # Cross-field relations which JSON Schema cannot express without
+        # duplicating the runtime contract remain covered by
+        # validate_machine_index / validate_module_summary tests.
+        self.assertIn("allOf", summary_schema)
+
     def test_machine_index_minor_versions_and_unknown_fields_are_compatible(self):
         fixture = self._valid_machine_index_fixture()
         fixture["schema_version"] = "1.7"
@@ -1780,6 +2976,111 @@ class TestMachineAnalysis(unittest.TestCase):
         self.assertNotIn("coverage", projected)
         self.assertNotIn("status", projected["files"][1])
         self.assertEqual(projected["schema_version"], MACHINE_INDEX_SCHEMA_VERSION)
+
+    def test_machine_index_v22_projects_bounded_source_summaries_only(self):
+        analysis = self._valid_machine_index_fixture()
+        analysis["attention"] = []
+        analysis["doc_freshness"] = {
+            "path": "doc_freshness.json",
+            "schema_version": "1.0",
+            "sha256": "d" * 64,
+            "counts": {"missing": 0, "fresh": 0, "stale": 0, "unknown": 0},
+        }
+        summary = TestModuleSummaryContract._docstring_summary()
+        summary["future_summary_field"] = {"internal": True}
+        summary["evidence"][0]["future_evidence_field"] = "ignored"
+        analysis["files"][1]["module_summary"] = summary
+        analysis["files"][0]["module_summary"] = {"internal": "not public"}
+        original_analysis = deepcopy(analysis)
+
+        legacy_projection = build_machine_index_v1(analysis)
+        projected = build_machine_index_v2(analysis)
+
+        self.assertEqual(analysis, original_analysis)
+        self.assertEqual(projected["schema_version"], MACHINE_INDEX_V2_SCHEMA_VERSION)
+        self.assertNotIn("module_summary", legacy_projection["files"][1])
+
+        by_path = {entry["path"]: entry for entry in projected["files"]}
+        app_entry = by_path["src/app.py"]
+        self.assertEqual(
+            set(app_entry), set(MACHINE_INDEX_FILE_FIELDS) | {"module_summary"}
+        )
+        self.assertEqual(
+            app_entry["module_summary"]["text"], "Read contour records."
+        )
+        self.assertNotIn(
+            "future_summary_field", app_entry["module_summary"]
+        )
+        self.assertNotIn(
+            "future_evidence_field", app_entry["module_summary"]["evidence"][0]
+        )
+        self.assertNotIn("module_summary", by_path["README.md"])
+        self.assertNotIn("module_summary", by_path["src/config.py"])
+        validate_machine_index(projected, supported_major=2)
+
+    def test_machine_index_summary_validation_starts_at_v22_and_loads_legacy_versions(self):
+        invalid_summary = {"text": "not a module summary"}
+        versions = ("1.0", "2.0", "2.1", "2.2", "2.9", "2.10", "2.100")
+
+        for version in versions:
+            with self.subTest(version=version):
+                fixture = self._valid_machine_index_fixture()
+                major, minor = (int(part) for part in version.split("."))
+                fixture["schema_version"] = version
+                if major == 2:
+                    fixture["attention"] = []
+                if major == 2 and minor >= 1:
+                    fixture["doc_freshness"] = {
+                        "path": "doc_freshness.json",
+                        "schema_version": "1.0",
+                        "sha256": "e" * 64,
+                        "counts": {
+                            "missing": 0,
+                            "fresh": 0,
+                            "stale": 0,
+                            "unknown": 0,
+                        },
+                    }
+                validate_machine_index(fixture, supported_major=major)
+
+                fixture["files"][1]["module_summary"] = deepcopy(invalid_summary)
+                if major == 2 and minor >= 2:
+                    with self.assertRaises(MachineIndexContractError) as context:
+                        validate_machine_index(fixture, supported_major=major)
+                    self.assertIn("files[1].module_summary", str(context.exception))
+                else:
+                    validate_machine_index(fixture, supported_major=major)
+
+        legacy = self._valid_machine_index_fixture()
+        legacy["schema_version"] = "2.1"
+        legacy["attention"] = []
+        legacy["doc_freshness"] = {
+            "path": "doc_freshness.json",
+            "schema_version": "1.0",
+            "sha256": "f" * 64,
+            "counts": {"missing": 0, "fresh": 0, "stale": 0, "unknown": 0},
+        }
+        legacy["files"][1]["module_summary"] = deepcopy(invalid_summary)
+        index_path = self.output_dir / "legacy-with-unknown-summary.json"
+        index_path.write_text(json.dumps(legacy), encoding="utf-8")
+        loaded = load_machine_index(index_path, supported_major=2)
+        self.assertEqual(loaded["files"][1]["module_summary"], invalid_summary)
+
+    def test_machine_index_v22_rejects_module_summary_on_non_source_entries(self):
+        fixture = self._valid_machine_index_fixture()
+        fixture["schema_version"] = "2.2"
+        fixture["attention"] = []
+        fixture["doc_freshness"] = {
+            "path": "doc_freshness.json",
+            "schema_version": "1.0",
+            "sha256": "f" * 64,
+            "counts": {"missing": 0, "fresh": 0, "stale": 0, "unknown": 0},
+        }
+        fixture["files"][0]["module_summary"] = TestModuleSummaryContract._docstring_summary()
+
+        with self.assertRaises(MachineIndexContractError) as context:
+            validate_machine_index(fixture, supported_major=2)
+        self.assertIn("files[0].module_summary", str(context.exception))
 
 
 class TestAttentionSnapshotBuilder(unittest.TestCase):
